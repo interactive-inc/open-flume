@@ -1,0 +1,19 @@
+# Claude
+.claude/agent-memory-local
+.claude/scheduled_tasks.lock
+
+# dependencies (bun install)
+node_modules
+
+# output
+dist
+
+# dotenv environment variable files
+.env
+.env.*
+
+# IntelliJ based IDEs
+.idea
+
+# Finder (MacOS) folder config
+.DS_Store
