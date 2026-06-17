@@ -1,0 +1,124 @@
+import type { z } from "zod/v4"
+import type {
+  FlumeGatewayMessageSchema,
+  FlumeGitHubNotificationSchema,
+  FlumeSlackConnectionResponseSchema,
+  FlumeSlackEnvelopeSchema,
+} from "@/schema"
+
+// Timer
+
+export type FlumeTimerHandle = ReturnType<typeof setTimeout>
+
+// Runtime DI
+
+export type FlumeRuntimeDeps = {
+  fetch(url: string | URL, init?: RequestInit): Promise<Response>
+  WebSocket: new (url: string | URL) => WebSocket
+  now(): number
+  random(): number
+  setTimeout(fn: () => void, ms: number): FlumeTimerHandle
+  clearTimeout(id: FlumeTimerHandle): void
+  setInterval(fn: () => void, ms: number): FlumeTimerHandle
+  clearInterval(id: FlumeTimerHandle): void
+}
+
+// Event
+
+export type FlumeSourceName = "discord" | "slack" | "github"
+
+export type FlumeEvent = {
+  source: FlumeSourceName
+  type: string
+  data: unknown
+  meta: Record<string, string>
+  receivedAt: number
+}
+
+export type FlumeHandler = (event: FlumeEvent) => void | Promise<void>
+
+// Status
+
+export type FlumeStatus =
+  | "disconnected"
+  | "connecting"
+  | "connected"
+  | "reconnecting"
+
+export type FlumeStatusHandler = (status: FlumeStatus, detail?: string) => void
+
+// Logging
+
+export type FlumeLogLevel =
+  | "debug"
+  | "info"
+  | "warn"
+  | "error"
+
+export type FlumeLog = {
+  level: FlumeLogLevel
+  source: string
+  action: string
+  message: string
+  error?: Error
+  detail?: Record<string, unknown>
+  timestamp: number
+}
+
+export type FlumeLogHandler = (log: FlumeLog) => void
+
+export type FlumeLogInput = {
+  action: string
+  message: string
+  error?: Error
+  detail?: Record<string, unknown>
+}
+
+// Reconnect
+
+export type FlumeReconnectOptions = {
+  maxAttempts?: number
+  baseDelay?: number
+  maxDelay?: number
+}
+
+export type FlumeReconnectConfig = {
+  maxAttempts: number
+  baseDelay: number
+  maxDelay: number
+}
+
+// Source options
+
+export type FlumeSourceOptions = {
+  reconnect?: boolean | FlumeReconnectOptions
+  onStatus?: FlumeStatusHandler
+  onLog?: FlumeLogHandler
+  signal?: AbortSignal
+  deps: FlumeRuntimeDeps
+}
+
+export type FlumeDiscordSourceOptions = FlumeSourceOptions & {
+  token: string
+  intents?: number
+}
+
+export type FlumeSlackSourceOptions = FlumeSourceOptions & {
+  appToken: string
+  botToken?: string
+}
+
+export type FlumeGitHubSourceOptions = FlumeSourceOptions & {
+  token: string
+  pollInterval?: number
+}
+
+// Zod inferred types
+
+export type FlumeGatewayMessage = z.infer<typeof FlumeGatewayMessageSchema>
+
+export type FlumeSlackEnvelope = z.infer<typeof FlumeSlackEnvelopeSchema>
+
+export type FlumeSlackConnectionResponse = z.infer<typeof FlumeSlackConnectionResponseSchema>
+
+export type FlumeGitHubNotification = z.infer<typeof FlumeGitHubNotificationSchema>
