@@ -1,0 +1,231 @@
+import { describe, it, expect, vi } from "vitest"
+import type { FlumeEvent, FlumeRuntimeDeps } from "@/types"
+import { FlumeDiscordSource } from "@/discord/discord-source"
+
+type Listener = (ev: unknown) => void
+
+class MockWebSocket {
+  static readonly OPEN = 1
+  static readonly CLOSED = 3
+  static latest: MockWebSocket | null = null
+
+  readonly url: string
+
+  readyState = MockWebSocket.OPEN
+
+  readonly sentMessages: Array<string> = []
+
+  private readonly listeners: Record<string, Array<Listener>> = {}
+
+  constructor(url: string | URL) {
+    this.url = String(url)
+    MockWebSocket.latest = this
+  }
+
+  addEventListener(type: string, fn: Listener): void {
+    if (!this.listeners[type]) {
+      this.listeners[type] = []
+    }
+    this.listeners[type].push(fn)
+  }
+
+  send(data: string): void {
+    this.sentMessages.push(data)
+  }
+
+  close(code?: number, reason?: string): void {
+    this.readyState = MockWebSocket.CLOSED
+    const listeners = this.listeners["close"] ?? []
+    for (const fn of listeners) {
+      fn({ code: code ?? 1000, reason: reason ?? "" })
+    }
+  }
+
+  simulateMessage(data: string): void {
+    const listeners = this.listeners["message"] ?? []
+    for (const fn of listeners) {
+      fn({ data })
+    }
+  }
+}
+
+const HELLO_MSG = '{"op":10,"d":{"heartbeat_interval":45000},"s":null,"t":null}'
+const READY_MSG = '{"op":0,"d":{"session_id":"abc","resume_gateway_url":"wss://resume.example.com"},"s":1,"t":"READY"}'
+
+const createMockDeps = (): FlumeRuntimeDeps => {
+  const timerHandle = globalThis.setTimeout(() => {}, 0)
+  globalThis.clearTimeout(timerHandle)
+
+  return {
+    WebSocket: MockWebSocket as unknown as FlumeRuntimeDeps["WebSocket"],
+    setInterval: vi.fn((_fn: () => void, _ms: number) => timerHandle),
+    clearInterval: vi.fn(),
+    setTimeout: vi.fn((_fn: () => void, _ms: number) => timerHandle),
+    clearTimeout: vi.fn(),
+    random: () => 0.5,
+    now: () => 1000,
+    fetch: vi.fn(),
+  }
+}
+
+const simulateReadySequence = () => {
+  const ws = MockWebSocket.latest!
+
+  ws.simulateMessage(HELLO_MSG)
+  ws.simulateMessage(READY_MSG)
+}
+
+describe("FlumeDiscordSource", () => {
+  it("start() creates gateway and connects", async () => {
+    const onStatus = vi.fn()
+    const deps = createMockDeps()
+
+    MockWebSocket.latest = null
+
+    const source = new FlumeDiscordSource({
+      token: "test-token",
+      onStatus,
+      reconnect: false,
+      deps,
+    })
+
+    const handler = vi.fn()
+
+    const startPromise = source.start(handler)
+
+    simulateReadySequence()
+
+    await startPromise
+
+    expect(MockWebSocket.latest).not.toBeNull()
+    expect(onStatus).toHaveBeenCalledWith("connected")
+  })
+
+  it("stop() disconnects and sets status to disconnected", async () => {
+    const onStatus = vi.fn()
+    const deps = createMockDeps()
+
+    MockWebSocket.latest = null
+
+    const source = new FlumeDiscordSource({
+      token: "test-token",
+      onStatus,
+      reconnect: false,
+      deps,
+    })
+
+    const handler = vi.fn()
+
+    const startPromise = source.start(handler)
+
+    simulateReadySequence()
+
+    await startPromise
+
+    await source.stop()
+
+    expect(onStatus).toHaveBeenCalledWith("disconnected")
+  })
+
+  it("dispatched events are forwarded to handler", async () => {
+    const deps = createMockDeps()
+
+    MockWebSocket.latest = null
+
+    const source = new FlumeDiscordSource({
+      token: "test-token",
+      reconnect: false,
+      deps,
+    })
+
+    const receivedEvents: Array<FlumeEvent> = []
+
+    const handler = (event: FlumeEvent) => {
+      receivedEvents.push(event)
+    }
+
+    const startPromise = source.start(handler)
+
+    simulateReadySequence()
+
+    await startPromise
+
+    const messageCreate = '{"op":0,"d":{"content":"hello","channel_id":"123"},"s":2,"t":"MESSAGE_CREATE"}'
+
+    MockWebSocket.latest!.simulateMessage(messageCreate)
+
+    const nonReadyEvents = receivedEvents.filter((ev) => ev.type !== "READY")
+
+    expect(nonReadyEvents.length).toBe(1)
+    expect(nonReadyEvents[0]!.source).toBe("discord")
+    expect(nonReadyEvents[0]!.type).toBe("MESSAGE_CREATE")
+  })
+
+  it("status() returns current status", () => {
+    const deps = createMockDeps()
+
+    MockWebSocket.latest = null
+
+    const source = new FlumeDiscordSource({
+      token: "test-token",
+      reconnect: false,
+      deps,
+    })
+
+    expect(source.status()).toBe("disconnected")
+  })
+
+  it("aborted signal prevents start", async () => {
+    const deps = createMockDeps()
+    const controller = new AbortController()
+
+    controller.abort()
+
+    MockWebSocket.latest = null
+
+    const source = new FlumeDiscordSource({
+      token: "test-token",
+      reconnect: false,
+      signal: controller.signal,
+      deps,
+    })
+
+    const handler = vi.fn()
+
+    await source.start(handler)
+
+    expect(MockWebSocket.latest).toBeNull()
+  })
+})
+
+describe("FlumeDiscordSource.extractMeta", () => {
+  it("extracts event_type", () => {
+    const meta = FlumeDiscordSource.extractMeta("MESSAGE_CREATE", {})
+    expect(meta.event_type).toBe("MESSAGE_CREATE")
+  })
+
+  it("extracts channel_id and guild_id", () => {
+    const meta = FlumeDiscordSource.extractMeta("MESSAGE_CREATE", {
+      channel_id: "ch-1",
+      guild_id: "g-1",
+    })
+    expect(meta.channel_id).toBe("ch-1")
+    expect(meta.guild_id).toBe("g-1")
+  })
+
+  it("extracts user_id from author", () => {
+    const meta = FlumeDiscordSource.extractMeta("MESSAGE_CREATE", {
+      author: { id: "u-1" },
+    })
+    expect(meta.user_id).toBe("u-1")
+  })
+
+  it("ignores non-string fields", () => {
+    const meta = FlumeDiscordSource.extractMeta("MESSAGE_CREATE", {
+      channel_id: 123,
+      author: "not-an-object",
+    })
+    expect(meta.channel_id).toBeUndefined()
+    expect(meta.user_id).toBeUndefined()
+  })
+})
