@@ -13,13 +13,13 @@ Flume only **receives**. It opens the WebSocket / polls the API, parses the payl
 ## Install
 
 ```bash
-npm add open-flume
+npm add @interactive-inc/flume
 ```
 
 ## Quick start
 
 ```ts
-import { Flume, createFlumeDefaultDeps } from "open-flume"
+import { Flume, createFlumeDefaultDeps } from "@interactive-inc/flume"
 
 const flume = new Flume({
   deps: createFlumeDefaultDeps(),
@@ -45,7 +45,7 @@ await github.start((event) => { /* ... */ })
 Skip the `Flume` container and instantiate a source directly:
 
 ```ts
-import { FlumeDiscordSource, createFlumeDefaultDeps } from "open-flume"
+import { FlumeDiscordSource, createFlumeDefaultDeps } from "@interactive-inc/flume"
 
 const source = new FlumeDiscordSource({
   token: process.env.DISCORD_BOT_TOKEN!,
@@ -63,14 +63,14 @@ Each source is also importable on its own. Use this to keep Slack's Socket Mode 
 
 | sub-entry             | exports                                                           |
 |-----------------------|-------------------------------------------------------------------|
-| `open-flume/discord`  | `FlumeDiscordSource`                                              |
-| `open-flume/slack`    | `FlumeSlackSource`                                                |
-| `open-flume/github`   | `FlumeGitHubSource`                                               |
+| `@interactive-inc/flume/discord`  | `FlumeDiscordSource`                                              |
+| `@interactive-inc/flume/slack`    | `FlumeSlackSource`                                                |
+| `@interactive-inc/flume/github`   | `FlumeGitHubSource`                                               |
 
 ```ts
-import { FlumeSlackSource } from "open-flume/slack"
-import { FlumeDiscordSource } from "open-flume/discord"
-import { FlumeGitHubSource } from "open-flume/github"
+import { FlumeSlackSource } from "@interactive-inc/flume/slack"
+import { FlumeDiscordSource } from "@interactive-inc/flume/discord"
+import { FlumeGitHubSource } from "@interactive-inc/flume/github"
 ```
 
 The root entry exports the `Flume` container, every source class, every protocol class (`FlumeDiscordGateway`, `FlumeSlackSocketMode`, `FlumeGitHubPoller`), `FlumeReconnector`, `FlumeLogger`, `createFlumeDefaultDeps`, every Zod schema, every error class, and all public types.
@@ -177,7 +177,7 @@ controller.abort() // all sources stop
 Every IO boundary (`fetch`, `WebSocket`, `now`, `random`, timers) lives in `FlumeRuntimeDeps`. The default factory wraps the global equivalents; tests pass mocks:
 
 ```ts
-import { createFlumeDefaultDeps } from "open-flume"
+import { createFlumeDefaultDeps } from "@interactive-inc/flume"
 
 const deps = {
   ...createFlumeDefaultDeps(),
