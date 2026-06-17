@@ -1,0 +1,77 @@
+{
+  "name": "open-flume",
+  "version": "0.1.0",
+  "description": "Unified notification listener for Discord, Slack, and GitHub. Raw WebSocket + fetch + Zod. No SDK dependencies.",
+  "keywords": [
+    "discord",
+    "slack",
+    "github",
+    "notifications",
+    "webhook",
+    "socket-mode",
+    "gateway",
+    "event-source",
+    "listener"
+  ],
+  "license": "MIT",
+  "author": "interactive-inc",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/interactive-inc/open-flume.git"
+  },
+  "homepage": "https://github.com/interactive-inc/open-flume#readme",
+  "bugs": {
+    "url": "https://github.com/interactive-inc/open-flume/issues"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./slack": {
+      "types": "./dist/slack.d.ts",
+      "import": "./dist/slack.js",
+      "default": "./dist/slack.js"
+    },
+    "./discord": {
+      "types": "./dist/discord.d.ts",
+      "import": "./dist/discord.js",
+      "default": "./dist/discord.js"
+    },
+    "./github": {
+      "types": "./dist/github.d.ts",
+      "import": "./dist/github.js",
+      "default": "./dist/github.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist/**/*",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "prepack": "vp pack",
+    "build": "vp pack",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "lint": "vp lint",
+    "fmt": "vp fmt"
+  },
+  "devDependencies": {
+    "vite-plus": "^0.1.21",
+    "vitest": "^4.1.9"
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
+  }
+}
