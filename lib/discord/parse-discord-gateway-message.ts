@@ -1,5 +1,5 @@
 import type { FlumeGatewayMessage } from "@/types"
-import { FlumeGatewayMessageSchema } from "@/schema"
+import { FlumeGatewayMessageSchema } from "@/discord/discord-gateway-message-schema"
 import { FlumeParseError } from "@/errors/parse-error"
 import { safeJsonParse } from "@/utils/safe-json-parse"
 

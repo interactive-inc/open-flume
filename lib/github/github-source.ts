@@ -1,8 +1,12 @@
 import type { FlumeEvent, FlumeGitHubNotification, FlumeGitHubSourceOptions, FlumeHandler, FlumeRuntimeDeps, FlumeStatus } from "@/types"
 import { FlumeLogger } from "@/logger"
+import { FlumeSerialQueue } from "@/utils/serial-queue"
+import { extractGitHubMeta } from "@/github/extract-github-meta"
 import { FlumeGitHubPoller } from "@/github/github-poller"
 
 export class FlumeGitHubSource {
+
+  readonly name = "github" as const
 
   private poller: FlumeGitHubPoller | null = null
 
@@ -12,13 +16,15 @@ export class FlumeGitHubSource {
 
   private readonly deps: FlumeRuntimeDeps
 
+  private readonly queue = new FlumeSerialQueue()
+
   constructor(private readonly options: FlumeGitHubSourceOptions) {
     this.deps = options.deps
     this.log = new FlumeLogger({ source: "github", handler: options.onLog, deps: this.deps })
   }
 
-  async start(handler: FlumeHandler): Promise<void> {
-    if (this.options.signal?.aborted) return
+  async start(handler: FlumeHandler): Promise<void | Error> {
+    if (this.options.signal?.aborted) return new Error("GitHub source: signal already aborted")
 
     this.options.signal?.addEventListener("abort", () => this.stop(), { once: true })
 
@@ -41,6 +47,7 @@ export class FlumeGitHubSource {
       const err = error instanceof Error ? error : new Error(String(error))
       this.log.error({ action: "start.failed", message: err.message, error: err })
       this.setStatus("disconnected")
+      return err
     }
   }
 
@@ -48,6 +55,7 @@ export class FlumeGitHubSource {
     this.log.info({ action: "stop", message: "stopping GitHub source" })
     this.poller?.stop()
     this.poller = null
+    await this.queue.drain()
     this.setStatus("disconnected")
   }
 
@@ -61,18 +69,20 @@ export class FlumeGitHubSource {
         source: "github",
         type: "notification",
         data: notification,
-        meta: FlumeGitHubSource.extractMeta(notification),
+        meta: extractGitHubMeta(notification),
         receivedAt: this.deps.now(),
       }
-      try {
-        handler(event)
-      } catch (err) {
-        this.log.error({
-          action: "handler.error",
-          message: "user handler threw",
-          error: err instanceof Error ? err : new Error(String(err)),
-        })
-      }
+      this.queue.add(async () => {
+        try {
+          await handler(event)
+        } catch (err) {
+          this.log.error({
+            action: "handler.error",
+            message: "user handler threw",
+            error: err instanceof Error ? err : new Error(String(err)),
+          })
+        }
+      })
     }
   }
 
@@ -84,13 +94,4 @@ export class FlumeGitHubSource {
     this.options.onStatus?.(next, detail)
   }
 
-  static extractMeta(notification: FlumeGitHubNotification): Record<string, string> {
-    return {
-      event_type: "notification",
-      reason: notification.reason,
-      subject_type: notification.subject.type,
-      repository: notification.repository.full_name,
-      thread_id: notification.id,
-    }
-  }
 }

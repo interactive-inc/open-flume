@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest"
 import { FlumeSlackSource } from "@/slack/slack-source"
+import { extractSlackMeta } from "@/slack/extract-slack-meta"
 import type { FlumeEvent, FlumeRuntimeDeps, FlumeStatus } from "@/types"
 
 type Listener = (ev: unknown) => void
@@ -124,6 +125,10 @@ describe("FlumeSlackSource", () => {
 
     TrackingMockWebSocket.latest!.simulateMessage(JSON.stringify(envelope))
 
+    await vi.waitFor(() => {
+      expect(receivedEvents.length).toBe(1)
+    })
+
     expect(receivedEvents.length).toBe(1)
     expect(receivedEvents[0]!.source).toBe("slack")
     expect(receivedEvents[0]!.type).toBe("events_api")
@@ -190,9 +195,9 @@ describe("FlumeSlackSource", () => {
   })
 })
 
-describe("FlumeSlackSource.extractMeta", () => {
+describe("extractSlackMeta", () => {
   it("extracts event_type from envelope", () => {
-    const meta = FlumeSlackSource.extractMeta({
+    const meta = extractSlackMeta({
       envelope_id: "e1",
       type: "events_api",
       payload: {},
@@ -201,7 +206,7 @@ describe("FlumeSlackSource.extractMeta", () => {
   })
 
   it("extracts channel, user, thread_ts from payload.event", () => {
-    const meta = FlumeSlackSource.extractMeta({
+    const meta = extractSlackMeta({
       envelope_id: "e1",
       type: "events_api",
       payload: {
@@ -215,7 +220,7 @@ describe("FlumeSlackSource.extractMeta", () => {
   })
 
   it("handles missing event payload", () => {
-    const meta = FlumeSlackSource.extractMeta({
+    const meta = extractSlackMeta({
       envelope_id: "e1",
       type: "slash_commands",
       payload: {},

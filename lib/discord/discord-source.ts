@@ -3,7 +3,9 @@ import { FlumeLogger } from "@/logger"
 import { FlumeReconnector } from "@/reconnector"
 import { resolveFlumeReconnectConfig } from "@/reconnect-config"
 import { FlumeConnectionError } from "@/errors/connection-error"
-import { isRecord } from "@/utils/is-record"
+import { FlumeSerialQueue } from "@/utils/serial-queue"
+import { scheduleFlumeReconnect } from "@/schedule-reconnect"
+import { extractDiscordMeta } from "@/discord/extract-discord-meta"
 import { FlumeDiscordGateway } from "@/discord/discord-gateway"
 import { FlumeDiscordGatewayIntents } from "@/discord/discord-gateway-intents"
 
@@ -14,6 +16,8 @@ const DEFAULT_INTENTS =
   FlumeDiscordGatewayIntents.MessageContent
 
 export class FlumeDiscordSource {
+
+  readonly name = "discord" as const
 
   private gateway: FlumeDiscordGateway | null = null
 
@@ -27,6 +31,8 @@ export class FlumeDiscordSource {
 
   private readonly deps: FlumeRuntimeDeps
 
+  private readonly queue = new FlumeSerialQueue()
+
   constructor(private readonly options: FlumeDiscordSourceOptions) {
     this.deps = options.deps
     this.log = new FlumeLogger({ source: "discord", handler: options.onLog, deps: this.deps })
@@ -38,14 +44,15 @@ export class FlumeDiscordSource {
     }
   }
 
-  async start(handler: FlumeHandler): Promise<void> {
-    if (this.options.signal?.aborted) return
+  async start(handler: FlumeHandler): Promise<void | Error> {
+    if (this.options.signal?.aborted) return new Error("Discord source: signal already aborted")
 
     this.options.signal?.addEventListener("abort", () => this.stop(), { once: true })
 
     this.handler = handler
     this.log.info({ action: "start", message: "starting Discord source" })
-    await this.connectInternal()
+
+    return this.connectInternal()
   }
 
   async stop(): Promise<void> {
@@ -57,6 +64,7 @@ export class FlumeDiscordSource {
     this.gateway?.disconnect()
     this.gateway = null
     this.handler = null
+    await this.queue.drain()
     this.setStatus("disconnected")
   }
 
@@ -64,7 +72,7 @@ export class FlumeDiscordSource {
     return this.currentStatus
   }
 
-  private async connectInternal(resumeUrl?: string): Promise<void> {
+  private async connectInternal(resumeUrl?: string): Promise<void | Error> {
     this.setStatus("connecting")
 
     this.gateway = new FlumeDiscordGateway({
@@ -80,6 +88,12 @@ export class FlumeDiscordSource {
 
     if (error instanceof FlumeConnectionError) {
       this.log.error({ action: "connect.failed", message: error.message, error })
+
+      if (!this.reconnector || this.reconnector.aborted) {
+        this.setStatus("disconnected")
+        return error
+      }
+
       this.scheduleReconnect()
     }
   }
@@ -89,19 +103,21 @@ export class FlumeDiscordSource {
       source: "discord",
       type: eventName,
       data: eventData,
-      meta: FlumeDiscordSource.extractMeta(eventName, eventData),
+      meta: extractDiscordMeta(eventName, eventData),
       receivedAt: this.deps.now(),
     }
 
-    try {
-      this.handler?.(event)
-    } catch (err) {
-      this.log.error({
-        action: "handler.error",
-        message: "user handler threw",
-        error: err instanceof Error ? err : new Error(String(err)),
-      })
-    }
+    this.queue.add(async () => {
+      try {
+        await this.handler?.(event)
+      } catch (err) {
+        this.log.error({
+          action: "handler.error",
+          message: "user handler threw",
+          error: err instanceof Error ? err : new Error(String(err)),
+        })
+      }
+    })
   }
 
   private handleGatewayStatus(status: "connected" | "disconnected"): void {
@@ -119,25 +135,14 @@ export class FlumeDiscordSource {
   }
 
   private scheduleReconnect(): void {
-    if (!this.reconnector || this.reconnector.aborted) {
-      this.setStatus("disconnected")
-      return
-    }
-
     const url = this.gateway?.session.resumeUrl ?? undefined
 
-    this.setStatus("reconnecting")
-
-    const delay = this.reconnector.schedule(() => {
-      this.connectInternal(url)
+    scheduleFlumeReconnect({
+      reconnector: this.reconnector,
+      log: this.log,
+      setStatus: (status) => this.setStatus(status),
+      retry: () => { this.connectInternal(url) },
     })
-
-    if (delay === -1) {
-      this.log.error({ action: "reconnect.exhausted", message: `gave up after ${this.reconnector.attempt} attempts` })
-      this.setStatus("disconnected")
-    } else {
-      this.log.info({ action: "reconnect.scheduled", message: `next attempt in ${Math.round(delay)}ms` })
-    }
   }
 
   private setStatus(next: FlumeStatus): void {
@@ -148,13 +153,4 @@ export class FlumeDiscordSource {
     this.options.onStatus?.(next)
   }
 
-  static extractMeta(eventName: string, eventData: Record<string, unknown>): Record<string, string> {
-    const meta: Record<string, string> = { event_type: eventName }
-
-    if (typeof eventData.channel_id === "string") meta.channel_id = eventData.channel_id
-    if (typeof eventData.guild_id === "string") meta.guild_id = eventData.guild_id
-    if (isRecord(eventData.author) && typeof eventData.author.id === "string") meta.user_id = eventData.author.id
-
-    return meta
-  }
 }

@@ -20,32 +20,68 @@ npm add @interactive-inc/flume
 
 ```ts
 import { Flume, createFlumeDefaultDeps } from "@interactive-inc/flume"
+import { FlumeDiscordSource } from "@interactive-inc/flume/discord"
+import { FlumeSlackSource } from "@interactive-inc/flume/slack"
+import { FlumeGitHubSource } from "@interactive-inc/flume/github"
+
+const deps = createFlumeDefaultDeps()
+const onLog = (log) => console.log(`[${log.level}] ${log.source}/${log.action}: ${log.message}`)
 
 const flume = new Flume({
-  deps: createFlumeDefaultDeps(),
-  onLog: (log) => console.log(`[${log.level}] ${log.source}/${log.action}: ${log.message}`),
-  onStatus: (status, detail) => console.log(`status: ${status} ${detail ?? ""}`),
-  reconnect: { maxAttempts: 10, baseDelay: 1000, maxDelay: 30000 },
+  sources: [
+    new FlumeDiscordSource({ token: process.env.DISCORD_BOT_TOKEN!, deps, onLog, reconnect: true }),
+    new FlumeSlackSource({ appToken: process.env.SLACK_APP_TOKEN!, deps, onLog, reconnect: true }),
+    new FlumeGitHubSource({ token: process.env.GITHUB_TOKEN!, deps, onLog, pollInterval: 60 }),
+  ],
 })
 
-const discord = flume.discord({ token: process.env.DISCORD_BOT_TOKEN! })
-const slack = flume.slack({ appToken: process.env.SLACK_APP_TOKEN! })
-const github = flume.github({ token: process.env.GITHUB_TOKEN!, pollInterval: 60 })
-
-await discord.start((event) => {
+const running = await flume.start((event) => {
   console.log(event.source, event.type, event.meta)
 })
 
-await slack.start((event) => { /* ... */ })
-await github.start((event) => { /* ... */ })
+if (running instanceof Error) throw running
+
+// later
+await running.stop()
+```
+
+## Lifecycle (type-state FSM)
+
+`Flume` enforces lifecycle correctness through three classes — misuse becomes a compile error.
+
+```
+Flume  ──start()──▶  FlumeRunning  ──stop()──▶  FlumeStopped
+(idle)               (running)                  (terminal)
+```
+
+- `Flume.start(handler)` returns `FlumeRunning | Error`. On partial failure (one source fails while another succeeds), the already-started sources are rolled back and an `Error` is returned with per-source detail.
+- `FlumeRunning.stop()` returns a `FlumeStopped` snapshot. `stop()` is idempotent and concurrent-safe.
+- `FlumeStopped` exposes only `statuses()` — a frozen snapshot of each source's final state. No `start`, no `stop`, no leaking source references.
+- An `AbortSignal` on `Flume` drives an automatic transition to `FlumeStopped`.
+
+```ts
+const running = await flume.start(handler)
+if (running instanceof Error) {
+  console.error(running.message)
+  // "Flume.start: 1 source(s) failed: slack: connect refused"
+  return
+}
+
+running.start() // type error — `start` is not on FlumeRunning
+
+const stopped = await running.stop()
+stopped.stop()  // type error
+stopped.start() // type error
+stopped.statuses() // [{ name: "discord", status: "disconnected" }, ...]
 ```
 
 ## Direct source usage
 
-Skip the `Flume` container and instantiate a source directly:
+Sources work standalone — `Flume` is only needed for multi-source orchestration.
 
 ```ts
-import { FlumeDiscordSource, createFlumeDefaultDeps } from "@interactive-inc/flume"
+import { FlumeDiscordSource } from "@interactive-inc/flume/discord"
+import { createFlumeDefaultDeps } from "@interactive-inc/flume"
 
 const source = new FlumeDiscordSource({
   token: process.env.DISCORD_BOT_TOKEN!,
@@ -54,26 +90,27 @@ const source = new FlumeDiscordSource({
   onLog: (log) => console.log(log),
 })
 
-await source.start((event) => { /* ... */ })
+const error = await source.start((event) => { /* ... */ })
+if (error instanceof Error) throw error
 ```
 
 ## Sub-entries
 
-Each source is also importable on its own. Use this to keep Slack's Socket Mode code out of a Discord-only bundle, or vice versa.
+Each source has a dedicated entry — importing one does not pull the others into your bundle. The root entry never loads source-specific code.
 
-| sub-entry             | exports                                                           |
-|-----------------------|-------------------------------------------------------------------|
-| `@interactive-inc/flume/discord`  | `FlumeDiscordSource`                                              |
-| `@interactive-inc/flume/slack`    | `FlumeSlackSource`                                                |
-| `@interactive-inc/flume/github`   | `FlumeGitHubSource`                                               |
+| sub-entry                          | classes                                                                                                                       |
+|------------------------------------|-------------------------------------------------------------------------------------------------------------------------------|
+| `@interactive-inc/flume`           | `Flume`, `FlumeRunning`, `FlumeStopped`, `FlumeLogger`, `FlumeReconnector`, `createFlumeDefaultDeps`, errors, types           |
+| `@interactive-inc/flume/discord`   | `FlumeDiscordSource`, `FlumeDiscordGateway`, `FlumeDiscordGatewayIntents`, `FlumeDiscordHeartbeat`, `FlumeGatewayMessageSchema` |
+| `@interactive-inc/flume/slack`     | `FlumeSlackSource`, `FlumeSlackSocketMode`, `obtainSlackUrl`, `FlumeSlackEnvelopeSchema`, `FlumeSlackConnectionResponseSchema` |
+| `@interactive-inc/flume/github`    | `FlumeGitHubSource`, `FlumeGitHubPoller`, `FlumeGitHubSeenCache`, `FlumeGitHubNotificationSchema`                              |
 
 ```ts
-import { FlumeSlackSource } from "@interactive-inc/flume/slack"
+import { Flume } from "@interactive-inc/flume"
 import { FlumeDiscordSource } from "@interactive-inc/flume/discord"
+import { FlumeSlackSource } from "@interactive-inc/flume/slack"
 import { FlumeGitHubSource } from "@interactive-inc/flume/github"
 ```
-
-The root entry exports the `Flume` container, every source class, every protocol class (`FlumeDiscordGateway`, `FlumeSlackSocketMode`, `FlumeGitHubPoller`), `FlumeReconnector`, `FlumeLogger`, `createFlumeDefaultDeps`, every Zod schema, every error class, and all public types.
 
 ## Event shape
 
@@ -163,14 +200,23 @@ GitHub populates `detail` with the failure reason (e.g. `"HTTP 500"`, `"network 
 
 ## Cancellation
 
-Pass an `AbortSignal` to any source. Aborting prevents start and triggers `stop()`:
+Pass an `AbortSignal` to `Flume` (propagates to every source) or to an individual source.
 
 ```ts
 const controller = new AbortController()
-const flume = new Flume({ signal: controller.signal, deps: createFlumeDefaultDeps() })
-// ...
-controller.abort() // all sources stop
+
+const flume = new Flume({
+  sources: [new FlumeDiscordSource({ token, deps, signal: controller.signal })],
+  signal: controller.signal,
+})
+
+const running = await flume.start(handler)
+if (running instanceof Error) throw running
+
+controller.abort() // FlumeRunning auto-transitions to FlumeStopped
 ```
+
+If the signal is already aborted at `Flume.start()` time, `start` returns an `Error` and no source is touched.
 
 ## Dependency injection
 
@@ -213,18 +259,18 @@ GitHub also exposes `gh auth token` if you want to reuse the `gh` CLI's session:
 ```ts
 import { execSync } from "node:child_process"
 const token = execSync("gh auth token").toString().trim()
-const github = flume.github({ token })
+const github = new FlumeGitHubSource({ token, deps: createFlumeDefaultDeps() })
 ```
 
 ## Module layout
 
-- `Flume` — DI container; `.discord()` / `.slack()` / `.github()` build sources with shared deps
-- `FlumeDiscordSource` / `FlumeSlackSource` / `FlumeGitHubSource` — high-level sources
+- `Flume` / `FlumeRunning` / `FlumeStopped` — type-state FSM merging multiple sources into one stream
+- `FlumeDiscordSource` / `FlumeSlackSource` / `FlumeGitHubSource` — high-level sources (each implements `FlumeSource`)
 - `FlumeDiscordGateway` / `FlumeSlackSocketMode` / `FlumeGitHubPoller` — protocol layer
 - `FlumeReconnector` — exponential backoff with jitter
 - `FlumeLogger` — structured log emitter (feeds `onLog`)
-- `FlumeRuntimeDeps` — IO boundary port
-- Zod schemas for every external boundary: `FlumeGatewayMessageSchema`, `FlumeSlackEnvelopeSchema`, `FlumeSlackConnectionResponseSchema`, `FlumeGitHubNotificationSchema`
+- `FlumeRuntimeDeps` — IO boundary port (`fetch`, `WebSocket`, `now`, `random`, timers)
+- Per-source Zod schemas: `FlumeGatewayMessageSchema` (discord), `FlumeSlackEnvelopeSchema` / `FlumeSlackConnectionResponseSchema` (slack), `FlumeGitHubNotificationSchema` (github)
 
 ## Development
 

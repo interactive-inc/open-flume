@@ -2,10 +2,17 @@ import type { FlumeEvent, FlumeHandler, FlumeRuntimeDeps, FlumeSlackEnvelope, Fl
 import { FlumeLogger } from "@/logger"
 import { FlumeReconnector } from "@/reconnector"
 import { resolveFlumeReconnectConfig } from "@/reconnect-config"
-import { isRecord } from "@/utils/is-record"
+import { FlumeSerialQueue } from "@/utils/serial-queue"
+import { scheduleFlumeReconnect } from "@/schedule-reconnect"
+import { extractSlackMeta } from "@/slack/extract-slack-meta"
+import { FlumeSlackSeenCache } from "@/slack/slack-seen-cache"
 import { FlumeSlackSocketMode } from "@/slack/slack-socket-mode"
 
+const SEEN_CACHE_MAX = 1024
+
 export class FlumeSlackSource {
+
+  readonly name = "slack" as const
 
   private socket: FlumeSlackSocketMode | null = null
 
@@ -19,6 +26,10 @@ export class FlumeSlackSource {
 
   private readonly deps: FlumeRuntimeDeps
 
+  private readonly queue = new FlumeSerialQueue()
+
+  private readonly seen = new FlumeSlackSeenCache({ maxSize: SEEN_CACHE_MAX })
+
   constructor(private readonly options: FlumeSlackSourceOptions) {
     this.deps = options.deps
     this.log = new FlumeLogger({ source: "slack", handler: options.onLog, deps: this.deps })
@@ -30,14 +41,15 @@ export class FlumeSlackSource {
     }
   }
 
-  async start(handler: FlumeHandler): Promise<void> {
-    if (this.options.signal?.aborted) return
+  async start(handler: FlumeHandler): Promise<void | Error> {
+    if (this.options.signal?.aborted) return new Error("Slack source: signal already aborted")
 
     this.options.signal?.addEventListener("abort", () => this.stop(), { once: true })
 
     this.handler = handler
     this.log.info({ action: "start", message: "starting Slack source" })
-    await this.connectInternal()
+
+    return this.connectInternal()
   }
 
   async stop(): Promise<void> {
@@ -49,6 +61,7 @@ export class FlumeSlackSource {
     this.socket?.disconnect()
     this.socket = null
     this.handler = null
+    await this.queue.drain()
     this.setStatus("disconnected")
   }
 
@@ -56,7 +69,7 @@ export class FlumeSlackSource {
     return this.currentStatus
   }
 
-  private async connectInternal(): Promise<void> {
+  private async connectInternal(): Promise<void | Error> {
     this.setStatus("connecting")
 
     this.socket = new FlumeSlackSocketMode({
@@ -78,46 +91,57 @@ export class FlumeSlackSource {
 
     if (error instanceof Error) {
       this.log.error({ action: "connect.failed", message: error.message, error })
+
+      if (!this.reconnector || this.reconnector.aborted) {
+        this.setStatus("disconnected")
+        return error
+      }
+
       this.scheduleReconnect()
     }
   }
 
   private handleMessage(envelope: FlumeSlackEnvelope): void {
+    if (this.seen.has(envelope.envelope_id)) {
+      this.log.debug({
+        action: "dedup.skip",
+        message: `duplicate envelope_id=${envelope.envelope_id}`,
+        detail: { envelope_id: envelope.envelope_id, retry_attempt: envelope.retry_attempt },
+      })
+      return
+    }
+
+    this.seen.add(envelope.envelope_id)
+    this.seen.trim()
+
     const event: FlumeEvent = {
       source: "slack",
       type: envelope.type,
       data: envelope.payload,
-      meta: FlumeSlackSource.extractMeta(envelope),
+      meta: extractSlackMeta(envelope),
       receivedAt: this.deps.now(),
     }
 
-    try {
-      this.handler?.(event)
-    } catch (err) {
-      this.log.error({
-        action: "handler.error",
-        message: "user handler threw",
-        error: err instanceof Error ? err : new Error(String(err)),
-      })
-    }
+    this.queue.add(async () => {
+      try {
+        await this.handler?.(event)
+      } catch (err) {
+        this.log.error({
+          action: "handler.error",
+          message: "user handler threw",
+          error: err instanceof Error ? err : new Error(String(err)),
+        })
+      }
+    })
   }
 
   private scheduleReconnect(): void {
-    if (!this.reconnector || this.reconnector.aborted) {
-      this.setStatus("disconnected")
-      return
-    }
-
-    this.setStatus("reconnecting")
-
-    const delay = this.reconnector.schedule(() => this.connectInternal())
-
-    if (delay === -1) {
-      this.log.error({ action: "reconnect.exhausted", message: `gave up after ${this.reconnector.attempt} attempts` })
-      this.setStatus("disconnected")
-    } else {
-      this.log.info({ action: "reconnect.scheduled", message: `next attempt in ${Math.round(delay)}ms` })
-    }
+    scheduleFlumeReconnect({
+      reconnector: this.reconnector,
+      log: this.log,
+      setStatus: (status) => this.setStatus(status),
+      retry: () => { this.connectInternal() },
+    })
   }
 
   private setStatus(next: FlumeStatus): void {
@@ -128,17 +152,4 @@ export class FlumeSlackSource {
     this.options.onStatus?.(next)
   }
 
-  static extractMeta(envelope: FlumeSlackEnvelope): Record<string, string> {
-    const meta: Record<string, string> = { event_type: envelope.type }
-    const eventPayload = isRecord(envelope.payload.event) ? envelope.payload.event : null
-
-    if (!eventPayload) return meta
-
-    if (typeof eventPayload.channel === "string") meta.channel_id = eventPayload.channel
-    if (typeof eventPayload.user === "string") meta.user_id = eventPayload.user
-    if (typeof eventPayload.thread_ts === "string") meta.thread_ts = eventPayload.thread_ts
-    if (typeof eventPayload.type === "string") meta.slack_event_type = eventPayload.type
-
-    return meta
-  }
 }

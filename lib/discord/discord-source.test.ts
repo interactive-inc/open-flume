@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest"
 import type { FlumeEvent, FlumeRuntimeDeps } from "@/types"
 import { FlumeDiscordSource } from "@/discord/discord-source"
+import { extractDiscordMeta } from "@/discord/extract-discord-meta"
 
 type Listener = (ev: unknown) => void
 
@@ -154,6 +155,10 @@ describe("FlumeDiscordSource", () => {
 
     MockWebSocket.latest!.simulateMessage(messageCreate)
 
+    await vi.waitFor(() => {
+      expect(receivedEvents.filter((ev) => ev.type !== "READY").length).toBe(1)
+    })
+
     const nonReadyEvents = receivedEvents.filter((ev) => ev.type !== "READY")
 
     expect(nonReadyEvents.length).toBe(1)
@@ -198,14 +203,14 @@ describe("FlumeDiscordSource", () => {
   })
 })
 
-describe("FlumeDiscordSource.extractMeta", () => {
+describe("extractDiscordMeta", () => {
   it("extracts event_type", () => {
-    const meta = FlumeDiscordSource.extractMeta("MESSAGE_CREATE", {})
+    const meta = extractDiscordMeta("MESSAGE_CREATE", {})
     expect(meta.event_type).toBe("MESSAGE_CREATE")
   })
 
   it("extracts channel_id and guild_id", () => {
-    const meta = FlumeDiscordSource.extractMeta("MESSAGE_CREATE", {
+    const meta = extractDiscordMeta("MESSAGE_CREATE", {
       channel_id: "ch-1",
       guild_id: "g-1",
     })
@@ -214,14 +219,14 @@ describe("FlumeDiscordSource.extractMeta", () => {
   })
 
   it("extracts user_id from author", () => {
-    const meta = FlumeDiscordSource.extractMeta("MESSAGE_CREATE", {
+    const meta = extractDiscordMeta("MESSAGE_CREATE", {
       author: { id: "u-1" },
     })
     expect(meta.user_id).toBe("u-1")
   })
 
   it("ignores non-string fields", () => {
-    const meta = FlumeDiscordSource.extractMeta("MESSAGE_CREATE", {
+    const meta = extractDiscordMeta("MESSAGE_CREATE", {
       channel_id: 123,
       author: "not-an-object",
     })

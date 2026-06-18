@@ -10,9 +10,9 @@ export default defineConfig({
   pack: {
     entry: {
       index: "lib/index.ts",
-      slack: "lib/slack/slack-source.ts",
-      discord: "lib/discord/discord-source.ts",
-      github: "lib/github/github-source.ts",
+      slack: "lib/slack.ts",
+      discord: "lib/discord.ts",
+      github: "lib/github.ts",
     },
     format: "esm",
     dts: true,

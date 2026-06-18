@@ -1,7 +1,9 @@
 import type { FlumeLogHandler, FlumeRuntimeDeps } from "@/types"
-import { FlumeSlackConnectionResponseSchema } from "@/schema"
+import { FlumeSlackConnectionResponseSchema } from "@/slack/slack-connection-response-schema"
 import { FlumeHttpError } from "@/errors/http-error"
 import { FlumeLogger } from "@/logger"
+import { isRecord } from "@/utils/is-record"
+import { safeFetch } from "@/utils/safe-fetch"
 
 type Props = {
   appToken: string
@@ -15,13 +17,19 @@ export async function obtainSlackUrl(props: Props): Promise<string | FlumeHttpEr
 
   log.debug({ action: "http.request", message: `POST ${url}` })
 
-  const response = await safeFetch(props, url, log)
-  if (response instanceof FlumeHttpError) return response
+  const response = await safeFetch({
+    fetch: props.deps.fetch,
+    url,
+    init: { method: "POST", headers: { Authorization: `Bearer ${props.appToken}` } },
+    log,
+  })
+  if (response instanceof Error) return new FlumeHttpError({ message: response.message, status: 0 })
 
   log.debug({ action: "http.response", message: `POST ${response.status}`, detail: { status: response.status, url } })
 
   const raw: unknown = await response.json()
-  log.debug({ action: "http.body", message: "apps.connections.open response", detail: { ok: isOk(raw), error: errorField(raw) } })
+  const peek = isRecord(raw) ? raw : {}
+  log.debug({ action: "http.body", message: "apps.connections.open response", detail: { ok: peek.ok, error: peek.error } })
 
   const parsed = FlumeSlackConnectionResponseSchema.safeParse(raw)
 
@@ -46,23 +54,3 @@ export async function obtainSlackUrl(props: Props): Promise<string | FlumeHttpEr
   return parsed.data.url
 }
 
-function isOk(raw: unknown): unknown {
-  return (raw as { ok?: unknown } | null)?.ok
-}
-
-function errorField(raw: unknown): unknown {
-  return (raw as { error?: unknown } | null)?.error
-}
-
-async function safeFetch(props: Props, url: string, log: FlumeLogger): Promise<Response | FlumeHttpError> {
-  try {
-    return await props.deps.fetch(url, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${props.appToken}` },
-    })
-  } catch (error) {
-    const err = error instanceof Error ? error : new Error(String(error))
-    log.error({ action: "http.error", message: `network error: ${err.message}`, error: err })
-    return new FlumeHttpError({ message: err.message, status: 0 })
-  }
-}

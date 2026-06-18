@@ -1,5 +1,5 @@
 import type { FlumeLogHandler, FlumeRuntimeDeps, FlumeSlackEnvelope } from "@/types"
-import { FlumeSlackEnvelopeSchema } from "@/schema"
+import { FlumeSlackEnvelopeSchema } from "@/slack/slack-envelope-schema"
 import { FlumeLogger } from "@/logger"
 import { FlumeConnectionError } from "@/errors/connection-error"
 import { FlumeHttpError } from "@/errors/http-error"

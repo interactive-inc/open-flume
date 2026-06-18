@@ -1,72 +1,67 @@
-import type {
-  FlumeDiscordSourceOptions,
-  FlumeGitHubSourceOptions,
-  FlumeLogHandler,
-  FlumeReconnectOptions,
-  FlumeRuntimeDeps,
-  FlumeSlackSourceOptions,
-  FlumeStatusHandler,
-} from "@/types"
-import { createFlumeDefaultDeps } from "@/deps"
-import { FlumeDiscordSource } from "@/discord/discord-source"
-import { FlumeSlackSource } from "@/slack/slack-source"
-import { FlumeGitHubSource } from "@/github/github-source"
+import type { FlumeHandler, FlumeSource } from "@/types"
+import { FlumeRunning } from "@/flume-running"
 
 type Props = {
-  onLog?: FlumeLogHandler
-  onStatus?: FlumeStatusHandler
-  reconnect?: boolean | FlumeReconnectOptions
+  sources: ReadonlyArray<FlumeSource>
   signal?: AbortSignal
-  deps?: Partial<FlumeRuntimeDeps>
 }
 
 /**
- * 共有設定を持つ DI コンテナ。各 Source に共通の deps / logging / reconnect を注入する
+ * 起動前の Flume。start() で FlumeRunning へ遷移する
  */
 export class Flume {
 
-  private readonly resolvedDeps: FlumeRuntimeDeps
+  private consumed = false
 
-  constructor(private readonly props: Props) {
-    this.resolvedDeps = { ...createFlumeDefaultDeps(), ...props.deps }
-  }
+  constructor(private readonly props: Props) {}
 
-  discord(options: { token: string; intents?: number }): FlumeDiscordSource {
-    const merged: FlumeDiscordSourceOptions = {
-      onLog: this.props.onLog,
-      onStatus: this.props.onStatus,
-      reconnect: this.props.reconnect,
-      signal: this.props.signal,
-      deps: this.resolvedDeps,
-      ...options,
+  async start(handler: FlumeHandler): Promise<FlumeRunning | Error> {
+    if (this.consumed) {
+      return new Error("Flume.start: already started")
     }
 
-    return new FlumeDiscordSource(merged)
-  }
-
-  slack(options: { appToken: string; botToken?: string }): FlumeSlackSource {
-    const merged: FlumeSlackSourceOptions = {
-      onLog: this.props.onLog,
-      onStatus: this.props.onStatus,
-      reconnect: this.props.reconnect,
-      signal: this.props.signal,
-      deps: this.resolvedDeps,
-      ...options,
+    if (this.props.signal?.aborted) {
+      return new Error("Flume.start: signal already aborted")
     }
 
-    return new FlumeSlackSource(merged)
-  }
+    this.consumed = true
 
-  github(options: { token: string; pollInterval?: number }): FlumeGitHubSource {
-    const merged: FlumeGitHubSourceOptions = {
-      onLog: this.props.onLog,
-      onStatus: this.props.onStatus,
-      reconnect: this.props.reconnect,
-      signal: this.props.signal,
-      deps: this.resolvedDeps,
-      ...options,
+    const settled = await Promise.allSettled(
+      this.props.sources.map((source) => source.start(handler)),
+    )
+
+    const failures: Array<{ name: string; error: Error }> = []
+    const started: FlumeSource[] = []
+
+    for (let i = 0; i < settled.length; i++) {
+      const result = settled[i]
+      const source = this.props.sources[i]
+
+      if (result === undefined || source === undefined) continue
+
+      if (result.status === "rejected") {
+        const reason = result.reason
+        failures.push({ name: source.name, error: reason instanceof Error ? reason : new Error(String(reason)) })
+      } else if (result.value instanceof Error) {
+        failures.push({ name: source.name, error: result.value })
+      } else {
+        started.push(source)
+      }
     }
 
-    return new FlumeGitHubSource(merged)
+    if (failures.length > 0) {
+      await Promise.allSettled(started.map((source) => source.stop()))
+
+      const detail = failures.map((f) => `${f.name}: ${f.error.message}`).join("; ")
+      return new Error(`Flume.start: ${failures.length} source(s) failed: ${detail}`)
+    }
+
+    if (this.props.signal?.aborted) {
+      await Promise.allSettled(this.props.sources.map((source) => source.stop()))
+
+      return new Error("Flume.start: aborted during start")
+    }
+
+    return new FlumeRunning({ sources: this.props.sources, signal: this.props.signal })
   }
 }

@@ -1,6 +1,7 @@
 import type { FlumeGitHubNotification, FlumeLogHandler, FlumeRuntimeDeps, FlumeTimerHandle } from "@/types"
-import { FlumeGitHubNotificationSchema } from "@/schema"
+import { FlumeGitHubNotificationSchema } from "@/github/github-notification-schema"
 import { FlumeLogger } from "@/logger"
+import { safeFetch } from "@/utils/safe-fetch"
 import { FlumeGitHubSeenCache } from "@/github/github-seen-cache"
 
 type Deps = Pick<FlumeRuntimeDeps, "fetch" | "setInterval" | "clearInterval" | "now">
@@ -152,20 +153,25 @@ export class FlumeGitHubPoller {
   }
 
   private async safeFetch(url: string): Promise<Response | Error> {
-    try {
-      return await this.props.deps.fetch(url, {
+    const result = await safeFetch({
+      fetch: this.props.deps.fetch,
+      url,
+      init: {
         headers: {
           Authorization: `Bearer ${this.props.token}`,
           Accept: "application/vnd.github+json",
           "X-GitHub-Api-Version": "2022-11-28",
         },
-      })
-    } catch (error) {
+      },
+      log: this.log,
+    })
+
+    if (result instanceof Error) {
       this.consecutiveErrors++
-      const err = error instanceof Error ? error : new Error(String(error))
-      this.log.error({ action: "http.error", message: `network error (consecutive=${this.consecutiveErrors})`, error: err })
+      this.log.warn({ action: "http.error", message: `consecutive=${this.consecutiveErrors}` })
       if (this.consecutiveErrors >= 3) this.props.onDisconnected("network error")
-      return err
     }
+
+    return result
   }
 }

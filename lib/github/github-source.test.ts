@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest"
 import { FlumeGitHubSource } from "@/github/github-source"
+import { extractGitHubMeta } from "@/github/extract-github-meta"
 import type { FlumeEvent, FlumeRuntimeDeps, FlumeStatus } from "@/types"
 
 const timerHandle = globalThis.setTimeout(() => {}, 0)
@@ -129,9 +130,9 @@ describe("FlumeGitHubSource", () => {
   })
 })
 
-describe("FlumeGitHubSource.extractMeta", () => {
+describe("extractGitHubMeta", () => {
   it("extracts all fields from notification", () => {
-    const meta = FlumeGitHubSource.extractMeta({
+    const meta = extractGitHubMeta({
       id: "123",
       reason: "mention",
       unread: true,

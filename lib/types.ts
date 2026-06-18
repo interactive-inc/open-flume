@@ -1,10 +1,8 @@
 import type { z } from "zod/v4"
-import type {
-  FlumeGatewayMessageSchema,
-  FlumeGitHubNotificationSchema,
-  FlumeSlackConnectionResponseSchema,
-  FlumeSlackEnvelopeSchema,
-} from "@/schema"
+import type { FlumeGatewayMessageSchema } from "@/discord/discord-gateway-message-schema"
+import type { FlumeGitHubNotificationSchema } from "@/github/github-notification-schema"
+import type { FlumeSlackConnectionResponseSchema } from "@/slack/slack-connection-response-schema"
+import type { FlumeSlackEnvelopeSchema } from "@/slack/slack-envelope-schema"
 
 // Timer
 
@@ -36,6 +34,18 @@ export type FlumeEvent = {
 }
 
 export type FlumeHandler = (event: FlumeEvent) => void | Promise<void>
+
+export type FlumeSource = {
+  readonly name: FlumeSourceName
+  start(handler: FlumeHandler): Promise<void | Error>
+  stop(): Promise<void>
+  status(): FlumeStatus
+}
+
+export type FlumeSourceStatus = {
+  name: FlumeSourceName
+  status: FlumeStatus
+}
 
 // Status
 
