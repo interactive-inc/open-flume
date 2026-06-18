@@ -1,4 +1,5 @@
 import type { FlumeEvent, FlumeHandler, FlumeRuntimeDeps, FlumeSlackEnvelope, FlumeSlackSourceOptions, FlumeStatus } from "@/types"
+import { createFlumeDefaultDeps } from "@/deps"
 import { FlumeLogger } from "@/logger"
 import { FlumeReconnector } from "@/reconnector"
 import { resolveFlumeReconnectConfig } from "@/reconnect-config"
@@ -31,7 +32,7 @@ export class FlumeSlackSource {
   private readonly seen = new FlumeSlackSeenCache({ maxSize: SEEN_CACHE_MAX })
 
   constructor(private readonly options: FlumeSlackSourceOptions) {
-    this.deps = options.deps
+    this.deps = options.deps ?? createFlumeDefaultDeps()
     this.log = new FlumeLogger({ source: "slack", handler: options.onLog, deps: this.deps })
 
     const rc = resolveFlumeReconnectConfig(options.reconnect)

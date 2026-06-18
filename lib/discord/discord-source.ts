@@ -1,4 +1,5 @@
 import type { FlumeDiscordSourceOptions, FlumeEvent, FlumeHandler, FlumeRuntimeDeps, FlumeStatus } from "@/types"
+import { createFlumeDefaultDeps } from "@/deps"
 import { FlumeLogger } from "@/logger"
 import { FlumeReconnector } from "@/reconnector"
 import { resolveFlumeReconnectConfig } from "@/reconnect-config"
@@ -34,7 +35,7 @@ export class FlumeDiscordSource {
   private readonly queue = new FlumeSerialQueue()
 
   constructor(private readonly options: FlumeDiscordSourceOptions) {
-    this.deps = options.deps
+    this.deps = options.deps ?? createFlumeDefaultDeps()
     this.log = new FlumeLogger({ source: "discord", handler: options.onLog, deps: this.deps })
 
     const rc = resolveFlumeReconnectConfig(options.reconnect)

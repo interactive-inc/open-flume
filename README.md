@@ -24,14 +24,13 @@ import { FlumeDiscordSource } from "@interactive-inc/flume/discord"
 import { FlumeSlackSource } from "@interactive-inc/flume/slack"
 import { FlumeGitHubSource } from "@interactive-inc/flume/github"
 
-const deps = createFlumeDefaultDeps()
 const onLog = (log) => console.log(`[${log.level}] ${log.source}/${log.action}: ${log.message}`)
 
 const flume = new Flume({
   sources: [
-    new FlumeDiscordSource({ token: process.env.DISCORD_BOT_TOKEN!, deps, onLog, reconnect: true }),
-    new FlumeSlackSource({ appToken: process.env.SLACK_APP_TOKEN!, deps, onLog, reconnect: true }),
-    new FlumeGitHubSource({ token: process.env.GITHUB_TOKEN!, deps, onLog, pollInterval: 60 }),
+    new FlumeDiscordSource({ token: process.env.DISCORD_BOT_TOKEN!, onLog, reconnect: true }),
+    new FlumeSlackSource({ appToken: process.env.SLACK_APP_TOKEN!, onLog, reconnect: true }),
+    new FlumeGitHubSource({ token: process.env.GITHUB_TOKEN!, onLog, pollInterval: 60 }),
   ],
 })
 
@@ -81,11 +80,9 @@ Sources work standalone — `Flume` is only needed for multi-source orchestratio
 
 ```ts
 import { FlumeDiscordSource } from "@interactive-inc/flume/discord"
-import { createFlumeDefaultDeps } from "@interactive-inc/flume"
 
 const source = new FlumeDiscordSource({
   token: process.env.DISCORD_BOT_TOKEN!,
-  deps: createFlumeDefaultDeps(),
   reconnect: true,
   onLog: (log) => console.log(log),
 })
@@ -206,7 +203,7 @@ Pass an `AbortSignal` to `Flume` (propagates to every source) or to an individua
 const controller = new AbortController()
 
 const flume = new Flume({
-  sources: [new FlumeDiscordSource({ token, deps, signal: controller.signal })],
+  sources: [new FlumeDiscordSource({ token, signal: controller.signal })],
   signal: controller.signal,
 })
 
@@ -220,21 +217,20 @@ If the signal is already aborted at `Flume.start()` time, `start` returns an `Er
 
 ## Dependency injection
 
-Every IO boundary (`fetch`, `WebSocket`, `now`, `random`, timers) lives in `FlumeRuntimeDeps`. The default factory wraps the global equivalents; tests pass mocks:
+Every IO boundary (`fetch`, `WebSocket`, `now`, `random`, timers) lives in `FlumeRuntimeDeps`. `deps` is optional on every source — when omitted, `createFlumeDefaultDeps()` wraps the global equivalents. Override only when you need mocks or runtime-specific shims.
 
 ```ts
 import { createFlumeDefaultDeps } from "@interactive-inc/flume"
 
-const deps = {
-  ...createFlumeDefaultDeps(),
-  fetch: mockFetch,
-  WebSocket: MockWebSocket,
-  now: () => 1_000,
-  random: () => 0.5,
-}
+new FlumeDiscordSource({
+  token,
+  deps: {
+    ...createFlumeDefaultDeps(),
+    fetch: mockFetch,
+    now: () => 1_000,
+  },
+})
 ```
-
-`Flume` accepts `Partial<FlumeRuntimeDeps>` and merges over the defaults — override only what you need.
 
 ## Errors
 
@@ -259,7 +255,7 @@ GitHub also exposes `gh auth token` if you want to reuse the `gh` CLI's session:
 ```ts
 import { execSync } from "node:child_process"
 const token = execSync("gh auth token").toString().trim()
-const github = new FlumeGitHubSource({ token, deps: createFlumeDefaultDeps() })
+const github = new FlumeGitHubSource({ token })
 ```
 
 ## Module layout

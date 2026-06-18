@@ -1,4 +1,5 @@
 import type { FlumeEvent, FlumeGitHubNotification, FlumeGitHubSourceOptions, FlumeHandler, FlumeRuntimeDeps, FlumeStatus } from "@/types"
+import { createFlumeDefaultDeps } from "@/deps"
 import { FlumeLogger } from "@/logger"
 import { FlumeSerialQueue } from "@/utils/serial-queue"
 import { extractGitHubMeta } from "@/github/extract-github-meta"
@@ -19,7 +20,7 @@ export class FlumeGitHubSource {
   private readonly queue = new FlumeSerialQueue()
 
   constructor(private readonly options: FlumeGitHubSourceOptions) {
-    this.deps = options.deps
+    this.deps = options.deps ?? createFlumeDefaultDeps()
     this.log = new FlumeLogger({ source: "github", handler: options.onLog, deps: this.deps })
   }
 

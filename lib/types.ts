@@ -105,7 +105,7 @@ export type FlumeSourceOptions = {
   onStatus?: FlumeStatusHandler
   onLog?: FlumeLogHandler
   signal?: AbortSignal
-  deps: FlumeRuntimeDeps
+  deps?: FlumeRuntimeDeps
 }
 
 export type FlumeDiscordSourceOptions = FlumeSourceOptions & {
