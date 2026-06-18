@@ -4,11 +4,11 @@ Unified notification listener for Discord, Slack, and GitHub. Raw WebSocket + `f
 
 ```
 Discord  ─┐
-Slack    ─┼──→  FlumeSource.start(handler)  ──→  FlumeEvent
+Slack    ─┼──▶  Flume  ──start(handler)──▶  FlumeEvent  (one merged stream)
 GitHub   ─┘
 ```
 
-Flume only **receives**. It opens the WebSocket / polls the API, parses the payload with Zod, and hands you a typed event. Sending replies is out of scope — bring your own HTTP call.
+Flume only **receives**. It opens the WebSocket / polls the API, parses the payload with Zod, serializes events through a per-source queue, and hands you a typed event. Sending replies is out of scope — bring your own HTTP call.
 
 ## Install
 
@@ -19,7 +19,7 @@ npm add @interactive-inc/flume
 ## Quick start
 
 ```ts
-import { Flume, createFlumeDefaultDeps } from "@interactive-inc/flume"
+import { Flume } from "@interactive-inc/flume"
 import { FlumeDiscordSource } from "@interactive-inc/flume/discord"
 import { FlumeSlackSource } from "@interactive-inc/flume/slack"
 import { FlumeGitHubSource } from "@interactive-inc/flume/github"
@@ -95,12 +95,12 @@ if (error instanceof Error) throw error
 
 Each source has a dedicated entry — importing one does not pull the others into your bundle. The root entry never loads source-specific code.
 
-| sub-entry                          | classes                                                                                                                       |
-|------------------------------------|-------------------------------------------------------------------------------------------------------------------------------|
-| `@interactive-inc/flume`           | `Flume`, `FlumeRunning`, `FlumeStopped`, `FlumeLogger`, `FlumeReconnector`, `createFlumeDefaultDeps`, errors, types           |
-| `@interactive-inc/flume/discord`   | `FlumeDiscordSource`, `FlumeDiscordGateway`, `FlumeDiscordGatewayIntents`, `FlumeDiscordHeartbeat`, `FlumeGatewayMessageSchema` |
-| `@interactive-inc/flume/slack`     | `FlumeSlackSource`, `FlumeSlackSocketMode`, `obtainSlackUrl`, `FlumeSlackEnvelopeSchema`, `FlumeSlackConnectionResponseSchema` |
-| `@interactive-inc/flume/github`    | `FlumeGitHubSource`, `FlumeGitHubPoller`, `FlumeGitHubSeenCache`, `FlumeGitHubNotificationSchema`                              |
+| sub-entry                          | exports                                                                                                                                                                   |
+|------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `@interactive-inc/flume`           | `Flume`, `FlumeRunning`, `FlumeStopped`, `FlumeLogger`, `FlumeReconnector`, `scheduleFlumeReconnect`, `createFlumeDefaultDeps`, errors, types                              |
+| `@interactive-inc/flume/discord`   | `FlumeDiscordSource`, `FlumeDiscordGateway`, `FlumeDiscordGatewayIntents`, `FlumeDiscordHeartbeat`, `FlumeDiscordGatewaySession`, `parseDiscordGatewayMessage`, `extractDiscordMeta`, `FlumeGatewayMessageSchema` |
+| `@interactive-inc/flume/slack`     | `FlumeSlackSource`, `FlumeSlackSocketMode`, `FlumeSlackSeenCache`, `obtainSlackUrl`, `extractSlackMeta`, `FlumeSlackEnvelopeSchema`, `FlumeSlackConnectionResponseSchema`   |
+| `@interactive-inc/flume/github`    | `FlumeGitHubSource`, `FlumeGitHubPoller`, `FlumeGitHubSeenCache`, `extractGitHubMeta`, `FlumeGitHubNotificationSchema`                                                     |
 
 ```ts
 import { Flume } from "@interactive-inc/flume"
@@ -232,6 +232,13 @@ new FlumeDiscordSource({
 })
 ```
 
+## Safety
+
+- **Backpressure** — each source has its own `FlumeSerialQueue`. Handler invocations are awaited and run one at a time per source, so async handlers don't race and `stop()` drains in-flight events before transitioning state.
+- **Duplicate suppression** — Slack envelopes are deduped by `envelope_id` (`FlumeSlackSeenCache`) to absorb ack retries. GitHub notifications are deduped by `id + updated_at` (`FlumeGitHubSeenCache`). Discord uses session resume so the Gateway does not re-emit dispatches.
+- **Partial-failure rollback** — if any source fails during `Flume.start()`, the already-started sources are stopped and an `Error` is returned with per-source detail.
+- **Idempotent stop** — `FlumeRunning.stop()` is safe to call concurrently; the first call wins and subsequent callers receive the same `FlumeStopped` snapshot.
+
 ## Errors
 
 Flume does not throw on protocol/network failures. Connection methods return `T | Error` and you check `instanceof`:
@@ -261,11 +268,14 @@ const github = new FlumeGitHubSource({ token })
 ## Module layout
 
 - `Flume` / `FlumeRunning` / `FlumeStopped` — type-state FSM merging multiple sources into one stream
-- `FlumeDiscordSource` / `FlumeSlackSource` / `FlumeGitHubSource` — high-level sources (each implements `FlumeSource`)
+- `FlumeDiscordSource` / `FlumeSlackSource` / `FlumeGitHubSource` — high-level sources (each conforms to the structural `FlumeSource` type)
 - `FlumeDiscordGateway` / `FlumeSlackSocketMode` / `FlumeGitHubPoller` — protocol layer
-- `FlumeReconnector` — exponential backoff with jitter
+- `FlumeDiscordGatewaySession` — immutable session value object (id / seq / resume URL) carried across Discord reconnects
+- `FlumeSlackSeenCache` / `FlumeGitHubSeenCache` — per-source duplicate suppression
+- `FlumeReconnector` + `scheduleFlumeReconnect` — exponential backoff with jitter + shared reconnect scheduler
 - `FlumeLogger` — structured log emitter (feeds `onLog`)
 - `FlumeRuntimeDeps` — IO boundary port (`fetch`, `WebSocket`, `now`, `random`, timers)
+- `extractDiscordMeta` / `extractSlackMeta` / `extractGitHubMeta` — pure functions that build `FlumeEvent.meta` from each protocol's payload shape
 - Per-source Zod schemas: `FlumeGatewayMessageSchema` (discord), `FlumeSlackEnvelopeSchema` / `FlumeSlackConnectionResponseSchema` (slack), `FlumeGitHubNotificationSchema` (github)
 
 ## Development
