@@ -1,5 +1,6 @@
 import type { FlumeEvent, FlumeGitHubNotification, FlumeGitHubSourceOptions, FlumeHandler, FlumeRuntimeDeps, FlumeStatus } from "@/types"
 import { createFlumeDefaultDeps } from "@/deps"
+import { FlumeStartError } from "@/errors/start-error"
 import { FlumeLogger } from "@/logger"
 import { FlumeSerialQueue } from "@/utils/serial-queue"
 import { extractGitHubMeta } from "@/github/extract-github-meta"
@@ -24,8 +25,10 @@ export class FlumeGitHubSource {
     this.log = new FlumeLogger({ source: "github", handler: options.onLog, deps: this.deps })
   }
 
-  async start(handler: FlumeHandler): Promise<void | Error> {
-    if (this.options.signal?.aborted) return new Error("GitHub source: signal already aborted")
+  async start(handler: FlumeHandler): Promise<Error | null> {
+    if (this.options.signal?.aborted) {
+      return new FlumeStartError("GitHub source: signal already aborted")
+    }
 
     this.options.signal?.addEventListener("abort", () => this.stop(), { once: true })
 
@@ -50,6 +53,8 @@ export class FlumeGitHubSource {
       this.setStatus("disconnected")
       return err
     }
+
+    return null
   }
 
   async stop(): Promise<void> {

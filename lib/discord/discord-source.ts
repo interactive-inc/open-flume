@@ -4,6 +4,7 @@ import { FlumeLogger } from "@/logger"
 import { FlumeReconnector } from "@/reconnector"
 import { resolveFlumeReconnectConfig } from "@/reconnect-config"
 import { FlumeConnectionError } from "@/errors/connection-error"
+import { FlumeStartError } from "@/errors/start-error"
 import { FlumeSerialQueue } from "@/utils/serial-queue"
 import { scheduleFlumeReconnect } from "@/schedule-reconnect"
 import { extractDiscordMeta } from "@/discord/extract-discord-meta"
@@ -45,15 +46,17 @@ export class FlumeDiscordSource {
     }
   }
 
-  async start(handler: FlumeHandler): Promise<void | Error> {
-    if (this.options.signal?.aborted) return new Error("Discord source: signal already aborted")
+  async start(handler: FlumeHandler): Promise<Error | null> {
+    if (this.options.signal?.aborted) {
+      return new FlumeStartError("Discord source: signal already aborted")
+    }
 
     this.options.signal?.addEventListener("abort", () => this.stop(), { once: true })
 
     this.handler = handler
     this.log.info({ action: "start", message: "starting Discord source" })
 
-    return this.connectInternal()
+    return await this.connectInternal()
   }
 
   async stop(): Promise<void> {
@@ -73,7 +76,7 @@ export class FlumeDiscordSource {
     return this.currentStatus
   }
 
-  private async connectInternal(resumeUrl?: string): Promise<void | Error> {
+  private async connectInternal(resumeUrl?: string): Promise<Error | null> {
     this.setStatus("connecting")
 
     this.gateway = new FlumeDiscordGateway({
@@ -97,6 +100,8 @@ export class FlumeDiscordSource {
 
       this.scheduleReconnect()
     }
+
+    return null
   }
 
   private handleDispatch(eventName: string, eventData: Record<string, unknown>): void {

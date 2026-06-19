@@ -1,4 +1,5 @@
 import type { FlumeHandler, FlumeSource } from "@/types"
+import { FlumeStartError } from "@/errors/start-error"
 import { FlumeRunning } from "@/flume-running"
 
 type Props = {
@@ -15,13 +16,13 @@ export class Flume {
 
   constructor(private readonly props: Props) {}
 
-  async start(handler: FlumeHandler): Promise<FlumeRunning | Error> {
+  async start(handler: FlumeHandler): Promise<FlumeRunning | FlumeStartError> {
     if (this.consumed) {
-      return new Error("Flume.start: already started")
+      return new FlumeStartError("Flume.start: already started")
     }
 
     if (this.props.signal?.aborted) {
-      return new Error("Flume.start: signal already aborted")
+      return new FlumeStartError("Flume.start: signal already aborted")
     }
 
     this.consumed = true
@@ -53,13 +54,13 @@ export class Flume {
       await Promise.allSettled(started.map((source) => source.stop()))
 
       const detail = failures.map((f) => `${f.name}: ${f.error.message}`).join("; ")
-      return new Error(`Flume.start: ${failures.length} source(s) failed: ${detail}`)
+      return new FlumeStartError(`Flume.start: ${failures.length} source(s) failed: ${detail}`)
     }
 
     if (this.props.signal?.aborted) {
       await Promise.allSettled(this.props.sources.map((source) => source.stop()))
 
-      return new Error("Flume.start: aborted during start")
+      return new FlumeStartError("Flume.start: aborted during start")
     }
 
     return new FlumeRunning({ sources: this.props.sources, signal: this.props.signal })

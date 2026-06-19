@@ -37,7 +37,7 @@ export type FlumeHandler = (event: FlumeEvent) => void | Promise<void>
 
 export type FlumeSource = {
   readonly name: FlumeSourceName
-  start(handler: FlumeHandler): Promise<void | Error>
+  start(handler: FlumeHandler): Promise<Error | null>
   stop(): Promise<void>
   status(): FlumeStatus
 }
@@ -115,7 +115,14 @@ export type FlumeDiscordSourceOptions = FlumeSourceOptions & {
 
 export type FlumeSlackSourceOptions = FlumeSourceOptions & {
   appToken: string
-  botToken?: string
+  /**
+   * Bot token (`xoxb-`). Required — used by the host (e.g. funnel) to call
+   * `auth.test` for self-detection and to post replies. Flume's Socket Mode
+   * transport only needs `appToken` to open the socket, but every realistic
+   * consumer needs the bot token too, so the type forces it to be present
+   * rather than leaving it optional and failing at runtime.
+   */
+  botToken: string
 }
 
 export type FlumeGitHubSourceOptions = FlumeSourceOptions & {

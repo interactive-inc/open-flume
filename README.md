@@ -29,7 +29,7 @@ const onLog = (log) => console.log(`[${log.level}] ${log.source}/${log.action}: 
 const flume = new Flume({
   sources: [
     new FlumeDiscordSource({ token: process.env.DISCORD_BOT_TOKEN!, onLog, reconnect: true }),
-    new FlumeSlackSource({ appToken: process.env.SLACK_APP_TOKEN!, onLog, reconnect: true }),
+    new FlumeSlackSource({ appToken: process.env.SLACK_APP_TOKEN!, botToken: process.env.SLACK_BOT_TOKEN!, onLog, reconnect: true }),
     new FlumeGitHubSource({ token: process.env.GITHUB_TOKEN!, onLog, pollInterval: 60 }),
   ],
 })
@@ -53,7 +53,7 @@ Flume  ──start()──▶  FlumeRunning  ──stop()──▶  FlumeStopped
 (idle)               (running)                  (terminal)
 ```
 
-- `Flume.start(handler)` returns `FlumeRunning | Error`. On partial failure (one source fails while another succeeds), the already-started sources are rolled back and an `Error` is returned with per-source detail.
+- `Flume.start(handler)` returns `FlumeRunning | FlumeStartError`. Branch with `instanceof Error`. On partial failure (one source fails while another succeeds), the already-started sources are rolled back and a `FlumeStartError` is returned with per-source detail in `.message`.
 - `FlumeRunning.stop()` returns a `FlumeStopped` snapshot. `stop()` is idempotent and concurrent-safe.
 - `FlumeStopped` exposes only `statuses()` — a frozen snapshot of each source's final state. No `start`, no `stop`, no leaking source references.
 - An `AbortSignal` on `Flume` drives an automatic transition to `FlumeStopped`.
@@ -97,7 +97,7 @@ Each source has a dedicated entry — importing one does not pull the others int
 
 | sub-entry                          | exports                                                                                                                                                                   |
 |------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `@interactive-inc/flume`           | `Flume`, `FlumeRunning`, `FlumeStopped`, `FlumeLogger`, `FlumeReconnector`, `scheduleFlumeReconnect`, `createFlumeDefaultDeps`, errors, types                              |
+| `@interactive-inc/flume`           | `Flume`, `FlumeRunning`, `FlumeStopped`, `FlumeLogger`, `FlumeReconnector`, `createFlumeDefaultDeps`, errors, types                          |
 | `@interactive-inc/flume/discord`   | `FlumeDiscordSource`, `FlumeDiscordGateway`, `FlumeDiscordGatewayIntents`, `FlumeDiscordHeartbeat`, `FlumeDiscordGatewaySession`, `parseDiscordGatewayMessage`, `extractDiscordMeta`, `FlumeGatewayMessageSchema` |
 | `@interactive-inc/flume/slack`     | `FlumeSlackSource`, `FlumeSlackSocketMode`, `FlumeSlackSeenCache`, `obtainSlackUrl`, `extractSlackMeta`, `FlumeSlackEnvelopeSchema`, `FlumeSlackConnectionResponseSchema`   |
 | `@interactive-inc/flume/github`    | `FlumeGitHubSource`, `FlumeGitHubPoller`, `FlumeGitHubSeenCache`, `extractGitHubMeta`, `FlumeGitHubNotificationSchema`                                                     |
@@ -207,13 +207,14 @@ const flume = new Flume({
   signal: controller.signal,
 })
 
+```ts
 const running = await flume.start(handler)
 if (running instanceof Error) throw running
 
 controller.abort() // FlumeRunning auto-transitions to FlumeStopped
 ```
 
-If the signal is already aborted at `Flume.start()` time, `start` returns an `Error` and no source is touched.
+If the signal is already aborted at `Flume.start()` time, `start` returns a `FlumeStartError` and no source is touched.
 
 ## Dependency injection
 
@@ -236,13 +237,14 @@ new FlumeDiscordSource({
 
 - **Backpressure** — each source has its own `FlumeSerialQueue`. Handler invocations are awaited and run one at a time per source, so async handlers don't race and `stop()` drains in-flight events before transitioning state.
 - **Duplicate suppression** — Slack envelopes are deduped by `envelope_id` (`FlumeSlackSeenCache`) to absorb ack retries. GitHub notifications are deduped by `id + updated_at` (`FlumeGitHubSeenCache`). Discord uses session resume so the Gateway does not re-emit dispatches.
-- **Partial-failure rollback** — if any source fails during `Flume.start()`, the already-started sources are stopped and an `Error` is returned with per-source detail.
+- **Partial-failure rollback** — if any source fails during `Flume.start()`, the already-started sources are stopped and a `FlumeStartError` is returned with per-source detail.
 - **Idempotent stop** — `FlumeRunning.stop()` is safe to call concurrently; the first call wins and subsequent callers receive the same `FlumeStopped` snapshot.
 
 ## Errors
 
-Flume does not throw on protocol/network failures. Connection methods return `T | Error` and you check `instanceof`:
+Flume does not throw on protocol/network failures. Every entry point returns `T | Error` — branch with `instanceof Error`. `Flume.start()` returns `FlumeRunning | FlumeStartError`; `Source.start()` returns `Error | null`; protocol-layer helpers (`FlumeDiscordGateway.connect()`, `obtainSlackUrl()`, …) return `T | Error`:
 
+- `FlumeStartError` — `Flume.start()` / `Source.start()` refused or failed (already started, signal aborted, partial-failure rollback)
 - `FlumeConnectionError` — WebSocket closed before ready
 - `FlumeHttpError` — HTTP call returned an error payload (e.g. Slack `ok: false`)
 - `FlumeParseError` — Unparseable WebSocket frame
@@ -254,7 +256,7 @@ Internal handler exceptions are caught and logged (never rethrown into the proto
 | source  | transport                         | auth                                          |
 |---------|----------------------------------|-----------------------------------------------|
 | Discord | Gateway WebSocket v10 (JSON)     | bot token                                     |
-| Slack   | Socket Mode WebSocket            | app token (`botToken` optional, for future)  |
+| Slack   | Socket Mode WebSocket            | app token + bot token (both required)         |
 | GitHub  | REST polling `/notifications`    | personal access token                         |
 
 GitHub also exposes `gh auth token` if you want to reuse the `gh` CLI's session:
@@ -272,7 +274,7 @@ const github = new FlumeGitHubSource({ token })
 - `FlumeDiscordGateway` / `FlumeSlackSocketMode` / `FlumeGitHubPoller` — protocol layer
 - `FlumeDiscordGatewaySession` — immutable session value object (id / seq / resume URL) carried across Discord reconnects
 - `FlumeSlackSeenCache` / `FlumeGitHubSeenCache` — per-source duplicate suppression
-- `FlumeReconnector` + `scheduleFlumeReconnect` — exponential backoff with jitter + shared reconnect scheduler
+- `FlumeReconnector` — exponential backoff with jitter (the internal `scheduleFlumeReconnect` helper is not exported; sources wire it themselves)
 - `FlumeLogger` — structured log emitter (feeds `onLog`)
 - `FlumeRuntimeDeps` — IO boundary port (`fetch`, `WebSocket`, `now`, `random`, timers)
 - `extractDiscordMeta` / `extractSlackMeta` / `extractGitHubMeta` — pure functions that build `FlumeEvent.meta` from each protocol's payload shape

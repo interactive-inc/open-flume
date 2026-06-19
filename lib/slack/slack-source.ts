@@ -1,5 +1,6 @@
 import type { FlumeEvent, FlumeHandler, FlumeRuntimeDeps, FlumeSlackEnvelope, FlumeSlackSourceOptions, FlumeStatus } from "@/types"
 import { createFlumeDefaultDeps } from "@/deps"
+import { FlumeStartError } from "@/errors/start-error"
 import { FlumeLogger } from "@/logger"
 import { FlumeReconnector } from "@/reconnector"
 import { resolveFlumeReconnectConfig } from "@/reconnect-config"
@@ -42,15 +43,17 @@ export class FlumeSlackSource {
     }
   }
 
-  async start(handler: FlumeHandler): Promise<void | Error> {
-    if (this.options.signal?.aborted) return new Error("Slack source: signal already aborted")
+  async start(handler: FlumeHandler): Promise<Error | null> {
+    if (this.options.signal?.aborted) {
+      return new FlumeStartError("Slack source: signal already aborted")
+    }
 
     this.options.signal?.addEventListener("abort", () => this.stop(), { once: true })
 
     this.handler = handler
     this.log.info({ action: "start", message: "starting Slack source" })
 
-    return this.connectInternal()
+    return await this.connectInternal()
   }
 
   async stop(): Promise<void> {
@@ -70,7 +73,7 @@ export class FlumeSlackSource {
     return this.currentStatus
   }
 
-  private async connectInternal(): Promise<void | Error> {
+  private async connectInternal(): Promise<Error | null> {
     this.setStatus("connecting")
 
     this.socket = new FlumeSlackSocketMode({
@@ -100,6 +103,8 @@ export class FlumeSlackSource {
 
       this.scheduleReconnect()
     }
+
+    return null
   }
 
   private handleMessage(envelope: FlumeSlackEnvelope): void {

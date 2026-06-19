@@ -101,6 +101,7 @@ describe("FlumeSlackSource", () => {
 
     const source = new FlumeSlackSource({
       appToken: "xapp-test",
+      botToken: "xoxb-test",
       reconnect: false,
       deps: createDeps(),
     })
@@ -140,6 +141,7 @@ describe("FlumeSlackSource", () => {
 
     const source = new FlumeSlackSource({
       appToken: "xapp-test",
+      botToken: "xoxb-test",
       reconnect: false,
       onStatus: (s) => { statuses.push(s) },
       deps: createDeps(),
@@ -164,6 +166,7 @@ describe("FlumeSlackSource", () => {
   it("status() returns current status", () => {
     const source = new FlumeSlackSource({
       appToken: "xapp-test",
+      botToken: "xoxb-test",
       reconnect: false,
       deps: createDeps(),
     })
@@ -180,6 +183,7 @@ describe("FlumeSlackSource", () => {
 
     const source = new FlumeSlackSource({
       appToken: "xapp-test",
+      botToken: "xoxb-test",
       reconnect: false,
       signal: controller.signal,
       deps: {

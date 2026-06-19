@@ -10,19 +10,26 @@ type MockSource = FlumeSource & {
   stopCount: number
 }
 
-function createMockSource(options?: { failOnStart?: Error; returnErrorOnStart?: Error; name?: "discord" | "slack" | "github" }): MockSource {
+function createMockSource(options?: {
+  failOnStart?: Error
+  returnErrorOnStart?: Error
+  name?: "discord" | "slack" | "github"
+}): MockSource {
   let handler: FlumeHandler | null = null
   let currentStatus: FlumeStatus = "disconnected"
   const mock: MockSource = {
     name: options?.name ?? "discord",
     startCount: 0,
     stopCount: 0,
-    async start(h: FlumeHandler): Promise<void | Error> {
+    async start(h: FlumeHandler): Promise<Error | null> {
       mock.startCount += 1
       if (options?.failOnStart) throw options.failOnStart
-      if (options?.returnErrorOnStart) return options.returnErrorOnStart
+      if (options?.returnErrorOnStart) {
+        return options.returnErrorOnStart
+      }
       handler = h
       currentStatus = "connected"
+      return null
     },
     async stop(): Promise<void> {
       mock.stopCount += 1
@@ -46,9 +53,9 @@ describe("Flume", () => {
     const flume = new Flume({ sources: [a, b] })
     const handler = vi.fn()
 
-    const running = await flume.start(handler)
+    const result = await flume.start(handler)
 
-    expect(running).toBeInstanceOf(FlumeRunning)
+    expect(result).toBeInstanceOf(FlumeRunning)
     expect(a.startCount).toBe(1)
     expect(b.startCount).toBe(1)
   })
@@ -74,10 +81,11 @@ describe("Flume", () => {
     const result = await flume.start(vi.fn())
 
     expect(result).toBeInstanceOf(Error)
+    if (result instanceof Error) expect(result.message).toContain("slack: boom")
     expect(a.stopCount).toBe(1)
   })
 
-  it("rolls back started sources when one returns Error", async () => {
+  it("rolls back started sources when one returns error", async () => {
     const a = createMockSource()
     const b = createMockSource({ returnErrorOnStart: new Error("connect refused"), name: "slack" })
     const flume = new Flume({ sources: [a, b] })
@@ -118,8 +126,8 @@ describe("FlumeRunning", () => {
     const a = createMockSource()
     const b = createMockSource()
     const flume = new Flume({ sources: [a, b] })
-    const running = await flume.start(vi.fn())
 
+    const running = await flume.start(vi.fn())
     if (running instanceof Error) throw running
 
     const stopped = await running.stop()
@@ -132,8 +140,8 @@ describe("FlumeRunning", () => {
   it("stop is idempotent and concurrent-safe", async () => {
     const a = createMockSource()
     const flume = new Flume({ sources: [a] })
-    const running = await flume.start(vi.fn())
 
+    const running = await flume.start(vi.fn())
     if (running instanceof Error) throw running
 
     const [first, second] = await Promise.all([running.stop(), running.stop()])
@@ -146,9 +154,7 @@ describe("FlumeRunning", () => {
     const a = createMockSource()
     const controller = new AbortController()
     const flume = new Flume({ sources: [a], signal: controller.signal })
-    const running = await flume.start(vi.fn())
-
-    if (running instanceof Error) throw running
+    await flume.start(vi.fn())
 
     controller.abort()
     await new Promise((resolve) => setTimeout(resolve, 0))
@@ -160,8 +166,8 @@ describe("FlumeRunning", () => {
     const a = createMockSource({ name: "discord" })
     const b = createMockSource({ name: "slack" })
     const flume = new Flume({ sources: [a, b] })
-    const running = await flume.start(vi.fn())
 
+    const running = await flume.start(vi.fn())
     if (running instanceof Error) throw running
 
     expect(running.statuses()).toEqual([
@@ -175,8 +181,8 @@ describe("FlumeStopped", () => {
   it("exposes a snapshot of final statuses without raw sources", async () => {
     const a = createMockSource({ name: "discord" })
     const flume = new Flume({ sources: [a] })
-    const running = await flume.start(vi.fn())
 
+    const running = await flume.start(vi.fn())
     if (running instanceof Error) throw running
 
     const stopped = await running.stop()
