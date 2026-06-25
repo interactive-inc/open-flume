@@ -5,12 +5,14 @@ user-invocable: false
 disable-model-invocation: false
 metadata:
   author: shigurenimo
+  type: reference
   description: 製品設計・UI 設計・ドメイン設計・コード設計をカバーする設計指針スキル。
+  design: 製品からコードまでの設計手法を採用済みの線路として束ね設計判断に適用する指針スキル。コード設計やドメイン設計の判断を左右する土台となる。
   dev: true
   tags: [docs]
 ---
 
-> このスキルを更新するときは [README.md](README.md) の方針に従う。
+> このスキルを更新するときは [CLAUDE.md](CLAUDE.md) の方針に従う。
 
 # Product Design
 
@@ -34,6 +36,10 @@ OOUI + UX 5 planes (Structure, Skeleton, Surface). Ref: [ux-five-planes.md](refe
 ## Screen Order
 
 操作順でなく、不安を解消する順に並べる。
+
+## Page Routing
+
+URL はレイアウトの入れ子を反映し、リソース指向にする。パラメータ名は `:id` でなく単数リソース名（`/users/:user/posts/:post`）。詳細 ⇒ [page-routing.md](references/page-routing.md)
 
 # Domain Design
 

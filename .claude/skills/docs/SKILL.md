@@ -1,13 +1,15 @@
 ---
 name: docs
 description: .docs/ documentation management.
-argument-hint: "[drift|links|next] [scope]"
+argument-hint: "[drift|links|next|features-sync] [scope]"
 when_to_use: Writing or maintaining product docs under .docs/.
 user-invocable: true
 disable-model-invocation: false
 metadata:
+  type: reference
   description: .docs/ 配下の製品ドキュメント（仕様・意思決定・バックログ・顧客の声）を管理し、コードと矛盾がない状態を保つ。
   author: shigurenimo
+  design: ナレッジグラフとして相互リンクした製品ドキュメントを管理し、コードとの矛盾検出や乖離更新を行う。設計判断と整合性維持の質が要となる。
   dev: true
   tags: [docs]
 ---
@@ -92,7 +94,7 @@ metadata:
 棲み分け。
 
 - references/terms/ = 製品の外にある専門知識のアトミック定義（グラフのノード）
-- notes/ = 長文の解説・深掘り（terms から文中でリンクする先）
+- notes/ = 長文の解説・深掘り（terms から文中でリンクする先）。一時的な棚卸し・調査メモ（`ephemeral: true`）も置く。詳細は [notes.md](references/notes.md)
 - glossary.md = 用語の索引、および機能名・製品固有用語の定義
 - features/ = 製品の機能
 

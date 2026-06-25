@@ -3,6 +3,7 @@ RyukyuInteractive/inta#open-libraries:
   - .claude/rules/ts.md
   - .claude/skills/docs/SKILL.md
   - .claude/skills/docs/commands/drift.md
+  - .claude/skills/docs/commands/features-sync.md
   - .claude/skills/docs/commands/links.md
   - .claude/skills/docs/commands/next.md
   - .claude/skills/docs/references/api-schema.md
@@ -19,6 +20,7 @@ RyukyuInteractive/inta#open-libraries:
   - .claude/skills/docs/references/integrations.md
   - .claude/skills/docs/references/manual.md
   - .claude/skills/docs/references/milestones.md
+  - .claude/skills/docs/references/notes.md
   - .claude/skills/docs/references/page-capabilities.md
   - .claude/skills/docs/references/pages.md
   - .claude/skills/docs/references/roles-and-permissions.md
@@ -30,7 +32,7 @@ RyukyuInteractive/inta#open-libraries:
   - .claude/skills/docs/references/value.md
   - .claude/skills/docs/references/writing-rules.md
   - .claude/skills/gh-issue-template/SKILL.md
-  - .claude/skills/software-design/README.md
+  - .claude/skills/software-design/CLAUDE.md
   - .claude/skills/software-design/SKILL.md
   - .claude/skills/software-design/references/api.md
   - .claude/skills/software-design/references/architecture.md
@@ -38,6 +40,7 @@ RyukyuInteractive/inta#open-libraries:
   - .claude/skills/software-design/references/error-handling.md
   - .claude/skills/software-design/references/fluent-api.md
   - .claude/skills/software-design/references/fsm.md
+  - .claude/skills/software-design/references/page-routing.md
   - .claude/skills/software-design/references/phantom-type.md
   - .claude/skills/software-design/references/react.md
   - .claude/skills/software-design/references/reducer.md
