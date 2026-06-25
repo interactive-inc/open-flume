@@ -108,6 +108,54 @@ describe("Flume", () => {
     expect(a.startCount).toBe(1)
   })
 
+  it("rolls back two started sources when the third fails", async () => {
+    const a = createMockSource({ name: "discord" })
+    const b = createMockSource({ name: "slack" })
+    const c = createMockSource({ returnErrorOnStart: new Error("c-failed"), name: "github" })
+    const flume = new Flume({ sources: [a, b, c] })
+
+    const result = await flume.start(vi.fn())
+
+    expect(result).toBeInstanceOf(Error)
+    expect(a.stopCount).toBe(1)
+    expect(b.stopCount).toBe(1)
+    expect(c.stopCount).toBe(0)
+  })
+
+  it("aggregates messages from multiple failing sources", async () => {
+    const a = createMockSource({ returnErrorOnStart: new Error("a-failed"), name: "discord" })
+    const b = createMockSource({ returnErrorOnStart: new Error("b-failed"), name: "slack" })
+    const flume = new Flume({ sources: [a, b] })
+
+    const result = await flume.start(vi.fn())
+
+    expect(result).toBeInstanceOf(Error)
+    if (result instanceof Error) {
+      expect(result.message).toContain("discord: a-failed")
+      expect(result.message).toContain("slack: b-failed")
+    }
+  })
+
+  it("logs rollback failures via onLog when a source's stop() rejects", async () => {
+    const a = createMockSource({ name: "discord" })
+    const failingStop: typeof a.stop = async () => {
+      throw new Error("stop-failed")
+    }
+    a.stop = failingStop
+    const b = createMockSource({ returnErrorOnStart: new Error("b-failed"), name: "slack" })
+    const captured: Array<{ action: string; level: string }> = []
+    const flume = new Flume({
+      sources: [a, b],
+      onLog: (log) => {
+        captured.push({ action: log.action, level: log.level })
+      },
+    })
+
+    await flume.start(vi.fn())
+
+    expect(captured.some((c) => c.action === "flume.rollback.failed")).toBe(true)
+  })
+
   it("refuses start if signal already aborted", async () => {
     const a = createMockSource()
     const controller = new AbortController()
@@ -171,8 +219,8 @@ describe("FlumeRunning", () => {
     if (running instanceof Error) throw running
 
     expect(running.statuses()).toEqual([
-      { name: "discord", status: "connected" },
-      { name: "slack", status: "connected" },
+      { source: "discord", status: "connected" },
+      { source: "slack", status: "connected" },
     ])
   })
 })
@@ -187,6 +235,6 @@ describe("FlumeStopped", () => {
 
     const stopped = await running.stop()
 
-    expect(stopped.statuses()).toEqual([{ name: "discord", status: "disconnected" }])
+    expect(stopped.statuses()).toEqual([{ source: "discord", status: "disconnected" }])
   })
 })

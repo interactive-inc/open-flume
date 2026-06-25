@@ -5,7 +5,6 @@ type Props = {
 }
 
 export class FlumeDiscordGatewaySession {
-
   readonly sessionId: string | null
 
   readonly resumeUrl: string | null
@@ -28,7 +27,11 @@ export class FlumeDiscordGatewaySession {
   }
 
   withSeq(seq: number): FlumeDiscordGatewaySession {
-    return new FlumeDiscordGatewaySession({ sessionId: this.sessionId, resumeUrl: this.resumeUrl, seq })
+    return new FlumeDiscordGatewaySession({
+      sessionId: this.sessionId,
+      resumeUrl: this.resumeUrl,
+      seq,
+    })
   }
 
   withReady(sessionId: string, resumeUrl: string): FlumeDiscordGatewaySession {

@@ -1,6 +1,8 @@
 import type { FlumeGitHubNotification } from "@/types"
 
-export function extractGitHubMeta(notification: FlumeGitHubNotification): Record<string, string> {
+export function flumeExtractGitHubMeta(
+  notification: FlumeGitHubNotification,
+): Record<string, string> {
   return {
     event_type: "notification",
     reason: notification.reason,

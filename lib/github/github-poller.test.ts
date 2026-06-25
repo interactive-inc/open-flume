@@ -23,7 +23,10 @@ function makeJsonResponse(body: unknown, status = 200) {
   })
 }
 
-type Deps = Pick<FlumeRuntimeDeps, "fetch" | "setInterval" | "clearInterval" | "now">
+type Deps = Pick<
+  FlumeRuntimeDeps,
+  "fetch" | "setInterval" | "clearInterval" | "setTimeout" | "clearTimeout" | "now"
+>
 
 function createTestDeps(overrides?: Partial<Deps>) {
   let intervalCallback: (() => void) | null = null
@@ -39,6 +42,8 @@ function createTestDeps(overrides?: Partial<Deps>) {
     fetch: mockFetch,
     setInterval: mockSetInterval,
     clearInterval: mockClearInterval,
+    setTimeout: vi.fn((_fn: () => void, _ms: number) => timerHandle),
+    clearTimeout: vi.fn(),
     now: () => 1000000,
     ...overrides,
   }
@@ -58,7 +63,9 @@ describe("FlumeGitHubPoller", () => {
     const onConnected = vi.fn()
     const onNotifications = vi.fn()
 
-    test.mockFetch.mockResolvedValueOnce(makeJsonResponse([makeNotification("1", "2024-01-01T00:00:00Z")]))
+    test.mockFetch.mockResolvedValueOnce(
+      makeJsonResponse([makeNotification("1", "2024-01-01T00:00:00Z")]),
+    )
 
     const poller = new FlumeGitHubPoller({
       token: "ghp_test",
@@ -79,8 +86,12 @@ describe("FlumeGitHubPoller", () => {
     const test = createTestDeps()
     const onNotifications = vi.fn()
 
-    test.mockFetch.mockResolvedValueOnce(makeJsonResponse([makeNotification("1", "2024-01-01T00:00:00Z")]))
-    test.mockFetch.mockResolvedValueOnce(makeJsonResponse([makeNotification("2", "2024-01-02T00:00:00Z")]))
+    test.mockFetch.mockResolvedValueOnce(
+      makeJsonResponse([makeNotification("1", "2024-01-01T00:00:00Z")]),
+    )
+    test.mockFetch.mockResolvedValueOnce(
+      makeJsonResponse([makeNotification("2", "2024-01-02T00:00:00Z")]),
+    )
 
     const poller = new FlumeGitHubPoller({
       token: "ghp_test",
@@ -132,8 +143,12 @@ describe("FlumeGitHubPoller", () => {
     const test = createTestDeps()
     const onNotifications = vi.fn()
 
-    test.mockFetch.mockResolvedValueOnce(makeJsonResponse([makeNotification("1", "2024-01-01T00:00:00Z")]))
-    test.mockFetch.mockResolvedValueOnce(makeJsonResponse([makeNotification("1", "2024-01-02T00:00:00Z")]))
+    test.mockFetch.mockResolvedValueOnce(
+      makeJsonResponse([makeNotification("1", "2024-01-01T00:00:00Z")]),
+    )
+    test.mockFetch.mockResolvedValueOnce(
+      makeJsonResponse([makeNotification("1", "2024-01-02T00:00:00Z")]),
+    )
 
     const poller = new FlumeGitHubPoller({
       token: "ghp_test",
@@ -232,7 +247,7 @@ describe("FlumeGitHubPoller", () => {
     poller.stop()
 
     expect(test.mockClearInterval).toHaveBeenCalledWith(timerHandle)
-    expect(poller.stopped).toBe(true)
+    expect(poller.isStopped).toBe(true)
   })
 
   it("sends correct Authorization header", async () => {

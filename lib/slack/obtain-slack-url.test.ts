@@ -1,19 +1,20 @@
 import { describe, it, expect, vi } from "vitest"
 import { obtainSlackUrl } from "@/slack/obtain-slack-url"
+import { FlumeConnectionError } from "@/errors/connection-error"
 import { FlumeHttpError } from "@/errors/http-error"
+
+const createMockDeps = (body: unknown, status = 200) => {
+  return {
+    fetch: vi.fn().mockResolvedValue({
+      text: () => Promise.resolve(typeof body === "string" ? body : JSON.stringify(body)),
+      status,
+    }),
+    now: () => 1000,
+  }
+}
 
 describe("obtainSlackUrl", () => {
   const appToken = "xapp-test-token"
-
-  const createMockDeps = (body: unknown, status = 200) => {
-    return {
-      fetch: vi.fn().mockResolvedValue({
-        json: () => Promise.resolve(body),
-        status,
-      }),
-      now: () => 1000,
-    }
-  }
 
   it("returns url when response is ok with url", async () => {
     const deps = createMockDeps({ ok: true, url: "wss://example.com" })
@@ -47,7 +48,18 @@ describe("obtainSlackUrl", () => {
     expect(result).toBeInstanceOf(FlumeHttpError)
   })
 
-  it("returns FlumeHttpError with status 0 when fetch throws", async () => {
+  it("returns FlumeHttpError when body is not JSON, with cause", async () => {
+    const deps = createMockDeps("not-json")
+
+    const result = await obtainSlackUrl({ appToken, deps })
+
+    expect(result).toBeInstanceOf(FlumeHttpError)
+    if (result instanceof FlumeHttpError) {
+      expect(result.cause).toBeDefined()
+    }
+  })
+
+  it("returns FlumeConnectionError when fetch throws (transport failure)", async () => {
     const deps = {
       fetch: vi.fn().mockRejectedValue(new Error("network failure")),
       now: () => 1000,
@@ -55,9 +67,16 @@ describe("obtainSlackUrl", () => {
 
     const result = await obtainSlackUrl({ appToken, deps })
 
-    expect(result).toBeInstanceOf(FlumeHttpError)
-    if (result instanceof FlumeHttpError) {
-      expect(result.status).toBe(0)
-    }
+    expect(result).toBeInstanceOf(FlumeConnectionError)
+  })
+
+  it("passes the AbortSignal through to fetch init", async () => {
+    const deps = createMockDeps({ ok: true, url: "wss://x" })
+    const controller = new AbortController()
+
+    await obtainSlackUrl({ appToken, deps, signal: controller.signal })
+
+    const init = deps.fetch.mock.calls[0]![1]
+    expect(init.signal).toBe(controller.signal)
   })
 })

@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest"
+import { FlumeParseError } from "@/errors/parse-error"
 import { safeJsonParse } from "@/utils/safe-json-parse"
 
 describe("safeJsonParse", () => {
@@ -6,12 +7,25 @@ describe("safeJsonParse", () => {
     expect(safeJsonParse('{"a":1}')).toEqual({ a: 1 })
   })
 
-  it("returns null for invalid JSON", () => {
-    expect(safeJsonParse("not json")).toBe(null)
+  it("returns FlumeParseError for invalid JSON", () => {
+    const result = safeJsonParse("not json")
+
+    expect(result).toBeInstanceOf(FlumeParseError)
   })
 
-  it("returns null for empty string", () => {
-    expect(safeJsonParse("")).toBe(null)
+  it("returns FlumeParseError for empty string", () => {
+    const result = safeJsonParse("")
+
+    expect(result).toBeInstanceOf(FlumeParseError)
+  })
+
+  it("FlumeParseError preserves the underlying SyntaxError as cause", () => {
+    const result = safeJsonParse("{{{")
+
+    expect(result).toBeInstanceOf(FlumeParseError)
+    if (result instanceof FlumeParseError) {
+      expect(result.cause).toBeInstanceOf(SyntaxError)
+    }
   })
 
   it("parses arrays", () => {

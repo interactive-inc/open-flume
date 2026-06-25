@@ -6,7 +6,6 @@ import { FlumeHttpError } from "@/errors/http-error"
 type Listener = (ev: unknown) => void
 
 class MockWebSocket {
-
   readonly url: string
 
   readyState = 1
@@ -59,11 +58,13 @@ const createMockFetch = () => {
   return vi.fn().mockResolvedValue({
     ok: true,
     status: 200,
-    json: () => Promise.resolve({ ok: true, url: "wss://slack.example.com/ws" }),
+    text: () => Promise.resolve(JSON.stringify({ ok: true, url: "wss://slack.example.com/ws" })),
   })
 }
 
-const createDeps = (overrides?: { fetch?: (url: string | URL, init?: RequestInit) => Promise<Response> }) => {
+const createDeps = (overrides?: {
+  fetch?: (url: string | URL, init?: RequestInit) => Promise<Response>
+}) => {
   const instances: MockWebSocket[] = []
 
   const WS = class extends MockWebSocket {
@@ -85,7 +86,6 @@ const createDeps = (overrides?: { fetch?: (url: string | URL, init?: RequestInit
 }
 
 describe("FlumeSlackSocketMode", () => {
-
   it("connect() obtains URL and opens WebSocket", async () => {
     const mockFetch = createMockFetch()
     const { deps, getSocket } = createDeps({ fetch: mockFetch })
@@ -288,14 +288,14 @@ describe("FlumeSlackSocketMode", () => {
 
     mode.disconnect()
 
-    expect(mode.stopped).toBe(true)
+    expect(mode.isStopped).toBe(true)
   })
 
   it("HTTP error from obtainSlackUrl returns FlumeHttpError", async () => {
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
-      json: () => Promise.resolve({ ok: false, error: "invalid_auth" }),
+      text: () => Promise.resolve(JSON.stringify({ ok: false, error: "invalid_auth" })),
     })
 
     const { deps } = createDeps({ fetch: mockFetch })

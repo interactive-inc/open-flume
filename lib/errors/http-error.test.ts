@@ -31,4 +31,11 @@ describe("FlumeHttpError", () => {
 
     expect(Object.isFrozen(err)).toBe(true)
   })
+
+  it("preserves cause when provided", () => {
+    const inner = new Error("ECONNREFUSED")
+    const err = new FlumeHttpError({ message: "transport", status: 0, cause: inner })
+
+    expect(err.cause).toBe(inner)
+  })
 })

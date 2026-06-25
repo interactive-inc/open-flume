@@ -1,5 +1,2 @@
-export * from "@/github/github-source"
-export * from "@/github/extract-github-meta"
-export * from "@/github/github-poller"
-export * from "@/github/github-seen-cache"
-export * from "@/github/github-notification-schema"
+export { FlumeGitHubSource } from "@/github/github-source"
+export { flumeExtractGitHubMeta } from "@/github/extract-github-meta"

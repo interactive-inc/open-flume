@@ -46,7 +46,9 @@ type Props = {
 
 ## クラス
 
-- `constructor(private readonly props: Props)` + `Object.freeze(this)`
+- `constructor(private readonly props: Props)`
+- イミュータブルクラス (値オブジェクト・純粋関数の集合・コンストラクタ以降フィールドを書き換えないもの) はコンストラクタで `Object.freeze(this)`
+- FSM / Reconnector / Poller / Queue / Logger のような内部状態を変えるクラスは freeze しない。代わりに mutable フィールドは `private` にし readonly getter で公開する
 - `with*()` で不変更新、配列は ReadonlyArray
 
 ## 変数・制御フロー

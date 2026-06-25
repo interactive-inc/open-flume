@@ -21,4 +21,11 @@ describe("FlumeParseError", () => {
     const error = new FlumeParseError("fail")
     expect(Object.isFrozen(error)).toBe(true)
   })
+
+  it("preserves cause when provided", () => {
+    const inner = new SyntaxError("Unexpected token")
+    const error = new FlumeParseError("invalid JSON", { cause: inner })
+
+    expect(error.cause).toBe(inner)
+  })
 })

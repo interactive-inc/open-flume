@@ -17,7 +17,10 @@ describe("FlumeDiscordGatewaySession", () => {
   })
 
   it("withReady() sets sessionId and resumeUrl, canResume() returns true", () => {
-    const session = FlumeDiscordGatewaySession.empty().withReady("sid-1", "wss://resume.example.com")
+    const session = FlumeDiscordGatewaySession.empty().withReady(
+      "sid-1",
+      "wss://resume.example.com",
+    )
 
     expect(session.sessionId).toBe("sid-1")
     expect(session.resumeUrl).toBe("wss://resume.example.com")
@@ -52,7 +55,10 @@ describe("FlumeDiscordGatewaySession", () => {
   })
 
   it("withSeq creates new instance", () => {
-    const original = FlumeDiscordGatewaySession.empty().withReady("sid-1", "wss://resume.example.com")
+    const original = FlumeDiscordGatewaySession.empty().withReady(
+      "sid-1",
+      "wss://resume.example.com",
+    )
     const updated = original.withSeq(10)
 
     expect(updated).not.toBe(original)

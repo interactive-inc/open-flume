@@ -25,4 +25,23 @@ describe("FlumeConnectionError", () => {
 
     expect(Object.isFrozen(err)).toBe(true)
   })
+
+  it("code defaults to null", () => {
+    const err = new FlumeConnectionError("fail")
+
+    expect(err.code).toBe(null)
+  })
+
+  it("preserves code when provided", () => {
+    const err = new FlumeConnectionError("auth", { code: 4004 })
+
+    expect(err.code).toBe(4004)
+  })
+
+  it("preserves cause when provided", () => {
+    const inner = new Error("inner")
+    const err = new FlumeConnectionError("outer", { cause: inner })
+
+    expect(err.cause).toBe(inner)
+  })
 })

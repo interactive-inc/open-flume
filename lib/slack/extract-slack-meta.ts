@@ -1,7 +1,7 @@
 import type { FlumeSlackEnvelope } from "@/types"
 import { isRecord } from "@/utils/is-record"
 
-export function extractSlackMeta(envelope: FlumeSlackEnvelope): Record<string, string> {
+export function flumeExtractSlackMeta(envelope: FlumeSlackEnvelope): Record<string, string> {
   const meta: Record<string, string> = { event_type: envelope.type }
   const eventPayload = isRecord(envelope.payload.event) ? envelope.payload.event : null
 

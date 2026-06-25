@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest"
 import { FlumeGitHubSource } from "@/github/github-source"
-import { extractGitHubMeta } from "@/github/extract-github-meta"
+import { flumeExtractGitHubMeta } from "@/github/extract-github-meta"
 import type { FlumeEvent, FlumeRuntimeDeps, FlumeStatus } from "@/types"
 
 const timerHandle = globalThis.setTimeout(() => {}, 0)
@@ -57,8 +57,12 @@ describe("FlumeGitHubSource", () => {
     const test = createMockDeps()
     const receivedEvents: FlumeEvent[] = []
 
-    test.mockFetch.mockResolvedValueOnce(makeJsonResponse([makeNotification("1", "2024-01-01T00:00:00Z")]))
-    test.mockFetch.mockResolvedValueOnce(makeJsonResponse([makeNotification("2", "2024-01-02T00:00:00Z")]))
+    test.mockFetch.mockResolvedValueOnce(
+      makeJsonResponse([makeNotification("1", "2024-01-01T00:00:00Z")]),
+    )
+    test.mockFetch.mockResolvedValueOnce(
+      makeJsonResponse([makeNotification("2", "2024-01-02T00:00:00Z")]),
+    )
 
     const source = new FlumeGitHubSource({
       token: "ghp_test",
@@ -130,9 +134,9 @@ describe("FlumeGitHubSource", () => {
   })
 })
 
-describe("extractGitHubMeta", () => {
+describe("flumeExtractGitHubMeta", () => {
   it("extracts all fields from notification", () => {
-    const meta = extractGitHubMeta({
+    const meta = flumeExtractGitHubMeta({
       id: "123",
       reason: "mention",
       unread: true,

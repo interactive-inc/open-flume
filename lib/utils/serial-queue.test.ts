@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest"
+import { describe, it, expect, vi } from "vitest"
 import { FlumeSerialQueue } from "@/utils/serial-queue"
 
 describe("FlumeSerialQueue", () => {
@@ -52,5 +52,56 @@ describe("FlumeSerialQueue", () => {
     await queue.drain()
 
     expect(count).toBe(50)
+  })
+
+  it("drops new tasks once maxDepth is reached and reports via onOverflow", async () => {
+    const onOverflow = vi.fn()
+    const queue = new FlumeSerialQueue({ maxDepth: 2, onOverflow })
+
+    let resolveBlocker: () => void = () => {}
+    const blocker = new Promise<void>((r) => {
+      resolveBlocker = r
+    })
+
+    queue.add(() => blocker)
+    queue.add(async () => {})
+    queue.add(async () => {})
+
+    expect(onOverflow).toHaveBeenCalledTimes(1)
+    expect(queue.size()).toBe(2)
+
+    resolveBlocker()
+    await queue.drain()
+  })
+
+  it("cancel() makes subsequent add() a no-op and drain() resolves immediately", async () => {
+    const queue = new FlumeSerialQueue()
+    let executed = false
+
+    queue.cancel()
+    queue.add(async () => {
+      executed = true
+    })
+
+    await queue.drain()
+
+    expect(executed).toBe(false)
+    expect(queue.isCancelled()).toBe(true)
+  })
+
+  it("size() decreases as tasks complete", async () => {
+    const queue = new FlumeSerialQueue()
+    let release: () => void = () => {}
+    const blocker = new Promise<void>((r) => {
+      release = r
+    })
+
+    queue.add(() => blocker)
+    queue.add(async () => {})
+
+    expect(queue.size()).toBe(2)
+    release()
+    await queue.drain()
+    expect(queue.size()).toBe(0)
   })
 })

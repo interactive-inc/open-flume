@@ -3,13 +3,19 @@ import { FlumeGatewayMessageSchema } from "@/discord/discord-gateway-message-sch
 import { FlumeParseError } from "@/errors/parse-error"
 import { safeJsonParse } from "@/utils/safe-json-parse"
 
-export function parseDiscordGatewayMessage(raw: string): FlumeGatewayMessage | FlumeParseError {
+export function parseFlumeDiscordGatewayMessage(
+  raw: string,
+): FlumeGatewayMessage | FlumeParseError {
   const json = safeJsonParse(raw)
+
+  if (json instanceof FlumeParseError) return json
 
   const parsed = FlumeGatewayMessageSchema.safeParse(json)
 
   if (!parsed.success) {
-    return new FlumeParseError(`invalid gateway message: ${raw.slice(0, 200)}`)
+    return new FlumeParseError(`invalid gateway message frame (${raw.length} bytes)`, {
+      cause: parsed.error,
+    })
   }
 
   return parsed.data

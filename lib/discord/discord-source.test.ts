@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from "vitest"
 import type { FlumeEvent, FlumeRuntimeDeps } from "@/types"
 import { FlumeDiscordSource } from "@/discord/discord-source"
-import { extractDiscordMeta } from "@/discord/extract-discord-meta"
+import { flumeExtractDiscordMeta } from "@/discord/extract-discord-meta"
 
 type Listener = (ev: unknown) => void
 
@@ -51,7 +51,8 @@ class MockWebSocket {
 }
 
 const HELLO_MSG = '{"op":10,"d":{"heartbeat_interval":45000},"s":null,"t":null}'
-const READY_MSG = '{"op":0,"d":{"session_id":"abc","resume_gateway_url":"wss://resume.example.com"},"s":1,"t":"READY"}'
+const READY_MSG =
+  '{"op":0,"d":{"session_id":"abc","resume_gateway_url":"wss://resume.example.com"},"s":1,"t":"READY"}'
 
 const createMockDeps = (): FlumeRuntimeDeps => {
   const timerHandle = globalThis.setTimeout(() => {}, 0)
@@ -151,7 +152,8 @@ describe("FlumeDiscordSource", () => {
 
     await startPromise
 
-    const messageCreate = '{"op":0,"d":{"content":"hello","channel_id":"123"},"s":2,"t":"MESSAGE_CREATE"}'
+    const messageCreate =
+      '{"op":0,"d":{"content":"hello","channel_id":"123"},"s":2,"t":"MESSAGE_CREATE"}'
 
     MockWebSocket.latest!.simulateMessage(messageCreate)
 
@@ -203,14 +205,14 @@ describe("FlumeDiscordSource", () => {
   })
 })
 
-describe("extractDiscordMeta", () => {
+describe("flumeExtractDiscordMeta", () => {
   it("extracts event_type", () => {
-    const meta = extractDiscordMeta("MESSAGE_CREATE", {})
+    const meta = flumeExtractDiscordMeta("MESSAGE_CREATE", {})
     expect(meta.event_type).toBe("MESSAGE_CREATE")
   })
 
   it("extracts channel_id and guild_id", () => {
-    const meta = extractDiscordMeta("MESSAGE_CREATE", {
+    const meta = flumeExtractDiscordMeta("MESSAGE_CREATE", {
       channel_id: "ch-1",
       guild_id: "g-1",
     })
@@ -219,14 +221,14 @@ describe("extractDiscordMeta", () => {
   })
 
   it("extracts user_id from author", () => {
-    const meta = extractDiscordMeta("MESSAGE_CREATE", {
+    const meta = flumeExtractDiscordMeta("MESSAGE_CREATE", {
       author: { id: "u-1" },
     })
     expect(meta.user_id).toBe("u-1")
   })
 
   it("ignores non-string fields", () => {
-    const meta = extractDiscordMeta("MESSAGE_CREATE", {
+    const meta = flumeExtractDiscordMeta("MESSAGE_CREATE", {
       channel_id: 123,
       author: "not-an-object",
     })

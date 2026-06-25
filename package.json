@@ -1,33 +1,38 @@
 {
   "name": "@interactive-inc/flume",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Unified notification listener for Discord, Slack, and GitHub. Raw WebSocket + fetch + Zod. No SDK dependencies.",
   "keywords": [
     "discord",
-    "slack",
-    "github",
-    "notifications",
-    "webhook",
-    "socket-mode",
-    "gateway",
     "event-source",
-    "listener"
+    "gateway",
+    "github",
+    "listener",
+    "notifications",
+    "slack",
+    "socket-mode",
+    "webhook"
   ],
+  "homepage": "https://github.com/interactive-inc/open-flume#readme",
+  "bugs": {
+    "url": "https://github.com/interactive-inc/open-flume/issues"
+  },
   "license": "MIT",
   "author": "interactive-inc",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/interactive-inc/open-flume.git"
   },
-  "homepage": "https://github.com/interactive-inc/open-flume#readme",
-  "bugs": {
-    "url": "https://github.com/interactive-inc/open-flume/issues"
-  },
+  "files": [
+    "dist/**/*",
+    "README.md",
+    "LICENSE"
+  ],
   "type": "module",
+  "sideEffects": false,
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "sideEffects": false,
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -51,11 +56,6 @@
     },
     "./package.json": "./package.json"
   },
-  "files": [
-    "dist/**/*",
-    "README.md",
-    "LICENSE"
-  ],
   "publishConfig": {
     "access": "public"
   },
@@ -67,11 +67,14 @@
     "lint": "vp lint",
     "fmt": "vp fmt"
   },
+  "dependencies": {
+    "zod": "^4.4.3"
+  },
   "devDependencies": {
     "vite-plus": "^0.1.21",
     "vitest": "^4.1.9"
   },
-  "dependencies": {
-    "zod": "^4.4.3"
+  "engines": {
+    "node": ">=22"
   }
 }

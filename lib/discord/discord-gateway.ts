@@ -1,14 +1,24 @@
-import type { FlumeGatewayMessage, FlumeLogHandler, FlumeRuntimeDeps } from "@/types"
+import type {
+  FlumeGatewayMessage,
+  FlumeLogHandler,
+  FlumeRuntimeDeps,
+  FlumeTimerHandle,
+} from "@/types"
 import { FlumeLogger } from "@/logger"
 import { FlumeConnectionError } from "@/errors/connection-error"
 import { FlumeParseError } from "@/errors/parse-error"
-import { FlumeDiscordHeartbeat } from "@/discord/discord-heartbeat"
 import { FlumeDiscordGatewaySession } from "@/discord/discord-gateway-session"
-import { parseDiscordGatewayMessage } from "@/discord/parse-discord-gateway-message"
+import { FlumeDiscordHeartbeat } from "@/discord/discord-heartbeat"
+import { parseFlumeDiscordGatewayMessage } from "@/discord/parse-discord-gateway-message"
+import { attempt } from "@/utils/attempt"
+import { isRecord } from "@/utils/is-record"
+import { safeErrorMessage } from "@/utils/safe-error-message"
+import { safeRandom } from "@/utils/safe-random"
+import { safeStringify } from "@/utils/safe-stringify"
 
 type Deps = Pick<
   FlumeRuntimeDeps,
-  "WebSocket" | "setInterval" | "clearInterval" | "setTimeout" | "random" | "now"
+  "WebSocket" | "setInterval" | "clearInterval" | "setTimeout" | "clearTimeout" | "random" | "now"
 >
 
 type Props = {
@@ -21,10 +31,6 @@ type Props = {
 }
 
 const GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json"
-
-function framePreview(raw: string): string {
-  return raw.length > 200 ? `${raw.slice(0, 200)}... (${raw.length} bytes)` : raw
-}
 
 const OP_DISPATCH = 0
 const OP_HEARTBEAT = 1
@@ -46,54 +52,125 @@ const OP_NAMES: Record<number, string> = {
   [OP_HEARTBEAT_ACK]: "HEARTBEAT_ACK",
 }
 
-export class FlumeDiscordGateway {
+// WHATWG WebSocket.OPEN は仕様で 1 に固定。global.WebSocket に依存しないようリテラル参照
+const WS_OPEN = 1
 
+// 再接続しても回復不能な Discord Gateway close code 群。
+// https://discord.com/developers/docs/topics/opcodes-and-status-codes#gateway-close-event-codes
+const TERMINAL_CLOSE_CODES = new Set<number>([
+  4004, // Authentication failed
+  4010, // Invalid shard
+  4011, // Sharding required
+  4012, // Invalid API version
+  4013, // Invalid intents
+  4014, // Disallowed intents
+])
+
+/**
+ * Discord Gateway v10 の最小実装。HELLO -> IDENTIFY/RESUME -> READY/RESUMED -> dispatch を扱う。
+ * READY 後の WebSocket 切断のみ `onStatus("disconnected")` を発火し source 側で再接続する。
+ * 終端 close code (4004 / 401x) を受けた場合は stopped 化して再接続を抑止。
+ * IO 境界は全て `attempt` 経由で扱い、コンストラクタ throw も `FlumeConnectionError` として返す
+ * (`connect()` は決して reject しない)
+ */
+export class FlumeDiscordGateway {
   private readonly log: FlumeLogger
 
   private ws: WebSocket | null = null
 
   private heartbeat: FlumeDiscordHeartbeat | null = null
 
-  session = FlumeDiscordGatewaySession.empty()
+  private currentSession = FlumeDiscordGatewaySession.empty()
 
-  stopped = false
+  private isStoppedFlag = false
+
+  private hasConnected = false
 
   private pendingResolve: ((value: FlumeConnectionError | null) => void) | null = null
 
   private pendingResolved = false
 
+  private invalidSessionTimer: FlumeTimerHandle | null = null
+
   constructor(private readonly props: Props) {
-    this.log = new FlumeLogger({ source: "discord.gateway", handler: props.onLog, deps: props.deps })
+    this.log = new FlumeLogger({
+      source: "discord.gateway",
+      handler: props.onLog,
+      deps: props.deps,
+    })
+  }
+
+  get session(): FlumeDiscordGatewaySession {
+    return this.currentSession
+  }
+
+  get isStopped(): boolean {
+    return this.isStoppedFlag
   }
 
   connect(url?: string): Promise<FlumeConnectionError | null> {
+    const WS = this.props.deps.WebSocket
+    if (!WS) {
+      const error = new FlumeConnectionError("WebSocket runtime not available")
+      this.log.error({ action: "ws.error", message: safeErrorMessage({ error }), error })
+      return Promise.resolve(error)
+    }
+
     const target = url ?? GATEWAY_URL
-    this.log.info({ action: "connect.start", message: `url=${new URL(target).hostname}` })
+    const hostResult = attempt(() => new URL(target).hostname)
+    const host = hostResult instanceof Error ? "unknown" : hostResult
+    this.log.info({ action: "connect.start", message: `host=${host}` })
     this.pendingResolved = false
+    this.hasConnected = false
 
     return new Promise<FlumeConnectionError | null>((resolve) => {
       this.pendingResolve = resolve
-      const socket = new this.props.deps.WebSocket(target)
+
+      const socketResult = attempt(() => new WS(target))
+      if (socketResult instanceof Error) {
+        const error = new FlumeConnectionError(
+          `WebSocket construction failed: ${safeErrorMessage({ error: socketResult })}`,
+          { cause: socketResult },
+        )
+        this.log.error({ action: "ws.construct.error", message: safeErrorMessage({ error }), error })
+        this.ws = null
+        this.pendingResolved = true
+        resolve(error)
+        return
+      }
+
+      const socket = socketResult
       this.ws = socket
-      socket.addEventListener("message", (ev) => this.onMessage(String(ev.data), socket))
-      socket.addEventListener("close", (ev) => this.onClose(ev))
-      socket.addEventListener("error", () => this.onError())
+      const listenerResult = attempt(() => {
+        socket.addEventListener("message", (ev) => this.safeOnMessage(ev, socket))
+        socket.addEventListener("close", (ev) => this.safeOnClose(ev))
+        socket.addEventListener("error", () => this.safeOnError())
+      })
+      if (listenerResult instanceof Error) {
+        const error = new FlumeConnectionError(
+          `WebSocket listener registration failed: ${safeErrorMessage({ error: listenerResult })}`,
+          { cause: listenerResult },
+        )
+        this.log.error({ action: "ws.listener.error", message: safeErrorMessage({ error }), error })
+        this.ws = null
+        this.pendingResolved = true
+        resolve(error)
+      }
     })
   }
 
   disconnect(): void {
     this.log.info({ action: "disconnect", message: "shutting down gateway" })
-    this.stopped = true
+    this.isStoppedFlag = true
     this.heartbeat?.stop()
+    this.clearInvalidSessionTimer()
 
-    if (this.ws) {
-      this.ws.close(1000, "shutdown")
-      this.ws = null
-    }
+    this.closeSocket({ ws: this.ws, code: 1000, reason: "shutdown" })
+    this.ws = null
   }
 
   isConnected(): boolean {
-    return this.ws !== null && this.ws.readyState === WebSocket.OPEN
+    return this.ws !== null && this.ws.readyState === WS_OPEN
   }
 
   private completeConnect(error: FlumeConnectionError | null): void {
@@ -102,24 +179,50 @@ export class FlumeDiscordGateway {
     this.pendingResolve(error)
   }
 
-  private onMessage(raw: string, socket: WebSocket): void {
-    this.log.debug({ action: "ws.recv", message: framePreview(raw) })
+  private safeOnMessage(ev: MessageEvent, socket: WebSocket): void {
+    const r = attempt(() => this.onMessage(String(ev.data), socket))
+    if (r instanceof Error) {
+      this.log.error({ action: "ws.message.threw", message: safeErrorMessage({ error: r }), error: r })
+    }
+  }
 
-    const parsed = parseDiscordGatewayMessage(raw)
+  private safeOnClose(ev: CloseEvent): void {
+    const r = attempt(() => this.onClose(ev))
+    if (r instanceof Error) {
+      this.log.error({ action: "ws.close.threw", message: safeErrorMessage({ error: r }), error: r })
+    }
+  }
+
+  private safeOnError(): void {
+    const r = attempt(() => this.onError())
+    if (r instanceof Error) {
+      this.log.error({ action: "ws.error.threw", message: safeErrorMessage({ error: r }), error: r })
+    }
+  }
+
+  private onMessage(raw: string, socket: WebSocket): void {
+    if (this.isStoppedFlag) return
+
+    const parsed = parseFlumeDiscordGatewayMessage(raw)
 
     if (parsed instanceof FlumeParseError) {
-      this.log.error({ action: "ws.parse-error", message: parsed.message, error: parsed })
+      this.log.error({
+        action: "ws.parse.error",
+        message: parsed.message,
+        error: parsed,
+        detail: { length: raw.length },
+      })
       return
     }
 
     this.log.debug({
-      action: "ws.frame",
-      message: `op=${OP_NAMES[parsed.op] ?? parsed.op} t=${parsed.t ?? "-"} s=${parsed.s ?? "-"}`,
-      detail: { op: parsed.op, t: parsed.t, s: parsed.s },
+      action: "ws.recv",
+      message: `op=${OP_NAMES[parsed.op] ?? parsed.op} t=${parsed.t ?? "-"} s=${parsed.s ?? "-"} length=${raw.length}`,
+      detail: { op: parsed.op, t: parsed.t, s: parsed.s, length: raw.length },
     })
 
     if (parsed.s !== null) {
-      this.session = this.session.withSeq(parsed.s)
+      this.currentSession = this.currentSession.withSeq(parsed.s)
     }
 
     if (parsed.op === OP_HELLO) return this.onHello(parsed)
@@ -129,28 +232,42 @@ export class FlumeDiscordGateway {
     if (parsed.op === OP_INVALID_SESSION) return this.onInvalidSession(parsed, socket)
     if (parsed.op === OP_DISPATCH) return this.onDispatch(parsed)
 
-    this.log.warn({ action: "ws.unknown-op", message: `unknown op=${parsed.op}`, detail: { op: parsed.op } })
+    this.log.warn({
+      action: "ws.op.unknown",
+      message: `unknown op=${parsed.op}`,
+      detail: { op: parsed.op },
+    })
   }
 
   private onHello(msg: FlumeGatewayMessage): void {
-    const interval = typeof msg.d?.heartbeat_interval === "number" ? msg.d.heartbeat_interval : 0
-    this.log.info({ action: "hello", message: `heartbeat_interval=${interval}ms` })
+    const d = isRecord(msg.d) ? msg.d : null
+    const interval = d && typeof d.heartbeat_interval === "number" ? d.heartbeat_interval : 0
+    this.log.info({
+      action: "gateway.hello",
+      message: `heartbeat_interval=${interval}ms`,
+      detail: { interval },
+    })
 
+    this.heartbeat?.stop()
     this.heartbeat = new FlumeDiscordHeartbeat({
+      log: this.log,
       deps: this.props.deps,
       onSend: () => {
-        this.log.debug({ action: "heartbeat.send", message: `seq=${this.session.seq}` })
-        this.send({ op: OP_HEARTBEAT, d: this.session.seq })
+        this.log.debug({ action: "heartbeat.send", message: `seq=${this.currentSession.seq}` })
+        this.send({ op: OP_HEARTBEAT, d: this.currentSession.seq })
       },
       onZombie: () => {
-        this.log.warn({ action: "heartbeat.zombie", message: "no ACK received, closing connection" })
-        this.ws?.close(4009, "zombie connection")
+        this.log.warn({
+          action: "heartbeat.zombie",
+          message: "no ACK received, closing connection",
+        })
+        this.closeSocket({ ws: this.ws, code: 4009, reason: "zombie connection" })
       },
     })
 
     this.heartbeat.start(interval)
 
-    if (this.session.canResume()) {
+    if (this.currentSession.canResume()) {
       this.sendResume()
     } else {
       this.sendIdentify()
@@ -164,78 +281,201 @@ export class FlumeDiscordGateway {
 
   private onHeartbeatRequest(): void {
     this.log.debug({ action: "heartbeat.requested", message: "server requested heartbeat" })
-    this.send({ op: OP_HEARTBEAT, d: this.session.seq })
+    this.send({ op: OP_HEARTBEAT, d: this.currentSession.seq })
   }
 
   private onReconnectRequest(socket: WebSocket): void {
-    this.log.info({ action: "reconnect.requested", message: "server requested reconnect" })
-    socket.close(4000, "reconnect requested")
+    this.log.info({ action: "ws.reconnect.requested", message: "server requested reconnect" })
+    this.closeSocket({ ws: socket, code: 4000, reason: "reconnect requested" })
   }
 
   private onInvalidSession(msg: FlumeGatewayMessage, socket: WebSocket): void {
-    const resumable = !!msg.d
-    this.log.warn({ action: "invalid-session", message: `resumable=${resumable}` })
-    this.session = this.session.withReset()
+    const resumable = msg.d === true || (isRecord(msg.d) && msg.d.resumable === true)
+    this.log.warn({
+      action: "session.invalid",
+      message: `resumable=${resumable}`,
+      detail: { resumable },
+    })
 
-    if (resumable) {
-      const delay = 1000 + this.props.deps.random() * 4000
-      this.log.info({ action: "identify.delayed", message: `re-identify in ${Math.round(delay)}ms` })
-      this.props.deps.setTimeout(() => this.sendIdentify(), delay)
+    const delay = 1000 + safeRandom({ deps: this.props.deps }) * 4000
+
+    if (!resumable) {
+      this.currentSession = this.currentSession.withReset()
+    }
+
+    this.clearInvalidSessionTimer()
+    const timerResult = attempt(() =>
+      this.props.deps.setTimeout(() => {
+        this.invalidSessionTimer = null
+        this.closeSocket({ ws: socket, code: 4000, reason: "invalid session" })
+      }, delay),
+    )
+    if (timerResult instanceof Error) {
+      this.log.error({
+        action: "session.invalid.timer.error",
+        message: safeErrorMessage({ error: timerResult }),
+        error: timerResult,
+      })
+      this.invalidSessionTimer = null
     } else {
-      socket.close(4000, "invalid session")
+      this.invalidSessionTimer = timerResult
     }
   }
 
   private onDispatch(msg: FlumeGatewayMessage): void {
-    if (msg.t === "READY" && msg.d) {
-      const sessionId = typeof msg.d.session_id === "string" ? msg.d.session_id : ""
-      const resumeUrl = typeof msg.d.resume_gateway_url === "string" ? msg.d.resume_gateway_url : ""
-      this.session = this.session.withReady(sessionId, resumeUrl)
-      this.log.info({ action: "ready", message: `session=${sessionId}` })
+    const d = isRecord(msg.d) ? msg.d : null
+
+    if (msg.t === "READY" && d) {
+      const sessionId = typeof d.session_id === "string" ? d.session_id : ""
+      const resumeUrl = typeof d.resume_gateway_url === "string" ? d.resume_gateway_url : ""
+      this.currentSession = this.currentSession.withReady(sessionId, resumeUrl)
+      this.log.info({
+        action: "gateway.ready",
+        message: `session ready`,
+        detail: { hasResumeUrl: resumeUrl !== "" },
+      })
+      this.hasConnected = true
       this.props.onStatus("connected")
       this.completeConnect(null)
     }
 
     if (msg.t === "RESUMED") {
-      this.log.info({ action: "resumed", message: `session=${this.session.sessionId} seq=${this.session.seq}` })
+      this.log.info({ action: "gateway.resumed", message: `seq=${this.currentSession.seq}` })
+      this.hasConnected = true
       this.props.onStatus("connected")
       this.completeConnect(null)
     }
 
-    if (msg.t && msg.d) {
-      this.props.onDispatch(msg.t, msg.d)
+    if (msg.t && d) {
+      this.props.onDispatch(msg.t, d)
     } else if (msg.t) {
-      this.props.onDispatch(msg.t, {})
+      this.log.debug({
+        action: "dispatch.empty",
+        message: `dropped ${msg.t} (no payload)`,
+        detail: { type: msg.t },
+      })
     }
   }
 
   private onClose(ev: CloseEvent): void {
+    const terminal = TERMINAL_CLOSE_CODES.has(ev.code)
     this.log.info({
       action: "ws.close",
-      message: `code=${ev.code} reason=${ev.reason || "none"}`,
-      detail: { code: ev.code, reason: ev.reason },
+      message: `code=${ev.code} reason=${ev.reason || "none"}${terminal ? " (terminal)" : ""}`,
+      detail: { code: ev.code, reason: ev.reason, terminal },
     })
 
     this.ws = null
     this.heartbeat?.stop()
-    this.props.onStatus("disconnected")
-    this.completeConnect(new FlumeConnectionError(`WebSocket closed before ready (code=${ev.code})`))
+    this.clearInvalidSessionTimer()
+
+    if (terminal) {
+      this.isStoppedFlag = true
+    }
+
+    if (this.hasConnected || terminal) {
+      this.props.onStatus("disconnected")
+    }
+
+    if (!this.pendingResolved) {
+      const error = new FlumeConnectionError(`WebSocket closed before ready (code=${ev.code})`, {
+        code: ev.code,
+      })
+      this.completeConnect(error)
+    }
   }
 
   private onError(): void {
-    this.log.error({ action: "ws.error", message: "WebSocket error event" })
-    this.completeConnect(new FlumeConnectionError("WebSocket connection error"))
+    const error = new FlumeConnectionError("WebSocket connection error")
+    this.log.error({ action: "ws.error", message: safeErrorMessage({ error }), error })
+    this.completeConnect(error)
+  }
+
+  private clearInvalidSessionTimer(): void {
+    if (this.invalidSessionTimer === null) return
+
+    const handle = this.invalidSessionTimer
+    const result = attempt(() => this.props.deps.clearTimeout(handle))
+    if (result instanceof Error) {
+      this.log.error({
+        action: "session.invalid.timer.clear.error",
+        message: safeErrorMessage({ error: result }),
+        error: result,
+      })
+    }
+    this.invalidSessionTimer = null
+  }
+
+  private closeSocket(input: { ws: WebSocket | null; code?: number; reason?: string }): void {
+    if (input.ws === null) return
+
+    const ws = input.ws
+    const result = attempt(() => {
+      if (input.code !== undefined) {
+        ws.close(input.code, input.reason ?? "")
+      } else {
+        ws.close()
+      }
+    })
+    if (result instanceof Error) {
+      this.log.error({
+        action: "ws.close.error",
+        message: safeErrorMessage({ error: result }),
+        error: result,
+      })
+    }
   }
 
   private send(input: { op: number; d?: unknown }): void {
-    const payload = JSON.stringify({ op: input.op, d: input.d ?? null })
-    this.log.debug({ action: "ws.send", message: `op=${OP_NAMES[input.op] ?? input.op}`, detail: { op: input.op } })
-    this.ws?.send(payload)
-    this.log.debug({ action: "ws.sent", message: framePreview(payload) })
+    const payload = this.safeSerialize(input)
+    if (payload === null) return
+
+    this.log.debug({
+      action: "ws.send",
+      message: `op=${OP_NAMES[input.op] ?? input.op} length=${payload.length}`,
+      detail: { op: input.op, length: payload.length },
+    })
+
+    const ws = this.ws
+    if (ws === null) {
+      this.log.warn({ action: "ws.send", message: "ws.send skipped: socket is null" })
+      return
+    }
+    if (ws.readyState !== WS_OPEN) {
+      this.log.warn({
+        action: "ws.send",
+        message: `ws.send skipped: readyState=${ws.readyState} (not OPEN)`,
+        detail: { readyState: ws.readyState },
+      })
+      return
+    }
+
+    const result = attempt(() => ws.send(payload))
+    if (result instanceof Error) {
+      this.log.error({
+        action: "ws.send",
+        message: `ws.send failed: ${safeErrorMessage({ error: result })}`,
+        error: result,
+      })
+    }
+  }
+
+  private safeSerialize(input: { op: number; d?: unknown }): string | null {
+    const result = safeStringify({ op: input.op, d: input.d ?? null })
+    if (result instanceof Error) {
+      this.log.error({
+        action: "ws.send.serialize.error",
+        message: safeErrorMessage({ error: result }),
+        error: result,
+        detail: { op: input.op },
+      })
+      return null
+    }
+    return result
   }
 
   private sendIdentify(): void {
-    this.log.info({ action: "identify", message: `intents=${this.props.intents}` })
+    this.log.info({ action: "gateway.identify", message: `intents=${this.props.intents}` })
 
     this.send({
       op: OP_IDENTIFY,
@@ -248,11 +488,15 @@ export class FlumeDiscordGateway {
   }
 
   private sendResume(): void {
-    this.log.info({ action: "resume", message: `session=${this.session.sessionId} seq=${this.session.seq}` })
+    this.log.info({ action: "gateway.resume", message: `seq=${this.currentSession.seq}` })
 
     this.send({
       op: OP_RESUME,
-      d: { token: this.props.token, session_id: this.session.sessionId, seq: this.session.seq },
+      d: {
+        token: this.props.token,
+        session_id: this.currentSession.sessionId,
+        seq: this.currentSession.seq,
+      },
     })
   }
 }

@@ -1,18 +1,32 @@
-import type { FlumeEvent, FlumeGitHubNotification, FlumeGitHubSourceOptions, FlumeHandler, FlumeRuntimeDeps, FlumeStatus } from "@/types"
+import type {
+  FlumeEvent,
+  FlumeGitHubNotification,
+  FlumeGitHubSourceOptions,
+  FlumeHandler,
+  FlumeRuntimeDeps,
+  FlumeSourceStartOptions,
+  FlumeStatus,
+} from "@/types"
 import { createFlumeDefaultDeps } from "@/deps"
 import { FlumeStartError } from "@/errors/start-error"
 import { FlumeLogger } from "@/logger"
-import { FlumeSerialQueue } from "@/utils/serial-queue"
-import { extractGitHubMeta } from "@/github/extract-github-meta"
+import { flumeExtractGitHubMeta } from "@/github/extract-github-meta"
 import { FlumeGitHubPoller } from "@/github/github-poller"
+import { FlumeSignalRegistry } from "@/source-helpers/flume-signal-registry"
+import { FlumeStatusEmitter } from "@/source-helpers/flume-status-emitter"
+import { attempt } from "@/utils/attempt"
+import { safeErrorMessage } from "@/utils/safe-error-message"
+import { safeInvokeCallback } from "@/utils/safe-invoke-callback"
+import { safeNormalizeError } from "@/utils/safe-normalize-error"
+import { safeNow } from "@/utils/safe-now"
+import { FlumeSerialQueue } from "@/utils/serial-queue"
 
 export class FlumeGitHubSource {
-
   readonly name = "github" as const
 
   private poller: FlumeGitHubPoller | null = null
 
-  private currentStatus: FlumeStatus = "disconnected"
+  private handler: FlumeHandler | null = null
 
   private readonly log: FlumeLogger
 
@@ -20,84 +34,121 @@ export class FlumeGitHubSource {
 
   private readonly queue = new FlumeSerialQueue()
 
+  private readonly signals: FlumeSignalRegistry
+
+  private readonly statusEmitter: FlumeStatusEmitter
+
+  private readonly onSignalAbort = (): void => {
+    safeInvokeCallback({
+      fn: () => this.stop(),
+      onError: (error) => {
+        this.log.error({
+          action: "signal.abort.stop.failed",
+          message: safeErrorMessage({ error }),
+          error,
+        })
+      },
+    })
+  }
+
   constructor(private readonly options: FlumeGitHubSourceOptions) {
     this.deps = options.deps ?? createFlumeDefaultDeps()
     this.log = new FlumeLogger({ source: "github", handler: options.onLog, deps: this.deps })
+    this.signals = new FlumeSignalRegistry({ log: this.log, onAbort: this.onSignalAbort })
+    this.statusEmitter = new FlumeStatusEmitter({ log: this.log, onStatus: options.onStatus })
   }
 
-  async start(handler: FlumeHandler): Promise<Error | null> {
-    if (this.options.signal?.aborted) {
+  async start(handler: FlumeHandler, options?: FlumeSourceStartOptions): Promise<Error | null> {
+    if (
+      this.signals.isAnyAborted(this.options.signal) ||
+      this.signals.isAnyAborted(options?.signal)
+    ) {
       return new FlumeStartError("GitHub source: signal already aborted")
     }
 
-    this.options.signal?.addEventListener("abort", () => this.stop(), { once: true })
+    this.signals.register(this.options.signal)
+    this.signals.register(options?.signal)
 
-    this.log.info({ action: "start", message: "starting GitHub source" })
-    this.setStatus("connecting")
+    this.handler = handler
+    this.log.info({ action: "source.start", message: "starting GitHub source" })
+    this.statusEmitter.set("connecting")
 
     this.poller = new FlumeGitHubPoller({
       token: this.options.token,
       interval: this.options.pollInterval ?? 60,
       onLog: this.options.onLog,
       deps: this.deps,
-      onNotifications: (notifications) => this.handleNotifications(handler, notifications),
-      onConnected: () => this.setStatus("connected"),
-      onDisconnected: (detail) => this.setStatus("disconnected", detail),
+      onNotifications: (notifications) => this.handleNotifications(notifications),
+      onConnected: () => this.statusEmitter.set("connected"),
+      onDisconnected: (detail) => this.statusEmitter.set("disconnected", detail),
     })
 
-    try {
-      await this.poller.start()
-    } catch (error) {
-      const err = error instanceof Error ? error : new Error(String(error))
-      this.log.error({ action: "start.failed", message: err.message, error: err })
-      this.setStatus("disconnected")
-      return err
+    const result = await this.poller.start()
+
+    if (result instanceof Error) {
+      this.log.error({
+        action: "source.start.failed",
+        message: safeErrorMessage({ error: result }),
+        error: result,
+      })
+      this.statusEmitter.set("disconnected", result.message)
+      return result
     }
 
     return null
   }
 
   async stop(): Promise<void> {
-    this.log.info({ action: "stop", message: "stopping GitHub source" })
+    this.signals.unregisterAll()
+    this.log.info({ action: "source.stop", message: "stopping GitHub source" })
     this.poller?.stop()
-    this.poller = null
     await this.queue.drain()
-    this.setStatus("disconnected")
+    this.poller = null
+    this.handler = null
+    this.statusEmitter.set("disconnected")
   }
 
   status(): FlumeStatus {
-    return this.currentStatus
+    return this.statusEmitter.value
   }
 
-  private handleNotifications(handler: FlumeHandler, notifications: FlumeGitHubNotification[]): void {
+  private handleNotifications(notifications: FlumeGitHubNotification[]): void {
+    const handler = this.handler
+    if (!handler) return
+
     for (const notification of notifications) {
-      const event: FlumeEvent = {
-        source: "github",
-        type: "notification",
-        data: notification,
-        meta: extractGitHubMeta(notification),
-        receivedAt: this.deps.now(),
-      }
       this.queue.add(async () => {
-        try {
-          await handler(event)
-        } catch (err) {
+        const event: FlumeEvent = {
+          source: "github",
+          type: "notification",
+          data: notification,
+          meta: this.safeExtractMeta(notification),
+          receivedAt: safeNow({ deps: this.deps }),
+        }
+        const r = await attempt(() => Promise.resolve(handler(event)))
+        if (r instanceof Error) {
           this.log.error({
             action: "handler.error",
-            message: "user handler threw",
-            error: err instanceof Error ? err : new Error(String(err)),
+            message: safeErrorMessage({ error: r }),
+            error: r,
           })
         }
       })
     }
   }
 
-  private setStatus(next: FlumeStatus, detail?: string): void {
-    if (this.currentStatus === next) return
-
-    this.log.info({ action: "status", message: `${this.currentStatus} → ${next}${detail ? ` (${detail})` : ""}` })
-    this.currentStatus = next
-    this.options.onStatus?.(next, detail)
+  private safeExtractMeta(notification: FlumeGitHubNotification): Record<string, string> {
+    const result = attempt(() => flumeExtractGitHubMeta(notification))
+    if (result instanceof Error) {
+      const error = safeNormalizeError({ value: result })
+      this.log.warn({
+        action: "meta.extract.error",
+        message: safeErrorMessage({ error }),
+        error,
+        detail: { notificationId: notification.id },
+      })
+      return { event_type: "notification" }
+    }
+    return result
   }
-
 }

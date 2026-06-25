@@ -1,30 +1,47 @@
+import type { FlumeRuntimeDeps } from "@/types"
+import { safeNow } from "@/utils/safe-now"
+
 type Props = {
   maxSize: number
+  ttlMs: number
+  deps: Pick<FlumeRuntimeDeps, "now">
 }
 
 /**
- * Slack envelope_id の LRU 風キャッシュ。Slack は ack 失敗時に同じ envelope を再送するため、
- * source レイヤで handler への重複配送を防ぐ
+ * Slack envelope_id を maxSize / ttlMs で制限するキャッシュ。Slack は ack 失敗時に同じ envelope を
+ * 再送してくるため、source 層で重複配送を防ぐ。TTL を過ぎたエントリは has() が false を返し、
+ * trim() で容量超過分が古い順に落とされる
  */
 export class FlumeSlackSeenCache {
-
-  private seen = new Set<string>()
+  private seen = new Map<string, number>()
 
   constructor(private readonly props: Props) {}
 
   has(envelopeId: string): boolean {
-    return this.seen.has(envelopeId)
+    const timestamp = this.seen.get(envelopeId)
+    if (timestamp === undefined) return false
+    if (safeNow({ deps: this.props.deps }) - timestamp > this.props.ttlMs) {
+      this.seen.delete(envelopeId)
+      return false
+    }
+    return true
   }
 
   add(envelopeId: string): void {
-    this.seen.add(envelopeId)
+    this.seen.set(envelopeId, safeNow({ deps: this.props.deps }))
   }
 
   trim(): void {
+    const cutoff = safeNow({ deps: this.props.deps }) - this.props.ttlMs
+
+    for (const [id, timestamp] of this.seen) {
+      if (timestamp < cutoff) this.seen.delete(id)
+    }
+
     if (this.seen.size <= this.props.maxSize) return
 
-    const entries = [...this.seen]
-    this.seen = new Set(entries.slice(entries.length - this.props.maxSize))
+    const entries = [...this.seen.entries()]
+    this.seen = new Map(entries.slice(entries.length - this.props.maxSize))
   }
 
   get size(): number {

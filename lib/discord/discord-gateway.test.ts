@@ -67,29 +67,30 @@ class MockWebSocket {
 
 type Deps = Pick<
   FlumeRuntimeDeps,
-  "WebSocket" | "setInterval" | "clearInterval" | "setTimeout" | "random" | "now"
+  "WebSocket" | "setInterval" | "clearInterval" | "setTimeout" | "clearTimeout" | "random" | "now"
 >
 
 const createMockDeps = (): Deps => {
-  const timerHandle = globalThis.setTimeout(() => {}, 0)
-  globalThis.clearTimeout(timerHandle)
-
   return {
     WebSocket: MockWebSocket as unknown as Deps["WebSocket"],
-    setInterval: vi.fn((_fn: () => void, _ms: number) => timerHandle),
+    setInterval: vi.fn((_fn: () => void, _ms: number) => 1),
     clearInterval: vi.fn(),
-    setTimeout: vi.fn((_fn: () => void, _ms: number) => timerHandle),
+    setTimeout: vi.fn((_fn: () => void, _ms: number) => 2),
+    clearTimeout: vi.fn(),
     random: () => 0.5,
     now: () => 1000,
   }
 }
 
 const HELLO_MSG = '{"op":10,"d":{"heartbeat_interval":45000},"s":null,"t":null}'
-const READY_MSG = '{"op":0,"d":{"session_id":"abc","resume_gateway_url":"wss://resume.example.com"},"s":1,"t":"READY"}'
+const READY_MSG =
+  '{"op":0,"d":{"session_id":"abc","resume_gateway_url":"wss://resume.example.com"},"s":1,"t":"READY"}'
+const RESUMED_MSG = '{"op":0,"d":{},"s":2,"t":"RESUMED"}'
 const HEARTBEAT_ACK_MSG = '{"op":11,"d":null,"s":null,"t":null}'
+const SERVER_HEARTBEAT_MSG = '{"op":1,"d":null,"s":null,"t":null}'
 const RECONNECT_MSG = '{"op":7,"d":null,"s":null,"t":null}'
-const INVALID_SESSION_NULL_MSG = '{"op":9,"d":null,"s":null,"t":null}'
-const INVALID_SESSION_RESUMABLE_MSG = '{"op":9,"d":{"resumable":true},"s":null,"t":null}'
+const INVALID_SESSION_NULL_MSG = '{"op":9,"d":false,"s":null,"t":null}'
+const INVALID_SESSION_RESUMABLE_MSG = '{"op":9,"d":true,"s":null,"t":null}'
 
 const createGateway = () => {
   const deps = createMockDeps()
@@ -119,13 +120,13 @@ describe("FlumeDiscordGateway", () => {
     expect(MockWebSocket.latest!.url).toBe("wss://gateway.discord.gg/?v=10&encoding=json")
   })
 
-  it("HELLO triggers heartbeat and sends IDENTIFY", () => {
+  it("HELLO triggers heartbeat scheduling and sends IDENTIFY", () => {
     const ctx = createGateway()
 
     ctx.gateway.connect()
     MockWebSocket.latest!.simulateMessage(HELLO_MSG)
 
-    expect(ctx.deps.setInterval).toHaveBeenCalled()
+    expect(ctx.deps.setTimeout).toHaveBeenCalled()
 
     const identifyMessages = MockWebSocket.latest!.sentMessages.filter((msg) => {
       const parsed = JSON.parse(msg)
@@ -154,6 +155,20 @@ describe("FlumeDiscordGateway", () => {
     expect(ctx.onStatus).toHaveBeenCalledWith("connected")
   })
 
+  it("RESUMED dispatch (resumed session) resolves connect with null", async () => {
+    const ctx = createGateway()
+
+    const connectPromise = ctx.gateway.connect()
+
+    MockWebSocket.latest!.simulateMessage(HELLO_MSG)
+    MockWebSocket.latest!.simulateMessage(RESUMED_MSG)
+
+    const connectResult = await connectPromise
+
+    expect(connectResult).toBeNull()
+    expect(ctx.onStatus).toHaveBeenCalledWith("connected")
+  })
+
   it("dispatch events call onDispatch", async () => {
     const ctx = createGateway()
 
@@ -164,11 +179,15 @@ describe("FlumeDiscordGateway", () => {
 
     await connectPromise
 
-    const messageCreate = '{"op":0,"d":{"content":"hello","channel_id":"123"},"s":2,"t":"MESSAGE_CREATE"}'
+    const messageCreate =
+      '{"op":0,"d":{"content":"hello","channel_id":"123"},"s":2,"t":"MESSAGE_CREATE"}'
 
     MockWebSocket.latest!.simulateMessage(messageCreate)
 
-    expect(ctx.onDispatch).toHaveBeenCalledWith("MESSAGE_CREATE", { content: "hello", channel_id: "123" })
+    expect(ctx.onDispatch).toHaveBeenCalledWith("MESSAGE_CREATE", {
+      content: "hello",
+      channel_id: "123",
+    })
   })
 
   it("HEARTBEAT_ACK calls heartbeat ack", () => {
@@ -179,6 +198,22 @@ describe("FlumeDiscordGateway", () => {
     MockWebSocket.latest!.simulateMessage(HEARTBEAT_ACK_MSG)
 
     expect(ctx.gateway.isConnected()).toBe(true)
+  })
+
+  it("server HEARTBEAT (op 1) triggers an outbound heartbeat", () => {
+    const ctx = createGateway()
+
+    ctx.gateway.connect()
+    MockWebSocket.latest!.simulateMessage(HELLO_MSG)
+
+    const sentBefore = MockWebSocket.latest!.sentMessages.length
+    MockWebSocket.latest!.simulateMessage(SERVER_HEARTBEAT_MSG)
+
+    const heartbeatsSent = MockWebSocket.latest!.sentMessages.slice(sentBefore)
+      .map((s) => JSON.parse(s))
+      .filter((m) => m.op === 1)
+
+    expect(heartbeatsSent.length).toBe(1)
   })
 
   it("server RECONNECT request closes socket", () => {
@@ -194,32 +229,37 @@ describe("FlumeDiscordGateway", () => {
     expect(closeSpy).toHaveBeenCalledWith(4000, "reconnect requested")
   })
 
-  it("INVALID_SESSION with d=false closes socket", () => {
+  it("INVALID_SESSION with d=false schedules timed close", () => {
     const ctx = createGateway()
 
     ctx.gateway.connect()
     const ws = MockWebSocket.latest!
 
-    const closeSpy = vi.spyOn(ws, "close")
-
     ws.simulateMessage(HELLO_MSG)
     ws.simulateMessage(INVALID_SESSION_NULL_MSG)
 
-    expect(closeSpy).toHaveBeenCalledWith(4000, "invalid session")
+    expect(ctx.deps.setTimeout).toHaveBeenCalled()
   })
 
-  it("INVALID_SESSION with d=true schedules re-identify", () => {
+  it("INVALID_SESSION with d=true schedules timed close without identifying", () => {
     const ctx = createGateway()
 
     ctx.gateway.connect()
 
     MockWebSocket.latest!.simulateMessage(HELLO_MSG)
+
+    const sentBeforeInvalid = MockWebSocket.latest!.sentMessages.length
+
     MockWebSocket.latest!.simulateMessage(INVALID_SESSION_RESUMABLE_MSG)
 
+    const sentAfter = MockWebSocket.latest!.sentMessages.slice(sentBeforeInvalid)
+    const newIdentifies = sentAfter.map((s) => JSON.parse(s)).filter((m) => m.op === 2)
+
+    expect(newIdentifies.length).toBe(0)
     expect(ctx.deps.setTimeout).toHaveBeenCalled()
   })
 
-  it("disconnect() stops heartbeat and closes WebSocket", async () => {
+  it("disconnect() stops heartbeat, closes WebSocket, and sets isStopped", async () => {
     const ctx = createGateway()
 
     const connectPromise = ctx.gateway.connect()
@@ -231,11 +271,11 @@ describe("FlumeDiscordGateway", () => {
 
     ctx.gateway.disconnect()
 
-    expect(ctx.gateway.stopped).toBe(true)
-    expect(ctx.deps.clearInterval).toHaveBeenCalled()
+    expect(ctx.gateway.isStopped).toBe(true)
+    expect(ctx.deps.clearTimeout).toHaveBeenCalled()
   })
 
-  it("WebSocket close event resolves connect with error", async () => {
+  it("WebSocket close before READY resolves connect with FlumeConnectionError carrying code", async () => {
     const ctx = createGateway()
 
     const connectPromise = ctx.gateway.connect()
@@ -245,5 +285,70 @@ describe("FlumeDiscordGateway", () => {
     const connectResult = await connectPromise
 
     expect(connectResult).toBeInstanceOf(FlumeConnectionError)
+    if (connectResult instanceof FlumeConnectionError) {
+      expect(connectResult.code).toBe(1006)
+    }
+  })
+
+  it("terminal close code (4004) sets isStopped to suppress reconnect", async () => {
+    const ctx = createGateway()
+
+    const connectPromise = ctx.gateway.connect()
+
+    MockWebSocket.latest!.simulateClose(4004, "authentication failed")
+
+    const connectResult = await connectPromise
+
+    expect(connectResult).toBeInstanceOf(FlumeConnectionError)
+    if (connectResult instanceof FlumeConnectionError) {
+      expect(connectResult.code).toBe(4004)
+    }
+    expect(ctx.gateway.isStopped).toBe(true)
+  })
+
+  it("does NOT emit onStatus('disconnected') when initial close happens before READY", () => {
+    const ctx = createGateway()
+
+    ctx.gateway.connect()
+
+    MockWebSocket.latest!.simulateClose(1006, "abnormal")
+
+    const disconnectedCalls = ctx.onStatus.mock.calls.filter((c) => c[0] === "disconnected")
+    expect(disconnectedCalls.length).toBe(0)
+  })
+
+  it("emits onStatus('disconnected') when the socket closes AFTER READY", async () => {
+    const ctx = createGateway()
+
+    const connectPromise = ctx.gateway.connect()
+    MockWebSocket.latest!.simulateMessage(HELLO_MSG)
+    MockWebSocket.latest!.simulateMessage(READY_MSG)
+    await connectPromise
+
+    MockWebSocket.latest!.simulateClose(1006, "later")
+
+    const disconnectedCalls = ctx.onStatus.mock.calls.filter((c) => c[0] === "disconnected")
+    expect(disconnectedCalls.length).toBe(1)
+  })
+
+  it("does NOT log raw token in IDENTIFY frame", () => {
+    const ctx = createGateway()
+    const logged: string[] = []
+    const gateway = new FlumeDiscordGateway({
+      token: "SECRET",
+      intents: 513,
+      onDispatch: vi.fn(),
+      onStatus: vi.fn(),
+      onLog: (log) => {
+        logged.push(`${log.message} ${JSON.stringify(log.detail ?? {})}`)
+      },
+      deps: ctx.deps,
+    })
+
+    gateway.connect()
+    MockWebSocket.latest!.simulateMessage(HELLO_MSG)
+
+    const leaked = logged.some((m) => m.includes("SECRET"))
+    expect(leaked).toBe(false)
   })
 })

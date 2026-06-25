@@ -1,7 +1,10 @@
-export class FlumeStartError extends Error {
+type Options = {
+  cause?: unknown
+}
 
-  constructor(message: string) {
-    super(message)
+export class FlumeStartError extends Error {
+  constructor(message: string, options?: Options) {
+    super(message, options?.cause === undefined ? undefined : { cause: options.cause })
     this.name = "FlumeStartError"
     Object.freeze(this)
   }

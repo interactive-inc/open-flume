@@ -6,13 +6,13 @@ import type { FlumeSlackEnvelopeSchema } from "@/slack/slack-envelope-schema"
 
 // Timer
 
-export type FlumeTimerHandle = ReturnType<typeof setTimeout>
+export type FlumeTimerHandle = unknown
 
 // Runtime DI
 
 export type FlumeRuntimeDeps = {
   fetch(url: string | URL, init?: RequestInit): Promise<Response>
-  WebSocket: new (url: string | URL) => WebSocket
+  WebSocket: (new (url: string | URL) => WebSocket) | null
   now(): number
   random(): number
   setTimeout(fn: () => void, ms: number): FlumeTimerHandle
@@ -21,49 +21,67 @@ export type FlumeRuntimeDeps = {
   clearInterval(id: FlumeTimerHandle): void
 }
 
-// Event
+// Event (discriminated by source)
 
 export type FlumeSourceName = "discord" | "slack" | "github"
 
-export type FlumeEvent = {
-  source: FlumeSourceName
+export type FlumeDiscordEvent = {
+  source: "discord"
   type: string
-  data: unknown
+  data: Record<string, unknown>
   meta: Record<string, string>
   receivedAt: number
 }
 
+export type FlumeSlackEvent = {
+  source: "slack"
+  type: string
+  data: Record<string, unknown>
+  meta: Record<string, string>
+  receivedAt: number
+}
+
+export type FlumeGitHubEvent = {
+  source: "github"
+  type: "notification"
+  data: FlumeGitHubNotification
+  meta: Record<string, string>
+  receivedAt: number
+}
+
+export type FlumeEvent = FlumeDiscordEvent | FlumeSlackEvent | FlumeGitHubEvent
+
 export type FlumeHandler = (event: FlumeEvent) => void | Promise<void>
+
+export type FlumeSourceStartOptions = {
+  signal?: AbortSignal
+}
 
 export type FlumeSource = {
   readonly name: FlumeSourceName
-  start(handler: FlumeHandler): Promise<Error | null>
+  start(handler: FlumeHandler, options?: FlumeSourceStartOptions): Promise<Error | null>
   stop(): Promise<void>
   status(): FlumeStatus
 }
 
 export type FlumeSourceStatus = {
-  name: FlumeSourceName
+  /**
+   * 多くは `FlumeSourceName` のいずれかだが、`source.name` getter が throw する
+   * 第三者 `FlumeSource` 実装に備えて `string` まで広げてある (fallback で `"?"`)
+   */
+  source: string
   status: FlumeStatus
 }
 
 // Status
 
-export type FlumeStatus =
-  | "disconnected"
-  | "connecting"
-  | "connected"
-  | "reconnecting"
+export type FlumeStatus = "disconnected" | "connecting" | "connected" | "reconnecting"
 
 export type FlumeStatusHandler = (status: FlumeStatus, detail?: string) => void
 
 // Logging
 
-export type FlumeLogLevel =
-  | "debug"
-  | "info"
-  | "warn"
-  | "error"
+export type FlumeLogLevel = "debug" | "info" | "warn" | "error"
 
 export type FlumeLog = {
   level: FlumeLogLevel
@@ -116,11 +134,8 @@ export type FlumeDiscordSourceOptions = FlumeSourceOptions & {
 export type FlumeSlackSourceOptions = FlumeSourceOptions & {
   appToken: string
   /**
-   * Bot token (`xoxb-`). Required — used by the host (e.g. funnel) to call
-   * `auth.test` for self-detection and to post replies. Flume's Socket Mode
-   * transport only needs `appToken` to open the socket, but every realistic
-   * consumer needs the bot token too, so the type forces it to be present
-   * rather than leaving it optional and failing at runtime.
+   * Bot token (`xoxb-`). Slack の Socket Mode (受信) には不要だが、ホスト側 (返信や
+   * `auth.test` での self 検出) が必ず使うため型で保持を強制する
    */
   botToken: string
 }

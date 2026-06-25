@@ -25,4 +25,17 @@ describe("FlumeStartError", () => {
 
     expect(Object.isFrozen(err)).toBe(true)
   })
+
+  it("preserves cause when provided", () => {
+    const inner = new Error("inner")
+    const err = new FlumeStartError("outer", { cause: inner })
+
+    expect(err.cause).toBe(inner)
+  })
+
+  it("cause is undefined when not provided", () => {
+    const err = new FlumeStartError("no-cause")
+
+    expect(err.cause).toBeUndefined()
+  })
 })

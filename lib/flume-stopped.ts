@@ -8,6 +8,7 @@ type Props = {
  * 停止済みの終端状態。最終ステータスのスナップショットのみ観測できる
  */
 export class FlumeStopped {
+  readonly kind = "stopped" as const
 
   constructor(private readonly props: Props) {
     Object.freeze(this)

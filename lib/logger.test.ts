@@ -43,9 +43,7 @@ describe("FlumeLogger", () => {
 
     logger.warn({ action: "retry", message: "slow" })
 
-    expect(handler).toHaveBeenCalledWith(
-      expect.objectContaining({ level: "warn" }),
-    )
+    expect(handler).toHaveBeenCalledWith(expect.objectContaining({ level: "warn" }))
   })
 
   it("error calls handler with the error field when provided", () => {
@@ -56,9 +54,7 @@ describe("FlumeLogger", () => {
 
     logger.error({ action: "fail", message: "broken", error: err })
 
-    expect(handler).toHaveBeenCalledWith(
-      expect.objectContaining({ level: "error", error: err }),
-    )
+    expect(handler).toHaveBeenCalledWith(expect.objectContaining({ level: "error", error: err }))
   })
 
   it("error accepts entries without an error field", () => {
@@ -94,5 +90,51 @@ describe("FlumeLogger", () => {
     const logger = new FlumeLogger({ source: "src", deps })
 
     expect(() => logger.info({ action: "x", message: "y" })).not.toThrow()
+  })
+
+  it("does not propagate a synchronous throw from the handler", () => {
+    const deps = createDeps()
+    const logger = new FlumeLogger({
+      source: "src",
+      deps,
+      handler: () => {
+        throw new Error("boom")
+      },
+    })
+
+    expect(() => logger.info({ action: "a", message: "m" })).not.toThrow()
+  })
+
+  it("subsequent emits still fire after the handler throws", () => {
+    const deps = createDeps()
+    let calls = 0
+    const logger = new FlumeLogger({
+      source: "src",
+      deps,
+      handler: () => {
+        calls++
+        if (calls === 1) throw new Error("first")
+      },
+    })
+
+    logger.info({ action: "a", message: "m" })
+    logger.info({ action: "b", message: "n" })
+
+    expect(calls).toBe(2)
+  })
+
+  it("does not propagate a rejected promise from an async handler", async () => {
+    const deps = createDeps()
+    const logger = new FlumeLogger({
+      source: "src",
+      deps,
+      handler: async () => {
+        throw new Error("async-boom")
+      },
+    })
+
+    logger.info({ action: "a", message: "m" })
+
+    await new Promise((resolve) => globalThis.setTimeout(resolve, 0))
   })
 })

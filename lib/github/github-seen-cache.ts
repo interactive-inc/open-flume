@@ -3,7 +3,6 @@ type Props = {
 }
 
 export class FlumeGitHubSeenCache {
-
   private seen = new Map<string, string>()
 
   constructor(private readonly props: Props) {}

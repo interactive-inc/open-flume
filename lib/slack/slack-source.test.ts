@@ -1,12 +1,11 @@
 import { describe, it, expect, vi } from "vitest"
 import { FlumeSlackSource } from "@/slack/slack-source"
-import { extractSlackMeta } from "@/slack/extract-slack-meta"
+import { flumeExtractSlackMeta } from "@/slack/extract-slack-meta"
 import type { FlumeEvent, FlumeRuntimeDeps, FlumeStatus } from "@/types"
 
 type Listener = (ev: unknown) => void
 
 class MockWebSocket {
-
   readonly url: string
 
   readyState = 1
@@ -68,7 +67,7 @@ const createMockFetch = () => {
   return vi.fn().mockResolvedValue({
     ok: true,
     status: 200,
-    json: () => Promise.resolve({ ok: true, url: "wss://slack.example.com/ws" }),
+    text: () => Promise.resolve(JSON.stringify({ ok: true, url: "wss://slack.example.com/ws" })),
   })
 }
 
@@ -94,7 +93,6 @@ const createDeps = (): FlumeRuntimeDeps => {
 }
 
 describe("FlumeSlackSource", () => {
-
   it("start() connects and forwards events to handler", async () => {
     TrackingMockWebSocket.latest = null
     const receivedEvents: Array<FlumeEvent> = []
@@ -143,7 +141,9 @@ describe("FlumeSlackSource", () => {
       appToken: "xapp-test",
       botToken: "xoxb-test",
       reconnect: false,
-      onStatus: (s) => { statuses.push(s) },
+      onStatus: (s) => {
+        statuses.push(s)
+      },
       deps: createDeps(),
     })
 
@@ -199,9 +199,9 @@ describe("FlumeSlackSource", () => {
   })
 })
 
-describe("extractSlackMeta", () => {
+describe("flumeExtractSlackMeta", () => {
   it("extracts event_type from envelope", () => {
-    const meta = extractSlackMeta({
+    const meta = flumeExtractSlackMeta({
       envelope_id: "e1",
       type: "events_api",
       payload: {},
@@ -210,7 +210,7 @@ describe("extractSlackMeta", () => {
   })
 
   it("extracts channel, user, thread_ts from payload.event", () => {
-    const meta = extractSlackMeta({
+    const meta = flumeExtractSlackMeta({
       envelope_id: "e1",
       type: "events_api",
       payload: {
@@ -224,7 +224,7 @@ describe("extractSlackMeta", () => {
   })
 
   it("handles missing event payload", () => {
-    const meta = extractSlackMeta({
+    const meta = flumeExtractSlackMeta({
       envelope_id: "e1",
       type: "slash_commands",
       payload: {},

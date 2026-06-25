@@ -1,25 +1,55 @@
 import type { FlumeSource, FlumeSourceStatus } from "@/types"
+import { FlumeLogger } from "@/logger"
 import { FlumeStopped } from "@/flume-stopped"
+import { attempt } from "@/utils/attempt"
+import { safeErrorMessage } from "@/utils/safe-error-message"
+import { safeInvokeCallback } from "@/utils/safe-invoke-callback"
+import { safeNormalizeError } from "@/utils/safe-normalize-error"
 
 type Props = {
   sources: ReadonlyArray<FlumeSource>
   signal?: AbortSignal
+  log: FlumeLogger
 }
 
 /**
- * 稼働中の Flume。stop() で FlumeStopped へ遷移する。signal が abort されると自動 stop
+ * 稼働中の Flume。stop() で FlumeStopped へ遷移する。signal が abort されると自動 stop。
+ * 全ての source 呼び出し・signal 操作・status 読み取りを `attempt` 経由で扱い、
+ * `runStop` の最外殻 try/catch で想定外の throw も `FlumeStopped` の resolve に変換する
  */
 export class FlumeRunning {
+  readonly kind = "running" as const
 
   private stopPromise: Promise<FlumeStopped> | null = null
 
   private readonly onAbort: () => void
 
   constructor(private readonly props: Props) {
-    this.onAbort = () => { void this.stop() }
+    this.onAbort = () => {
+      this.props.log.info({ action: "flume.abort", message: "signal aborted, stopping" })
+      safeInvokeCallback({
+        fn: () => this.stop(),
+        onError: (error) => {
+          this.props.log.error({
+            action: "flume.abort.stop.failed",
+            message: safeErrorMessage({ error }),
+            error,
+          })
+        },
+      })
+    }
 
-    if (props.signal) {
-      props.signal.addEventListener("abort", this.onAbort, { once: true })
+    const signal = props.signal
+    if (signal) {
+      const result = attempt(() => signal.addEventListener("abort", this.onAbort, { once: true }))
+      if (result instanceof Error) {
+        const error = safeNormalizeError({ value: result })
+        props.log.error({
+          action: "signal.addListener.failed",
+          message: safeErrorMessage({ error }),
+          error,
+        })
+      }
     }
   }
 
@@ -27,20 +57,88 @@ export class FlumeRunning {
     if (this.stopPromise) return this.stopPromise
 
     this.stopPromise = this.runStop()
-
     return this.stopPromise
   }
 
   statuses(): ReadonlyArray<FlumeSourceStatus> {
-    return this.props.sources.map((source) => ({ name: source.name, status: source.status() }))
+    return this.snapshotStatuses()
   }
 
   private async runStop(): Promise<FlumeStopped> {
-    await Promise.allSettled(this.props.sources.map((source) => source.stop()))
-    this.props.signal?.removeEventListener("abort", this.onAbort)
+    try {
+      this.props.log.info({
+        action: "flume.stop",
+        message: `stopping ${this.props.sources.length} source(s)`,
+      })
 
-    return new FlumeStopped({
-      finalStatuses: this.props.sources.map((source) => ({ name: source.name, status: source.status() })),
+      const settled = await Promise.allSettled(
+        this.props.sources.map((source) =>
+          Promise.resolve().then(() => source.stop()),
+        ),
+      )
+
+      for (const [index, result] of settled.entries()) {
+        if (result.status === "rejected") {
+          const source = this.props.sources[index]
+          const name = source ? this.sourceName(source) : "?"
+          const error = safeNormalizeError({ value: result.reason })
+          this.props.log.error({
+            action: "flume.stop.failed",
+            message: `${name}: ${safeErrorMessage({ error })}`,
+            error,
+            detail: { source: name },
+          })
+        }
+      }
+
+      const signal = this.props.signal
+      if (signal) {
+        const result = attempt(() => signal.removeEventListener("abort", this.onAbort))
+        if (result instanceof Error) {
+          const error = safeNormalizeError({ value: result })
+          this.props.log.error({
+            action: "signal.removeListener.failed",
+            message: safeErrorMessage({ error }),
+            error,
+          })
+        }
+      }
+      this.props.log.info({ action: "flume.stop.complete", message: "all sources stopped" })
+
+      return new FlumeStopped({ finalStatuses: this.snapshotStatuses() })
+    } catch (err) {
+      const error = safeNormalizeError({ value: err })
+      this.props.log.error({
+        action: "flume.stop.unhandled",
+        message: safeErrorMessage({ error }),
+        error,
+      })
+      return new FlumeStopped({ finalStatuses: this.snapshotStatuses() })
+    }
+  }
+
+  private snapshotStatuses(): ReadonlyArray<FlumeSourceStatus> {
+    return this.props.sources.map((source) => {
+      const name = this.sourceName(source)
+      const status = attempt(() => source.status())
+      if (status instanceof Error) {
+        const error = safeNormalizeError({ value: status })
+        this.props.log.error({
+          action: "source.status.failed",
+          message: `${name}: ${safeErrorMessage({ error })}`,
+          error,
+          detail: { source: name },
+        })
+        return { source: name, status: "disconnected" as const }
+      }
+      return { source: name, status }
     })
+  }
+
+  private sourceName(source: FlumeSource): string {
+    const result = attempt(() => source.name)
+    if (result instanceof Error) return "?"
+    if (typeof result !== "string") return "?"
+    return result
   }
 }
