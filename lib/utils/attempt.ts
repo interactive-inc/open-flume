@@ -11,9 +11,7 @@ import { safeNormalizeError } from "@/utils/safe-normalize-error"
  */
 export function attempt<T>(fn: () => Promise<T>): Promise<T | Error>
 export function attempt<T>(fn: () => T): T | Error
-export function attempt<T>(
-  fn: () => T | Promise<T>,
-): T | Error | Promise<T | Error> {
+export function attempt<T>(fn: () => T | Promise<T>): T | Error | Promise<T | Error> {
   try {
     const result = fn()
     if (result instanceof Promise) {

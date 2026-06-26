@@ -13,7 +13,11 @@ describe("safeStringify", () => {
   })
 
   it("returns Error when toJSON throws", () => {
-    const cursed = { toJSON: () => { throw new Error("bad") } }
+    const cursed = {
+      toJSON: () => {
+        throw new Error("bad")
+      },
+    }
     expect(safeStringify(cursed)).toBeInstanceOf(Error)
   })
 })

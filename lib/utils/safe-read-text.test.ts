@@ -26,7 +26,9 @@ describe("safeReadText", () => {
 
   it("returns FlumeHttpError when text() throws synchronously", async () => {
     const response = {
-      text: () => { throw new Error("sync") },
+      text: () => {
+        throw new Error("sync")
+      },
       status: 500,
     } as unknown as Response
 

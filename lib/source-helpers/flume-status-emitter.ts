@@ -1,11 +1,11 @@
 import type { FlumeLogger } from "@/logger"
-import type { FlumeStatus, FlumeStatusHandler } from "@/types"
+import type { FlumeSourceLocalStatusHandler, FlumeStatus } from "@/types"
 import { safeErrorMessage } from "@/utils/safe-error-message"
 import { safeInvokeCallback } from "@/utils/safe-invoke-callback"
 
 type Props = {
   log: FlumeLogger
-  onStatus?: FlumeStatusHandler
+  onStatus?: FlumeSourceLocalStatusHandler
 }
 
 /**

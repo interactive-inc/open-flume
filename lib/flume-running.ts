@@ -1,4 +1,5 @@
-import type { FlumeSource, FlumeSourceStatus } from "@/types"
+import type { FlumeSourceStatus } from "@/types"
+import type { FlumeSource } from "@/flume-source"
 import { FlumeLogger } from "@/logger"
 import { FlumeStopped } from "@/flume-stopped"
 import { attempt } from "@/utils/attempt"
@@ -72,9 +73,7 @@ export class FlumeRunning {
       })
 
       const settled = await Promise.allSettled(
-        this.props.sources.map((source) =>
-          Promise.resolve().then(() => source.stop()),
-        ),
+        this.props.sources.map((source) => Promise.resolve().then(() => source.stop())),
       )
 
       for (const [index, result] of settled.entries()) {

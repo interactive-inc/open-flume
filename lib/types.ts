@@ -1,4 +1,5 @@
 import type { z } from "zod/v4"
+import type { FlumeLogger } from "@/logger"
 import type { FlumeGatewayMessageSchema } from "@/discord/discord-gateway-message-schema"
 import type { FlumeGitHubNotificationSchema } from "@/github/github-notification-schema"
 import type { FlumeSlackConnectionResponseSchema } from "@/slack/slack-connection-response-schema"
@@ -51,33 +52,28 @@ export type FlumeGitHubEvent = {
 
 export type FlumeEvent = FlumeDiscordEvent | FlumeSlackEvent | FlumeGitHubEvent
 
-export type FlumeHandler = (event: FlumeEvent) => void | Promise<void>
-
-export type FlumeSourceStartOptions = {
-  signal?: AbortSignal
-}
-
-export type FlumeSource = {
-  readonly name: FlumeSourceName
-  start(handler: FlumeHandler, options?: FlumeSourceStartOptions): Promise<Error | null>
-  stop(): Promise<void>
-  status(): FlumeStatus
-}
-
-export type FlumeSourceStatus = {
-  /**
-   * 多くは `FlumeSourceName` のいずれかだが、`source.name` getter が throw する
-   * 第三者 `FlumeSource` 実装に備えて `string` まで広げてある (fallback で `"?"`)
-   */
-  source: string
-  status: FlumeStatus
-}
+export type FlumeEventHandler = (event: FlumeEvent) => void | Promise<void>
 
 // Status
 
 export type FlumeStatus = "disconnected" | "connecting" | "connected" | "reconnecting"
 
-export type FlumeStatusHandler = (status: FlumeStatus, detail?: string) => void
+export type FlumeStatusEvent = {
+  source: string
+  status: FlumeStatus
+  detail?: string
+}
+
+export type FlumeStatusHandler = (event: FlumeStatusEvent) => void
+
+export type FlumeSourceStatus = {
+  /**
+   * 多くは `FlumeSourceName` のいずれかだが、`source.name` getter が throw する
+   * 第三者 FlumeSource 実装に備えて `string` まで広げてある (fallback で `"?"`)
+   */
+  source: string
+  status: FlumeStatus
+}
 
 // Logging
 
@@ -116,31 +112,36 @@ export type FlumeReconnectConfig = {
   maxDelay: number
 }
 
-// Source options
+// Source start context (Flume → Source 内部 API)
 
-export type FlumeSourceOptions = {
-  reconnect?: boolean | FlumeReconnectOptions
-  onStatus?: FlumeStatusHandler
-  onLog?: FlumeLogHandler
-  signal?: AbortSignal
-  deps?: FlumeRuntimeDeps
+export type FlumeSourceLocalStatusHandler = (status: FlumeStatus, detail?: string) => void
+
+export type FlumeSourceStartContext = {
+  onEvent: FlumeEventHandler
+  log: FlumeLogger
+  deps: FlumeRuntimeDeps
+  onStatus: FlumeSourceLocalStatusHandler
+  reconnect: FlumeReconnectConfig | null
 }
 
-export type FlumeDiscordSourceOptions = FlumeSourceOptions & {
+// Source 構築 options — domain config のみ。
+// cross-cutting (handler / onLog / onStatus / signal / deps / reconnect) は Flume 側で受け取る
+
+export type FlumeDiscordSourceOptions = {
   token: string
   intents?: number
 }
 
-export type FlumeSlackSourceOptions = FlumeSourceOptions & {
+export type FlumeSlackSourceOptions = {
   appToken: string
   /**
-   * Bot token (`xoxb-`). Slack の Socket Mode (受信) には不要だが、ホスト側 (返信や
+   * Bot token (`xoxb-`). Slack Socket Mode (受信) には不要だが、ホスト側 (返信や
    * `auth.test` での self 検出) が必ず使うため型で保持を強制する
    */
   botToken: string
 }
 
-export type FlumeGitHubSourceOptions = FlumeSourceOptions & {
+export type FlumeGitHubSourceOptions = {
   token: string
   pollInterval?: number
 }

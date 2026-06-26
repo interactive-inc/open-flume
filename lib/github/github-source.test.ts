@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from "vitest"
 import { FlumeGitHubSource } from "@/github/github-source"
 import { flumeExtractGitHubMeta } from "@/github/extract-github-meta"
-import type { FlumeEvent, FlumeRuntimeDeps, FlumeStatus } from "@/types"
+import { FlumeLogger } from "@/logger"
+import type { FlumeEvent, FlumeRuntimeDeps, FlumeSourceStartContext, FlumeStatus } from "@/types"
 
 const timerHandle = globalThis.setTimeout(() => {}, 0)
 globalThis.clearTimeout(timerHandle)
@@ -48,6 +49,20 @@ function createMockDeps() {
   return { deps, mockFetch, getIntervalCallback }
 }
 
+type CtxProps = {
+  deps: FlumeRuntimeDeps
+  onEvent?: (event: FlumeEvent) => void
+  onStatus?: (status: FlumeStatus, detail?: string) => void
+}
+
+const createCtx = (props: CtxProps): FlumeSourceStartContext => ({
+  onEvent: props.onEvent ?? (() => {}),
+  log: new FlumeLogger({ source: "github", deps: props.deps }),
+  deps: props.deps,
+  onStatus: props.onStatus ?? (() => {}),
+  reconnect: null,
+})
+
 function flushPromises() {
   return new Promise<void>((resolve) => globalThis.setTimeout(resolve, 0))
 }
@@ -64,15 +79,11 @@ describe("FlumeGitHubSource", () => {
       makeJsonResponse([makeNotification("2", "2024-01-02T00:00:00Z")]),
     )
 
-    const source = new FlumeGitHubSource({
-      token: "ghp_test",
-      pollInterval: 60,
-      deps: test.deps,
-    })
+    const source = new FlumeGitHubSource({ token: "ghp_test", pollInterval: 60 })
 
-    await source.start((event) => {
-      receivedEvents.push(event)
-    })
+    await source.start(
+      createCtx({ deps: test.deps, onEvent: (event) => receivedEvents.push(event) }),
+    )
 
     const cb = test.getIntervalCallback()
     cb!()
@@ -90,16 +101,9 @@ describe("FlumeGitHubSource", () => {
 
     test.mockFetch.mockResolvedValueOnce(makeJsonResponse([]))
 
-    const source = new FlumeGitHubSource({
-      token: "ghp_test",
-      pollInterval: 60,
-      deps: test.deps,
-      onStatus: (status) => {
-        statuses.push(status)
-      },
-    })
+    const source = new FlumeGitHubSource({ token: "ghp_test", pollInterval: 60 })
 
-    await source.start(vi.fn())
+    await source.start(createCtx({ deps: test.deps, onStatus: (s) => statuses.push(s) }))
     await source.stop()
 
     expect(source.status()).toBe("disconnected")
@@ -107,30 +111,9 @@ describe("FlumeGitHubSource", () => {
   })
 
   it("status() returns disconnected initially", () => {
-    const test = createMockDeps()
-
-    const source = new FlumeGitHubSource({
-      token: "ghp_test",
-      deps: test.deps,
-    })
+    const source = new FlumeGitHubSource({ token: "ghp_test" })
 
     expect(source.status()).toBe("disconnected")
-  })
-
-  it("aborted signal prevents start", async () => {
-    const test = createMockDeps()
-    const controller = new AbortController()
-    controller.abort()
-
-    const source = new FlumeGitHubSource({
-      token: "ghp_test",
-      deps: test.deps,
-      signal: controller.signal,
-    })
-
-    await source.start(vi.fn())
-
-    expect(test.mockFetch).not.toHaveBeenCalled()
   })
 })
 

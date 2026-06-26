@@ -13,7 +13,9 @@ describe("safeInvokeCallback", () => {
   it("calls onError with normalized Error when fn throws synchronously", () => {
     const onError = vi.fn()
     safeInvokeCallback({
-      fn: () => { throw new Error("boom") },
+      fn: () => {
+        throw new Error("boom")
+      },
       onError,
     })
     expect(onError).toHaveBeenCalledOnce()
@@ -24,7 +26,9 @@ describe("safeInvokeCallback", () => {
 
   it("calls onError with normalized Error when async fn rejects", async () => {
     const onError = vi.fn()
-    const asyncFn = async (): Promise<void> => { throw new Error("async-boom") }
+    const asyncFn = async (): Promise<void> => {
+      throw new Error("async-boom")
+    }
     safeInvokeCallback({ fn: asyncFn as unknown as () => void, onError })
     await new Promise((r) => globalThis.setTimeout(r, 0))
     expect(onError).toHaveBeenCalledOnce()
@@ -33,17 +37,25 @@ describe("safeInvokeCallback", () => {
   it("does not throw when onError itself throws", () => {
     expect(() =>
       safeInvokeCallback({
-        fn: () => { throw new Error("boom") },
-        onError: () => { throw new Error("onError-boom") },
+        fn: () => {
+          throw new Error("boom")
+        },
+        onError: () => {
+          throw new Error("onError-boom")
+        },
       }),
     ).not.toThrow()
   })
 
   it("does not propagate when async onError throws after rejection", async () => {
-    const asyncFn = async (): Promise<void> => { throw new Error("async-boom") }
+    const asyncFn = async (): Promise<void> => {
+      throw new Error("async-boom")
+    }
     safeInvokeCallback({
       fn: asyncFn as unknown as () => void,
-      onError: () => { throw new Error("onError-boom") },
+      onError: () => {
+        throw new Error("onError-boom")
+      },
     })
     await new Promise((r) => globalThis.setTimeout(r, 0))
   })

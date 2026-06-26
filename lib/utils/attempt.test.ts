@@ -47,11 +47,9 @@ describe("attempt (async)", () => {
   })
 
   it("returns Error when fn throws synchronously before returning Promise", async () => {
-    const result = await attempt<number>(
-      (): Promise<number> => {
-        throw new Error("sync")
-      },
-    )
+    const result = await attempt<number>((): Promise<number> => {
+      throw new Error("sync")
+    })
     expect(result).toBeInstanceOf(Error)
   })
 

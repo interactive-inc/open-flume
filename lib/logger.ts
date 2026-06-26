@@ -37,6 +37,14 @@ export class FlumeLogger {
     this.emit("error", entry)
   }
 
+  get handler(): FlumeLogHandler | undefined {
+    return this.props.handler
+  }
+
+  child(source: string): FlumeLogger {
+    return new FlumeLogger({ source, handler: this.props.handler, deps: this.props.deps })
+  }
+
   private emit(level: FlumeLogLevel, input: FlumeLogInput): void {
     const handler = this.props.handler
 

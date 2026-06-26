@@ -120,7 +120,11 @@ export class FlumeSlackSocketMode {
           `WebSocket construction failed: ${safeErrorMessage({ error: socketResult })}`,
           { cause: socketResult },
         )
-        this.log.error({ action: "ws.construct.error", message: safeErrorMessage({ error }), error })
+        this.log.error({
+          action: "ws.construct.error",
+          message: safeErrorMessage({ error }),
+          error,
+        })
         this.ws = null
         this.pendingResolved = true
         resolve(error)
@@ -156,21 +160,33 @@ export class FlumeSlackSocketMode {
   private safeOnMessage(ev: MessageEvent, socket: WebSocket): void {
     const r = attempt(() => this.onMessage(String(ev.data), socket))
     if (r instanceof Error) {
-      this.log.error({ action: "ws.message.threw", message: safeErrorMessage({ error: r }), error: r })
+      this.log.error({
+        action: "ws.message.threw",
+        message: safeErrorMessage({ error: r }),
+        error: r,
+      })
     }
   }
 
   private safeOnClose(ev: CloseEvent): void {
     const r = attempt(() => this.onClose(ev))
     if (r instanceof Error) {
-      this.log.error({ action: "ws.close.threw", message: safeErrorMessage({ error: r }), error: r })
+      this.log.error({
+        action: "ws.close.threw",
+        message: safeErrorMessage({ error: r }),
+        error: r,
+      })
     }
   }
 
   private safeOnError(): void {
     const r = attempt(() => this.onError())
     if (r instanceof Error) {
-      this.log.error({ action: "ws.error.threw", message: safeErrorMessage({ error: r }), error: r })
+      this.log.error({
+        action: "ws.error.threw",
+        message: safeErrorMessage({ error: r }),
+        error: r,
+      })
     }
   }
 

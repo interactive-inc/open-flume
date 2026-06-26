@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from "vitest"
-import type { FlumeEvent, FlumeRuntimeDeps } from "@/types"
+import type { FlumeEvent, FlumeRuntimeDeps, FlumeSourceStartContext } from "@/types"
 import { FlumeDiscordSource } from "@/discord/discord-source"
 import { flumeExtractDiscordMeta } from "@/discord/extract-discord-meta"
+import { FlumeLogger } from "@/logger"
 
 type Listener = (ev: unknown) => void
 
@@ -70,6 +71,20 @@ const createMockDeps = (): FlumeRuntimeDeps => {
   }
 }
 
+type CtxProps = {
+  deps: FlumeRuntimeDeps
+  onEvent?: (event: FlumeEvent) => void
+  onStatus?: (status: string, detail?: string) => void
+}
+
+const createCtx = (props: CtxProps): FlumeSourceStartContext => ({
+  onEvent: props.onEvent ?? (() => {}),
+  log: new FlumeLogger({ source: "discord", deps: props.deps }),
+  deps: props.deps,
+  onStatus: props.onStatus ?? (() => {}),
+  reconnect: null,
+})
+
 const simulateReadySequence = () => {
   const ws = MockWebSocket.latest!
 
@@ -84,16 +99,8 @@ describe("FlumeDiscordSource", () => {
 
     MockWebSocket.latest = null
 
-    const source = new FlumeDiscordSource({
-      token: "test-token",
-      onStatus,
-      reconnect: false,
-      deps,
-    })
-
-    const handler = vi.fn()
-
-    const startPromise = source.start(handler)
+    const source = new FlumeDiscordSource({ token: "test-token" })
+    const startPromise = source.start(createCtx({ deps, onStatus }))
 
     simulateReadySequence()
 
@@ -109,16 +116,8 @@ describe("FlumeDiscordSource", () => {
 
     MockWebSocket.latest = null
 
-    const source = new FlumeDiscordSource({
-      token: "test-token",
-      onStatus,
-      reconnect: false,
-      deps,
-    })
-
-    const handler = vi.fn()
-
-    const startPromise = source.start(handler)
+    const source = new FlumeDiscordSource({ token: "test-token" })
+    const startPromise = source.start(createCtx({ deps, onStatus }))
 
     simulateReadySequence()
 
@@ -129,24 +128,19 @@ describe("FlumeDiscordSource", () => {
     expect(onStatus).toHaveBeenCalledWith("disconnected")
   })
 
-  it("dispatched events are forwarded to handler", async () => {
+  it("dispatched events are forwarded to onEvent", async () => {
     const deps = createMockDeps()
 
     MockWebSocket.latest = null
 
-    const source = new FlumeDiscordSource({
-      token: "test-token",
-      reconnect: false,
-      deps,
-    })
+    const source = new FlumeDiscordSource({ token: "test-token" })
 
     const receivedEvents: Array<FlumeEvent> = []
-
-    const handler = (event: FlumeEvent) => {
+    const onEvent = (event: FlumeEvent) => {
       receivedEvents.push(event)
     }
 
-    const startPromise = source.start(handler)
+    const startPromise = source.start(createCtx({ deps, onEvent }))
 
     simulateReadySequence()
 
@@ -169,39 +163,23 @@ describe("FlumeDiscordSource", () => {
   })
 
   it("status() returns current status", () => {
-    const deps = createMockDeps()
-
-    MockWebSocket.latest = null
-
-    const source = new FlumeDiscordSource({
-      token: "test-token",
-      reconnect: false,
-      deps,
-    })
+    const source = new FlumeDiscordSource({ token: "test-token" })
 
     expect(source.status()).toBe("disconnected")
   })
 
-  it("aborted signal prevents start", async () => {
+  it("second start() returns FlumeStartError (consumed guard)", async () => {
     const deps = createMockDeps()
-    const controller = new AbortController()
-
-    controller.abort()
-
     MockWebSocket.latest = null
 
-    const source = new FlumeDiscordSource({
-      token: "test-token",
-      reconnect: false,
-      signal: controller.signal,
-      deps,
-    })
+    const source = new FlumeDiscordSource({ token: "test-token" })
+    const startPromise = source.start(createCtx({ deps }))
+    simulateReadySequence()
+    await startPromise
 
-    const handler = vi.fn()
+    const second = await source.start(createCtx({ deps }))
 
-    await source.start(handler)
-
-    expect(MockWebSocket.latest).toBeNull()
+    expect(second).toBeInstanceOf(Error)
   })
 })
 

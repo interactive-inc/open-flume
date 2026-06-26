@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from "vitest"
 import { FlumeSlackSource } from "@/slack/slack-source"
 import { flumeExtractSlackMeta } from "@/slack/extract-slack-meta"
-import type { FlumeEvent, FlumeRuntimeDeps, FlumeStatus } from "@/types"
+import { FlumeLogger } from "@/logger"
+import type { FlumeEvent, FlumeRuntimeDeps, FlumeSourceStartContext, FlumeStatus } from "@/types"
 
 type Listener = (ev: unknown) => void
 
@@ -92,21 +93,31 @@ const createDeps = (): FlumeRuntimeDeps => {
   }
 }
 
+type CtxProps = {
+  deps: FlumeRuntimeDeps
+  onEvent?: (event: FlumeEvent) => void
+  onStatus?: (status: FlumeStatus, detail?: string) => void
+}
+
+const createCtx = (props: CtxProps): FlumeSourceStartContext => ({
+  onEvent: props.onEvent ?? (() => {}),
+  log: new FlumeLogger({ source: "slack", deps: props.deps }),
+  deps: props.deps,
+  onStatus: props.onStatus ?? (() => {}),
+  reconnect: null,
+})
+
 describe("FlumeSlackSource", () => {
-  it("start() connects and forwards events to handler", async () => {
+  it("start() connects and forwards events to onEvent", async () => {
     TrackingMockWebSocket.latest = null
     const receivedEvents: Array<FlumeEvent> = []
+    const deps = createDeps()
 
-    const source = new FlumeSlackSource({
-      appToken: "xapp-test",
-      botToken: "xoxb-test",
-      reconnect: false,
-      deps: createDeps(),
-    })
+    const source = new FlumeSlackSource({ appToken: "xapp-test", botToken: "xoxb-test" })
 
-    const startPromise = source.start((event) => {
-      receivedEvents.push(event)
-    })
+    const startPromise = source.start(
+      createCtx({ deps, onEvent: (event) => receivedEvents.push(event) }),
+    )
 
     await vi.waitFor(() => {
       expect(TrackingMockWebSocket.latest).not.toBeNull()
@@ -136,18 +147,10 @@ describe("FlumeSlackSource", () => {
   it("stop() disconnects and sets status to disconnected", async () => {
     TrackingMockWebSocket.latest = null
     const statuses: Array<FlumeStatus> = []
+    const deps = createDeps()
 
-    const source = new FlumeSlackSource({
-      appToken: "xapp-test",
-      botToken: "xoxb-test",
-      reconnect: false,
-      onStatus: (s) => {
-        statuses.push(s)
-      },
-      deps: createDeps(),
-    })
-
-    const startPromise = source.start(vi.fn())
+    const source = new FlumeSlackSource({ appToken: "xapp-test", botToken: "xoxb-test" })
+    const startPromise = source.start(createCtx({ deps, onStatus: (s) => statuses.push(s) }))
 
     await vi.waitFor(() => {
       expect(TrackingMockWebSocket.latest).not.toBeNull()
@@ -164,38 +167,9 @@ describe("FlumeSlackSource", () => {
   })
 
   it("status() returns current status", () => {
-    const source = new FlumeSlackSource({
-      appToken: "xapp-test",
-      botToken: "xoxb-test",
-      reconnect: false,
-      deps: createDeps(),
-    })
+    const source = new FlumeSlackSource({ appToken: "xapp-test", botToken: "xoxb-test" })
 
     expect(source.status()).toBe("disconnected")
-  })
-
-  it("aborted signal prevents start", async () => {
-    TrackingMockWebSocket.latest = null
-    const controller = new AbortController()
-    controller.abort()
-
-    const mockFetch = createMockFetch()
-
-    const source = new FlumeSlackSource({
-      appToken: "xapp-test",
-      botToken: "xoxb-test",
-      reconnect: false,
-      signal: controller.signal,
-      deps: {
-        ...createDeps(),
-        fetch: mockFetch,
-      },
-    })
-
-    await source.start(vi.fn())
-
-    expect(mockFetch).not.toHaveBeenCalled()
-    expect(TrackingMockWebSocket.latest).toBeNull()
   })
 })
 

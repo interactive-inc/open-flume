@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from "vitest"
-import type { FlumeRuntimeDeps } from "@/types"
+import type { FlumeEvent, FlumeRuntimeDeps, FlumeSourceStartContext } from "@/types"
 import { Flume } from "@/flume"
 import { FlumeRunning } from "@/flume-running"
 import { FlumeDiscordSource } from "@/discord/discord-source"
+import { FlumeSource } from "@/flume-source"
+import { FlumeLogger } from "@/logger"
 
 class MockWebSocket {
   static latest: MockWebSocket | null = null
@@ -53,19 +55,34 @@ const createDeps = (): FlumeRuntimeDeps => ({
   clearInterval: vi.fn(),
 })
 
+type CtxProps = {
+  deps: FlumeRuntimeDeps
+  onEvent?: (event: FlumeEvent) => void
+  onLog?: (log: import("@/types").FlumeLog) => void
+  onStatus?: (status: import("@/types").FlumeStatus, detail?: string) => void
+}
+
+const createCtx = (props: CtxProps): FlumeSourceStartContext => ({
+  onEvent: props.onEvent ?? (() => {}),
+  log: new FlumeLogger({ source: "test", deps: props.deps, handler: props.onLog }),
+  deps: props.deps,
+  onStatus: props.onStatus ?? (() => {}),
+  reconnect: null,
+})
+
 describe("throw isolation: public surface never throws", () => {
   it("source.start does not throw when onLog throws", async () => {
     MockWebSocket.latest = null
-    const source = new FlumeDiscordSource({
-      token: "t",
-      reconnect: false,
-      deps: createDeps(),
-      onLog: () => {
-        throw new Error("onLog boom")
-      },
-    })
+    const source = new FlumeDiscordSource({ token: "t" })
 
-    const startPromise = source.start(vi.fn())
+    const startPromise = source.start(
+      createCtx({
+        deps: createDeps(),
+        onLog: () => {
+          throw new Error("onLog boom")
+        },
+      }),
+    )
     MockWebSocket.latest!.simulateMessage(HELLO)
     MockWebSocket.latest!.simulateMessage(READY)
     const result = await startPromise
@@ -75,16 +92,16 @@ describe("throw isolation: public surface never throws", () => {
 
   it("source does not crash when onStatus throws", async () => {
     MockWebSocket.latest = null
-    const source = new FlumeDiscordSource({
-      token: "t",
-      reconnect: false,
-      deps: createDeps(),
-      onStatus: () => {
-        throw new Error("onStatus boom")
-      },
-    })
+    const source = new FlumeDiscordSource({ token: "t" })
 
-    const startPromise = source.start(vi.fn())
+    const startPromise = source.start(
+      createCtx({
+        deps: createDeps(),
+        onStatus: () => {
+          throw new Error("onStatus boom")
+        },
+      }),
+    )
     MockWebSocket.latest!.simulateMessage(HELLO)
     MockWebSocket.latest!.simulateMessage(READY)
     const result = await startPromise
@@ -100,31 +117,27 @@ describe("throw isolation: public surface never throws", () => {
       }
     } as unknown as FlumeRuntimeDeps["WebSocket"]
 
-    const source = new FlumeDiscordSource({
-      token: "t",
-      reconnect: false,
-      deps: { ...createDeps(), WebSocket: ThrowingWS },
-    })
-
-    const result = await source.start(vi.fn())
+    const source = new FlumeDiscordSource({ token: "t" })
+    const result = await source.start(
+      createCtx({ deps: { ...createDeps(), WebSocket: ThrowingWS } }),
+    )
 
     expect(result).toBeInstanceOf(Error)
   })
 
   it("source.start does not throw when deps.now throws", async () => {
-    const deps = createDeps()
-    const source = new FlumeDiscordSource({
-      token: "t",
-      reconnect: false,
-      deps: {
-        ...deps,
-        now: () => {
-          throw new Error("now boom")
-        },
-      },
-    })
+    const source = new FlumeDiscordSource({ token: "t" })
 
-    const startPromise = source.start(vi.fn())
+    const startPromise = source.start(
+      createCtx({
+        deps: {
+          ...createDeps(),
+          now: () => {
+            throw new Error("now boom")
+          },
+        },
+      }),
+    )
     MockWebSocket.latest?.simulateMessage(HELLO)
     MockWebSocket.latest?.simulateMessage(READY)
     const result = await startPromise
@@ -132,18 +145,17 @@ describe("throw isolation: public surface never throws", () => {
     expect(result).toBeNull()
   })
 
-  it("Flume.start does not throw when a source.start throws synchronously", async () => {
-    const throwingSource = {
-      name: "discord" as const,
-      start: (): Promise<Error | null> => {
-        throw new Error("sync-start-throw")
-      },
-      stop: async (): Promise<void> => {},
-      status: () => "disconnected" as const,
+  class SyncThrowOnConnect extends FlumeSource {
+    readonly name = "discord" as const
+    protected async connect(_ctx: FlumeSourceStartContext): Promise<Error | null> {
+      throw new Error("sync-start-throw")
     }
+    protected disconnect(): void {}
+  }
 
-    const flume = new Flume({ sources: [throwingSource] })
-    const result = await flume.start(vi.fn())
+  it("Flume.start does not throw when a source.connect throws synchronously", async () => {
+    const flume = new Flume([new SyncThrowOnConnect()], { onEvent: vi.fn() })
+    const result = await flume.start()
 
     expect(result).toBeInstanceOf(Error)
     if (result instanceof Error) {
@@ -151,42 +163,46 @@ describe("throw isolation: public surface never throws", () => {
     }
   })
 
-  it("FlumeRunning.stop does not throw when a source.stop throws synchronously", async () => {
-    const okStart = vi.fn().mockResolvedValue(null)
-    const throwingStop = (): Promise<void> => {
+  class ThrowOnDisconnect extends FlumeSource {
+    readonly name = "discord" as const
+    protected async connect(_ctx: FlumeSourceStartContext): Promise<Error | null> {
+      this.setStatus("connected")
+      return null
+    }
+    protected disconnect(): void {
       throw new Error("sync-stop-throw")
     }
-    const source = {
-      name: "discord" as const,
-      start: okStart,
-      stop: throwingStop,
-      status: () => "connected" as const,
-    }
+  }
 
-    const flume = new Flume({ sources: [source] })
-    const running = await flume.start(vi.fn())
+  it("FlumeRunning.stop does not throw when a source.disconnect throws synchronously", async () => {
+    const flume = new Flume([new ThrowOnDisconnect()], { onEvent: vi.fn() })
+    const running = await flume.start()
     if (!(running instanceof FlumeRunning)) throw new Error("expected FlumeRunning")
 
     const stopped = await running.stop()
     expect(stopped.statuses()[0]?.source).toBe("discord")
   })
 
-  it("Flume.start does not throw when source.status throws", async () => {
-    const source = {
-      name: "discord" as const,
-      start: async (): Promise<Error | null> => null,
-      stop: async (): Promise<void> => {},
-      status: (): "connected" => {
-        throw new Error("status-boom")
-      },
+  class CursedNameSource extends FlumeSource {
+    get name(): "discord" {
+      throw new Error("name-getter-boom")
     }
+    protected async connect(_ctx: FlumeSourceStartContext): Promise<Error | null> {
+      this.setStatus("connected")
+      return null
+    }
+    protected disconnect(): void {}
+  }
 
-    const flume = new Flume({ sources: [source] })
-    const running = await flume.start(vi.fn())
-    if (!(running instanceof FlumeRunning)) throw new Error("expected FlumeRunning")
+  it("Flume.start does not throw when third-party source.name getter throws", async () => {
+    const flume = new Flume([new CursedNameSource()], { onEvent: vi.fn() })
+    const running = await flume.start()
 
-    const statuses = running.statuses()
-    expect(statuses[0]?.status).toBe("disconnected")
+    expect(running).toBeInstanceOf(FlumeRunning)
+    if (running instanceof FlumeRunning) {
+      const stopped = await running.stop()
+      expect(stopped).toBeDefined()
+    }
   })
 
   it("source.start returns FlumeStartError when deps.WebSocket getter throws", async () => {
@@ -198,12 +214,12 @@ describe("throw isolation: public surface never throws", () => {
       },
     }) as FlumeRuntimeDeps
 
-    const source = new FlumeDiscordSource({ token: "t", reconnect: false, deps: cursedDeps })
-    const result = await source.start(vi.fn())
+    const source = new FlumeDiscordSource({ token: "t" })
+    const result = await source.start(createCtx({ deps: cursedDeps }))
     expect(result).toBeInstanceOf(Error)
   })
 
-  it("source.start returns FlumeStartError when signal.aborted getter throws", async () => {
+  it("Flume.start returns FlumeStartError when signal.aborted getter throws", async () => {
     const poisoned = {
       get aborted(): boolean {
         throw new Error("getter-boom")
@@ -212,29 +228,27 @@ describe("throw isolation: public surface never throws", () => {
       removeEventListener: () => {},
     } as unknown as AbortSignal
 
-    const source = new FlumeDiscordSource({
-      token: "t",
-      reconnect: false,
-      signal: poisoned,
-      deps: createDeps(),
-    })
-    const result = await source.start(vi.fn())
+    const source = new FlumeDiscordSource({ token: "t" })
+    const flume = new Flume([source], { onEvent: vi.fn(), signal: poisoned })
+    const result = await flume.start()
     expect(result).toBeInstanceOf(Error)
   })
 
   it("Flume.start does not throw when deps.setTimeout throws in source", async () => {
-    const deps = createDeps()
     const setTimeoutMock = vi.fn(() => {
       throw new Error("timer-denied")
     })
-    const source = new FlumeDiscordSource({
-      token: "t",
-      reconnect: { maxAttempts: 0 },
-      deps: { ...deps, setTimeout: setTimeoutMock as unknown as FlumeRuntimeDeps["setTimeout"] },
-    })
+    const source = new FlumeDiscordSource({ token: "t" })
 
     MockWebSocket.latest = null
-    const startPromise = source.start(vi.fn())
+    const startPromise = source.start(
+      createCtx({
+        deps: {
+          ...createDeps(),
+          setTimeout: setTimeoutMock as unknown as FlumeRuntimeDeps["setTimeout"],
+        },
+      }),
+    )
     const ws = MockWebSocket.latest as MockWebSocket | null
     ws?.simulateMessage(HELLO)
     ws?.simulateMessage(READY)
@@ -243,44 +257,25 @@ describe("throw isolation: public surface never throws", () => {
     expect(result).toBeNull()
   })
 
-  it("Flume.start does not throw when third-party source.name getter throws", async () => {
-    const hostileSource = {
-      get name(): "discord" {
-        throw new Error("name-getter-boom")
-      },
-      start: async (): Promise<Error | null> => null,
-      stop: async (): Promise<void> => {},
-      status: () => "connected" as const,
-    }
-
-    const flume = new Flume({ sources: [hostileSource] })
-    const running = await flume.start(vi.fn())
-
-    expect(running).toBeInstanceOf(FlumeRunning)
-    if (running instanceof FlumeRunning) {
-      const stopped = await running.stop()
-      expect(stopped).toBeDefined()
-    }
-  })
-
-  it("source.start does not throw when handler rejects with poisoned object", async () => {
+  it("source.start does not throw when onEvent rejects with poisoned object", async () => {
     MockWebSocket.latest = null
     const cursedThrower = {
       [Symbol.toPrimitive]() {
         throw new Error("toPrim-boom")
       },
     }
-    const handler = vi.fn(() => {
+    const onEvent = vi.fn(() => {
       throw cursedThrower
     })
 
-    const source = new FlumeDiscordSource({
-      token: "t",
-      reconnect: false,
-      deps: createDeps(),
-    })
+    const source = new FlumeDiscordSource({ token: "t" })
 
-    const startPromise = source.start(handler as unknown as Parameters<typeof source.start>[0])
+    const startPromise = source.start(
+      createCtx({
+        deps: createDeps(),
+        onEvent: onEvent as unknown as (event: FlumeEvent) => void,
+      }),
+    )
     MockWebSocket.latest!.simulateMessage(HELLO)
     MockWebSocket.latest!.simulateMessage(READY)
     const result = await startPromise
