@@ -60,10 +60,18 @@ export abstract class FlumeSource {
     if (this.stopped) return
     this.stopped = true
 
-    await this.disconnect()
-    await this.queue.drain()
-    this.statusEmitter?.set("disconnected")
-    this.ctx = null
+    // disconnect() の throw は意図的に握らず再 throw する。Flume.runStop /
+    // Flume.rollback は allSettled で吸収して `flume.stop.failed` /
+    // `flume.rollback.failed` として onLog に流すので、ここで catch する
+    // と同じ事象が二重ログになる。基底クラスの責務は queue.drain と
+    // statusEmitter の最終化までで、エラー観測は Flume 側に委ねる。
+    try {
+      await this.disconnect()
+    } finally {
+      await this.queue.drain()
+      this.statusEmitter?.set("disconnected")
+      this.ctx = null
+    }
   }
 
   status(): FlumeStatus {

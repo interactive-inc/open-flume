@@ -26,4 +26,30 @@ describe("createFlumeDefaultDeps", () => {
     expect(val).toBeGreaterThanOrEqual(0)
     expect(val).toBeLessThan(1)
   })
+
+  it("re-resolves globalThis.WebSocket on every call so test patches are honoured", () => {
+    const original = globalThis.WebSocket
+    class FakeWebSocket {}
+
+    try {
+      // 1) パッチ前: 元の (もしくは null) を返す
+      const before = createFlumeDefaultDeps().WebSocket
+
+      // 2) パッチ後: 新しい参照が返ること — モジュール初期化時の cache だと
+      //    この期待は外れる (常に `before` と同じ参照になる)
+      // biome-ignore lint/suspicious/noExplicitAny: test boundary
+      globalThis.WebSocket = FakeWebSocket as any
+      const afterPatch = createFlumeDefaultDeps().WebSocket
+      expect(afterPatch).toBe(FakeWebSocket as unknown as typeof WebSocket)
+
+      // 3) 戻したら戻ること
+      // biome-ignore lint/suspicious/noExplicitAny: test boundary
+      globalThis.WebSocket = original as any
+      const afterRestore = createFlumeDefaultDeps().WebSocket
+      expect(afterRestore).toBe(before)
+    } finally {
+      // biome-ignore lint/suspicious/noExplicitAny: test boundary
+      globalThis.WebSocket = original as any
+    }
+  })
 })

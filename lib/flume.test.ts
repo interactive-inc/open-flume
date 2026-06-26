@@ -8,6 +8,7 @@ import { FlumeSource } from "@/flume-source"
 type MockOptions = {
   failOnConnect?: Error
   returnErrorOnConnect?: Error
+  failOnDisconnect?: Error
   name?: "discord" | "slack" | "github"
 }
 
@@ -18,6 +19,8 @@ class MockSource extends FlumeSource {
 
   stopCount = 0
 
+  capturedSignal: AbortSignal | undefined = undefined
+
   pushEvent: ((event: FlumeEvent) => void) | null = null
 
   constructor(private readonly mockOptions: MockOptions = {}) {
@@ -25,8 +28,9 @@ class MockSource extends FlumeSource {
     this.name = mockOptions.name ?? "discord"
   }
 
-  protected async connect(_ctx: FlumeSourceStartContext): Promise<Error | null> {
+  protected async connect(ctx: FlumeSourceStartContext): Promise<Error | null> {
     this.startCount += 1
+    this.capturedSignal = ctx.signal
     if (this.mockOptions.failOnConnect) throw this.mockOptions.failOnConnect
     if (this.mockOptions.returnErrorOnConnect) return this.mockOptions.returnErrorOnConnect
 
@@ -38,6 +42,7 @@ class MockSource extends FlumeSource {
   protected disconnect(): void {
     this.stopCount += 1
     this.pushEvent = null
+    if (this.mockOptions.failOnDisconnect) throw this.mockOptions.failOnDisconnect
   }
 }
 
@@ -202,6 +207,28 @@ describe("Flume", () => {
     expect(captured.some((c) => c.action === "flume.rollback.failed")).toBe(true)
   })
 
+  it("threads the host signal into source ctx so sources can listen for abort natively", async () => {
+    const source = new MockSource({ name: "discord" })
+    const controller = new AbortController()
+    const flume = new Flume([source], {
+      onEvent: vi.fn(),
+      signal: controller.signal,
+    })
+
+    const result = await flume.start()
+    expect(result).not.toBeInstanceOf(Error)
+    expect(source.capturedSignal).toBe(controller.signal)
+  })
+
+  it("passes undefined as ctx.signal when the host did not supply one", async () => {
+    const source = new MockSource({ name: "discord" })
+    const flume = new Flume([source], { onEvent: vi.fn() })
+
+    const result = await flume.start()
+    expect(result).not.toBeInstanceOf(Error)
+    expect(source.capturedSignal).toBeUndefined()
+  })
+
   it("refuses start if signal already aborted", async () => {
     const a = new MockSource({ name: "discord" })
     const controller = new AbortController()
@@ -274,6 +301,30 @@ describe("FlumeRunning", () => {
       { source: "discord", status: "connected" },
       { source: "slack", status: "connected" },
     ])
+  })
+
+  it("propagates source.disconnect throws to runStop so flume.stop.failed is logged with the failing source name", async () => {
+    const source = new MockSource({
+      name: "discord",
+      failOnDisconnect: new Error("ws close timeout"),
+    })
+    const logs: { action: string; message: string; error?: Error }[] = []
+
+    const flume = new Flume([source], {
+      onEvent: vi.fn(),
+      onLog: (entry) => logs.push({ action: entry.action, message: entry.message, error: entry.error }),
+    })
+
+    const running = await flume.start()
+    if (running instanceof Error) throw running
+
+    const stopped = await running.stop()
+    expect(stopped).toBeInstanceOf(FlumeStopped)
+
+    const failures = logs.filter((l) => l.action === "flume.stop.failed")
+    expect(failures).toHaveLength(1)
+    expect(failures[0]?.error?.message).toBe("ws close timeout")
+    expect(failures[0]?.message).toContain("discord")
   })
 })
 

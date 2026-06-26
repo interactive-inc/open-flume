@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.7.0
+
+### Breaking
+
+- **`FlumeSourceStartContext` gains a required `signal: AbortSignal | undefined` field.** Custom `FlumeSource` subclasses that construct a context literal in tests or wrappers must add `signal`. Built-in sources are unaffected.
+
+### Added
+
+- `FlumeSourceStartContext.signal` carries the host's `Flume({ signal })` down to `connect(ctx)`. Source implementations can now plumb the host signal into their own `fetch(url, { signal })` / `setTimeout` cancellation / WebSocket close paths so a host SIGTERM propagates natively, instead of relying solely on Flume's outer `runStop` to stop the source.
+
+### Fixed
+
+- `createFlumeDefaultDeps().WebSocket` is now resolved lazily on each call (was cached at module load). Tests that patch `globalThis.WebSocket` in `beforeEach`, jsdom / happy-dom environments where `WebSocket` is installed after the flume import, and any other late-initialised WebSocket constructor now reach Flume correctly. `fetch` / timers were already lazy; `WebSocket` lagged behind for no good reason.
+
 ## 0.3.0
 
 ### Breaking

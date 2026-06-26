@@ -1,6 +1,6 @@
 {
   "name": "@interactive-inc/flume",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Unified notification listener for Discord, Slack, and GitHub. Raw WebSocket + fetch + Zod. No SDK dependencies.",
   "keywords": [
     "discord",

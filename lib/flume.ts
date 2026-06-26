@@ -179,6 +179,7 @@ export class Flume {
       deps: this.deps,
       onStatus: (status, detail) => this.notifyStatus(name, status, detail),
       reconnect,
+      signal: this.options.signal,
     }
     return Promise.resolve().then(() => source.start(ctx))
   }
