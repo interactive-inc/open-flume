@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from "vitest"
+import { waitFor } from "@/test-utils/wait-for"
 import { FlumeSlackSource } from "@/slack/slack-source"
 import { flumeExtractSlackMeta } from "@/slack/extract-slack-meta"
 import { FlumeLogger } from "@/logger"
@@ -105,7 +106,6 @@ const createCtx = (props: CtxProps): FlumeSourceStartContext => ({
   deps: props.deps,
   onStatus: props.onStatus ?? (() => {}),
   reconnect: null,
-  signal: undefined,
 })
 
 describe("FlumeSlackSource", () => {
@@ -120,7 +120,7 @@ describe("FlumeSlackSource", () => {
       createCtx({ deps, onEvent: (event) => receivedEvents.push(event) }),
     )
 
-    await vi.waitFor(() => {
+    await waitFor(() => {
       expect(TrackingMockWebSocket.latest).not.toBeNull()
     })
 
@@ -136,7 +136,7 @@ describe("FlumeSlackSource", () => {
 
     TrackingMockWebSocket.latest!.simulateMessage(JSON.stringify(envelope))
 
-    await vi.waitFor(() => {
+    await waitFor(() => {
       expect(receivedEvents.length).toBe(1)
     })
 
@@ -153,7 +153,7 @@ describe("FlumeSlackSource", () => {
     const source = new FlumeSlackSource({ appToken: "xapp-test", botToken: "xoxb-test" })
     const startPromise = source.start(createCtx({ deps, onStatus: (s) => statuses.push(s) }))
 
-    await vi.waitFor(() => {
+    await waitFor(() => {
       expect(TrackingMockWebSocket.latest).not.toBeNull()
     })
 

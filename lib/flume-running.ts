@@ -1,7 +1,7 @@
 import type { FlumeSourceStatus } from "@/types"
 import type { FlumeSource } from "@/flume-source"
 import { FlumeLogger } from "@/logger"
-import { FlumeStopped } from "@/flume-stopped"
+import { FlumeStopped, type FlumeStopError } from "@/flume-stopped"
 import { attempt } from "@/utils/attempt"
 import { safeErrorMessage } from "@/utils/safe-error-message"
 import { safeInvokeCallback } from "@/utils/safe-invoke-callback"
@@ -65,7 +65,18 @@ export class FlumeRunning {
     return this.snapshotStatuses()
   }
 
+  /**
+   * Host が `Flume({ signal })` で渡した AbortSignal をそのまま公開する。
+   * 直接の controller を持っていない呼び出し元が `running.signal?.aborted`
+   * で abort 状態を確認できる
+   */
+  get signal(): AbortSignal | undefined {
+    return this.props.signal
+  }
+
   private async runStop(): Promise<FlumeStopped> {
+    const stopErrors: FlumeStopError[] = []
+
     try {
       this.props.log.info({
         action: "flume.stop",
@@ -81,6 +92,7 @@ export class FlumeRunning {
           const source = this.props.sources[index]
           const name = source ? this.sourceName(source) : "?"
           const error = safeNormalizeError({ value: result.reason })
+          stopErrors.push({ source: name, error })
           this.props.log.error({
             action: "flume.stop.failed",
             message: `${name}: ${safeErrorMessage({ error })}`,
@@ -104,7 +116,7 @@ export class FlumeRunning {
       }
       this.props.log.info({ action: "flume.stop.complete", message: "all sources stopped" })
 
-      return new FlumeStopped({ finalStatuses: this.snapshotStatuses() })
+      return new FlumeStopped({ finalStatuses: this.snapshotStatuses(), stopErrors })
     } catch (err) {
       const error = safeNormalizeError({ value: err })
       this.props.log.error({
@@ -112,7 +124,7 @@ export class FlumeRunning {
         message: safeErrorMessage({ error }),
         error,
       })
-      return new FlumeStopped({ finalStatuses: this.snapshotStatuses() })
+      return new FlumeStopped({ finalStatuses: this.snapshotStatuses(), stopErrors })
     }
   }
 

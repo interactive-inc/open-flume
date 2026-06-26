@@ -127,9 +127,9 @@ export type FlumeSourceStartContext = {
    * source 実装が自前で `fetch(url, { signal })` / `setTimeout` cancel / WS close を
    * host abort 経由で発火させたい時に使う (Flume 自身は最外殻で runStop を駆動するので
    * source は signal を無視しても動作的には停止する — 自然な伝播パスが欲しい場合のみ)。
-   * signal が指定されていなければ undefined。
+   * Flume.options.signal が未設定なら省略される。
    */
-  signal: AbortSignal | undefined
+  signal?: AbortSignal
 }
 
 // Source 構築 options — domain config のみ。

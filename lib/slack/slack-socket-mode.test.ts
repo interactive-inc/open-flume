@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from "vitest"
+import { waitFor } from "@/test-utils/wait-for"
 import { FlumeSlackSocketMode } from "@/slack/slack-socket-mode"
 import { FlumeConnectionError } from "@/errors/connection-error"
 import { FlumeHttpError } from "@/errors/http-error"
@@ -103,7 +104,7 @@ describe("FlumeSlackSocketMode", () => {
 
     const connectPromise = mode.connect()
 
-    await vi.waitFor(() => {
+    await waitFor(() => {
       expect(getSocket()).not.toBeNull()
     })
 
@@ -135,7 +136,7 @@ describe("FlumeSlackSocketMode", () => {
 
     const connectPromise = mode.connect()
 
-    await vi.waitFor(() => {
+    await waitFor(() => {
       expect(getSocket()).not.toBeNull()
     })
 
@@ -161,7 +162,7 @@ describe("FlumeSlackSocketMode", () => {
 
     const connectPromise = mode.connect()
 
-    await vi.waitFor(() => {
+    await waitFor(() => {
       expect(getSocket()).not.toBeNull()
     })
 
@@ -201,7 +202,7 @@ describe("FlumeSlackSocketMode", () => {
 
     const connectPromise = mode.connect()
 
-    await vi.waitFor(() => {
+    await waitFor(() => {
       expect(getSocket()).not.toBeNull()
     })
 
@@ -228,7 +229,7 @@ describe("FlumeSlackSocketMode", () => {
 
     const connectPromise = mode.connect()
 
-    await vi.waitFor(() => {
+    await waitFor(() => {
       expect(getSocket()).not.toBeNull()
     })
 
@@ -255,7 +256,7 @@ describe("FlumeSlackSocketMode", () => {
 
     const connectPromise = mode.connect()
 
-    await vi.waitFor(() => {
+    await waitFor(() => {
       expect(getSocket()).not.toBeNull()
     })
 
@@ -279,7 +280,7 @@ describe("FlumeSlackSocketMode", () => {
 
     const connectPromise = mode.connect()
 
-    await vi.waitFor(() => {
+    await waitFor(() => {
       expect(getSocket()).not.toBeNull()
     })
 

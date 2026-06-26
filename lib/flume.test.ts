@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from "vitest"
+import { waitFor } from "@/test-utils/wait-for"
 import type { FlumeEvent, FlumeSourceStartContext, FlumeStatusEvent } from "@/types"
 import { Flume } from "@/flume"
 import { FlumeRunning } from "@/flume-running"
@@ -89,7 +90,7 @@ describe("Flume", () => {
     a.pushEvent!({ source: "discord", type: "x", data: {}, meta: {}, receivedAt: 1 })
     b.pushEvent!({ source: "slack", type: "y", data: {}, meta: {}, receivedAt: 2 })
 
-    await vi.waitFor(() => expect(onEvent).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(onEvent).toHaveBeenCalledTimes(2))
   })
 
   it("rolls back started sources when one throws", async () => {
@@ -303,6 +304,30 @@ describe("FlumeRunning", () => {
     ])
   })
 
+  it("exposes the host signal via the running.signal getter", async () => {
+    const source = new MockSource({ name: "discord" })
+    const controller = new AbortController()
+
+    const flume = new Flume([source], { onEvent: vi.fn(), signal: controller.signal })
+    const running = await flume.start()
+    if (running instanceof Error) throw running
+
+    expect(running.signal).toBe(controller.signal)
+    expect(running.signal?.aborted).toBe(false)
+
+    controller.abort()
+    expect(running.signal?.aborted).toBe(true)
+  })
+
+  it("running.signal is undefined when the host did not supply one", async () => {
+    const source = new MockSource({ name: "discord" })
+    const flume = new Flume([source], { onEvent: vi.fn() })
+    const running = await flume.start()
+    if (running instanceof Error) throw running
+
+    expect(running.signal).toBeUndefined()
+  })
+
   it("propagates source.disconnect throws to runStop so flume.stop.failed is logged with the failing source name", async () => {
     const source = new MockSource({
       name: "discord",
@@ -325,6 +350,34 @@ describe("FlumeRunning", () => {
     expect(failures).toHaveLength(1)
     expect(failures[0]?.error?.message).toBe("ws close timeout")
     expect(failures[0]?.message).toContain("discord")
+  })
+
+  it("FlumeStopped.errors() lists per-source disconnect failures so hosts skip the onLog grep", async () => {
+    const ok = new MockSource({ name: "discord" })
+    const bad = new MockSource({ name: "slack", failOnDisconnect: new Error("boom") })
+
+    const flume = new Flume([ok, bad], { onEvent: vi.fn() })
+    const running = await flume.start()
+    if (running instanceof Error) throw running
+
+    const stopped = await running.stop()
+    const errors = stopped.errors()
+
+    expect(errors).toHaveLength(1)
+    expect(errors[0]?.source).toBe("slack")
+    expect(errors[0]?.error.message).toBe("boom")
+  })
+
+  it("FlumeStopped.errors() is empty when every source stops cleanly", async () => {
+    const a = new MockSource({ name: "discord" })
+    const b = new MockSource({ name: "slack" })
+
+    const flume = new Flume([a, b], { onEvent: vi.fn() })
+    const running = await flume.start()
+    if (running instanceof Error) throw running
+
+    const stopped = await running.stop()
+    expect(stopped.errors()).toEqual([])
   })
 })
 

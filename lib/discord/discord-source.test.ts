@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from "vitest"
+import { waitFor } from "@/test-utils/wait-for"
 import type { FlumeEvent, FlumeRuntimeDeps, FlumeSourceStartContext } from "@/types"
 import { FlumeDiscordSource } from "@/discord/discord-source"
 import { flumeExtractDiscordMeta } from "@/discord/extract-discord-meta"
@@ -83,7 +84,6 @@ const createCtx = (props: CtxProps): FlumeSourceStartContext => ({
   deps: props.deps,
   onStatus: props.onStatus ?? (() => {}),
   reconnect: null,
-  signal: undefined,
 })
 
 const simulateReadySequence = () => {
@@ -152,7 +152,7 @@ describe("FlumeDiscordSource", () => {
 
     MockWebSocket.latest!.simulateMessage(messageCreate)
 
-    await vi.waitFor(() => {
+    await waitFor(() => {
       expect(receivedEvents.filter((ev) => ev.type !== "READY").length).toBe(1)
     })
 

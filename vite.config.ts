@@ -17,5 +17,12 @@ export default defineConfig({
     format: "esm",
     dts: true,
     outExtensions: () => ({ js: ".js" }),
+    // Strip the build hash from shared chunks so bundle diffs do not churn
+    // on every rebuild. Content-addressed naming is the rolldown default;
+    // we trade that for diff stability since this package's chunks have
+    // unique names that do not collide.
+    outputOptions: {
+      chunkFileNames: "[name].js",
+    },
   },
 })

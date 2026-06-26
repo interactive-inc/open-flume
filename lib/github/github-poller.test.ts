@@ -271,4 +271,196 @@ describe("FlumeGitHubPoller", () => {
     const headers = init?.headers
     expect(headers).toEqual(expect.objectContaining({ Authorization: "Bearer ghp_secret123" }))
   })
+
+  it("429 with Retry-After pauses polling for that many seconds", async () => {
+    const mockSetTimeout = vi.fn((_fn: () => void, _ms: number) => timerHandle)
+    const test = createTestDeps({ setTimeout: mockSetTimeout })
+
+    test.mockFetch.mockResolvedValueOnce(makeJsonResponse([]))
+    test.mockFetch.mockResolvedValueOnce(
+      new Response("", { status: 429, headers: { "Retry-After": "5" } }),
+    )
+
+    const poller = new FlumeGitHubPoller({
+      token: "ghp_test",
+      interval: 60,
+      onNotifications: vi.fn(),
+      onConnected: vi.fn(),
+      onDisconnected: vi.fn(),
+      deps: test.deps,
+    })
+
+    await poller.start()
+
+    test.getIntervalCallback()!()
+    await flushPromises()
+
+    expect(test.mockClearInterval).toHaveBeenCalledWith(timerHandle)
+    expect(mockSetTimeout).toHaveBeenCalledWith(expect.any(Function), 5000)
+  })
+
+  it("403 with X-RateLimit-Remaining 0 computes delay from X-RateLimit-Reset", async () => {
+    const mockSetTimeout = vi.fn((_fn: () => void, _ms: number) => timerHandle)
+    const test = createTestDeps({ setTimeout: mockSetTimeout, now: () => 1_000_000 })
+
+    test.mockFetch.mockResolvedValueOnce(makeJsonResponse([]))
+    test.mockFetch.mockResolvedValueOnce(
+      new Response("", {
+        status: 403,
+        headers: { "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1100" },
+      }),
+    )
+
+    const poller = new FlumeGitHubPoller({
+      token: "ghp_test",
+      interval: 60,
+      onNotifications: vi.fn(),
+      onConnected: vi.fn(),
+      onDisconnected: vi.fn(),
+      deps: test.deps,
+    })
+
+    await poller.start()
+
+    test.getIntervalCallback()!()
+    await flushPromises()
+
+    // now=1_000_000ms → 1000s。reset=1100s → 100s 後
+    expect(mockSetTimeout).toHaveBeenCalledWith(expect.any(Function), 100_000)
+  })
+
+  it("rate limit without usable headers defaults to 60s", async () => {
+    const mockSetTimeout = vi.fn((_fn: () => void, _ms: number) => timerHandle)
+    const test = createTestDeps({ setTimeout: mockSetTimeout })
+
+    test.mockFetch.mockResolvedValueOnce(makeJsonResponse([]))
+    test.mockFetch.mockResolvedValueOnce(new Response("", { status: 429 }))
+
+    const poller = new FlumeGitHubPoller({
+      token: "ghp_test",
+      interval: 60,
+      onNotifications: vi.fn(),
+      onConnected: vi.fn(),
+      onDisconnected: vi.fn(),
+      deps: test.deps,
+    })
+
+    await poller.start()
+
+    test.getIntervalCallback()!()
+    await flushPromises()
+
+    expect(mockSetTimeout).toHaveBeenCalledWith(expect.any(Function), 60_000)
+  })
+
+  it("rate limit does not count as a failure (no onDisconnected)", async () => {
+    const test = createTestDeps()
+    const onDisconnected = vi.fn()
+
+    test.mockFetch.mockResolvedValueOnce(makeJsonResponse([]))
+    test.mockFetch.mockResolvedValue(new Response("", { status: 429 }))
+
+    const poller = new FlumeGitHubPoller({
+      token: "ghp_test",
+      interval: 60,
+      onNotifications: vi.fn(),
+      onConnected: vi.fn(),
+      onDisconnected,
+      deps: test.deps,
+    })
+
+    await poller.start()
+
+    const cb = test.getIntervalCallback()
+    cb!()
+    await flushPromises()
+    cb!()
+    await flushPromises()
+    cb!()
+    await flushPromises()
+
+    expect(onDisconnected).not.toHaveBeenCalled()
+  })
+
+  it("resumes polling when the rate-limit timer fires", async () => {
+    let rateTimerCallback: (() => void) | null = null
+    const mockSetTimeout = vi.fn((fn: () => void, _ms: number) => {
+      rateTimerCallback = fn
+      return timerHandle
+    })
+    const test = createTestDeps({ setTimeout: mockSetTimeout })
+
+    test.mockFetch.mockResolvedValueOnce(makeJsonResponse([]))
+    test.mockFetch.mockResolvedValueOnce(new Response("", { status: 429 }))
+
+    const poller = new FlumeGitHubPoller({
+      token: "ghp_test",
+      interval: 60,
+      onNotifications: vi.fn(),
+      onConnected: vi.fn(),
+      onDisconnected: vi.fn(),
+      deps: test.deps,
+    })
+
+    await poller.start()
+    expect(test.mockSetInterval).toHaveBeenCalledTimes(1)
+
+    test.getIntervalCallback()!()
+    await flushPromises()
+
+    rateTimerCallback!()
+    expect(test.mockSetInterval).toHaveBeenCalledTimes(2)
+  })
+
+  it("rate limit on the initial poll does not start the interval immediately", async () => {
+    const mockSetTimeout = vi.fn((_fn: () => void, _ms: number) => timerHandle)
+    const test = createTestDeps({ setTimeout: mockSetTimeout })
+
+    test.mockFetch.mockResolvedValueOnce(new Response("", { status: 429 }))
+
+    const poller = new FlumeGitHubPoller({
+      token: "ghp_test",
+      interval: 60,
+      onNotifications: vi.fn(),
+      onConnected: vi.fn(),
+      onDisconnected: vi.fn(),
+      deps: test.deps,
+    })
+
+    await poller.start()
+
+    // 一時停止タイマーだけが張られ、interval は張られない
+    expect(mockSetTimeout).toHaveBeenCalledWith(expect.any(Function), 60_000)
+    expect(test.mockSetInterval).not.toHaveBeenCalled()
+  })
+
+  it("does not resume polling if stopped before the rate-limit timer fires", async () => {
+    let rateTimerCallback: (() => void) | null = null
+    const mockSetTimeout = vi.fn((fn: () => void, _ms: number) => {
+      rateTimerCallback = fn
+      return timerHandle
+    })
+    const test = createTestDeps({ setTimeout: mockSetTimeout })
+
+    test.mockFetch.mockResolvedValueOnce(makeJsonResponse([]))
+    test.mockFetch.mockResolvedValueOnce(new Response("", { status: 429 }))
+
+    const poller = new FlumeGitHubPoller({
+      token: "ghp_test",
+      interval: 60,
+      onNotifications: vi.fn(),
+      onConnected: vi.fn(),
+      onDisconnected: vi.fn(),
+      deps: test.deps,
+    })
+
+    await poller.start()
+    test.getIntervalCallback()!()
+    await flushPromises()
+
+    poller.stop()
+    rateTimerCallback!()
+
+    expect(test.mockSetInterval).toHaveBeenCalledTimes(1)
+  })
 })

@@ -18,8 +18,13 @@ export class FlumeGitHubSeenCache {
   trim(): void {
     if (this.seen.size <= this.props.maxSize) return
 
-    const entries = [...this.seen.entries()]
-    this.seen = new Map(entries.slice(entries.length - this.props.maxSize))
+    let removeCount = this.seen.size - this.props.maxSize
+
+    for (const id of this.seen.keys()) {
+      if (removeCount <= 0) break
+      this.seen.delete(id)
+      removeCount--
+    }
   }
 
   get size(): number {

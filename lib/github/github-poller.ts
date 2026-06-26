@@ -99,6 +99,10 @@ export class FlumeGitHubPoller {
     if (error) return error
     if (this.isStoppedFlag) return null
 
+    // 初回 poll が rate-limit された場合は handleRateLimit が再開タイマーを握っている。
+    // ここで interval を張ると一時停止を打ち消すのでスキップする
+    if (this.rateLimitTimer !== null) return null
+
     this.scheduleInterval()
     return null
   }
@@ -118,16 +122,15 @@ export class FlumeGitHubPoller {
 
     const intervalResult = attempt(() =>
       this.props.deps.setInterval(() => {
-        this.poll()
-          .catch((err) => {
-            const error = safeNormalizeError({ value: err })
-            this.log.error({
-              action: "poll.unhandled",
-              message: safeErrorMessage({ error }),
-              error,
-            })
+        // poll() は内部で try/catch 済みで reject しない。将来 throw する変更への保険として log + 握り潰す
+        this.poll().catch((err) => {
+          const error = safeNormalizeError({ value: err })
+          this.log.error({
+            action: "poll.unhandled",
+            message: safeErrorMessage({ error }),
+            error,
           })
-          .catch(() => {})
+        })
       }, this.effectiveIntervalSec * 1000),
     )
     if (intervalResult instanceof Error) {

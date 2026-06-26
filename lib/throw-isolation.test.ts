@@ -68,7 +68,6 @@ const createCtx = (props: CtxProps): FlumeSourceStartContext => ({
   deps: props.deps,
   onStatus: props.onStatus ?? (() => {}),
   reconnect: null,
-  signal: undefined,
 })
 
 describe("throw isolation: public surface never throws", () => {

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.8.0
+
+### Breaking
+
+- **`FlumeSourceStartContext.signal` is now an optional field (`signal?: AbortSignal`)** instead of required `signal: AbortSignal | undefined`. Tests / wrappers that previously had to pass `signal: undefined` explicitly can drop the field. Source implementations already used `ctx.signal` defensively, so runtime behavior is unchanged.
+
+### Added
+
+- `FlumeStopped.errors(): ReadonlyArray<{source, error}>` lists per-source disconnect failures so hosts can branch on stop outcome without grepping `onLog` for `flume.stop.failed`. Empty when every source stopped cleanly.
+- `FlumeRunning.signal` getter exposes the host-supplied `AbortSignal` so callers without the original controller can check `running.signal?.aborted`.
+
+### Fixed
+
+- Tests no longer depend on `vi.waitFor` (not supported by `bun:test`). Replaced with an in-repo `waitFor` helper at `lib/test-utils/wait-for.ts`. The 11 previously-failing `vi.waitFor` tests now run.
+- `dist/` chunk filenames lost the build hash (`flume-source-DDbm_Eik.js` → `flume-source.js`). Stable filenames mean bundle diffs across rebuilds only churn on real content changes.
+
 ## 0.7.0
 
 ### Breaking

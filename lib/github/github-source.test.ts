@@ -61,7 +61,6 @@ const createCtx = (props: CtxProps): FlumeSourceStartContext => ({
   deps: props.deps,
   onStatus: props.onStatus ?? (() => {}),
   reconnect: null,
-  signal: undefined,
 })
 
 function flushPromises() {
