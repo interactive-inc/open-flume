@@ -71,6 +71,26 @@ describe("FlumeConfluence", () => {
     expect(confluence.ids()).toEqual(["dup"])
   })
 
+  it("keeps a single group when the same id is added concurrently", async () => {
+    const confluence = new FlumeConfluence()
+    const a = new MockSource()
+    const b = new MockSource({ name: "slack" })
+
+    const [first, second] = await Promise.all([
+      confluence.add("dup", [a]),
+      confluence.add("dup", [b]),
+    ])
+
+    // 片方は成功 (null)、もう片方は重複エラー。どちらが勝つかは順序依存
+    const outcomes = [first, second]
+    expect(outcomes.filter((r) => r === null)).toHaveLength(1)
+    expect(outcomes.filter((r) => r instanceof Error)).toHaveLength(1)
+    expect(confluence.ids()).toEqual(["dup"])
+
+    // 負けた側の source は開かれても確実に close される (リークしない)
+    expect(a.stopCount + b.stopCount).toBe(1)
+  })
+
   it("returns the start error and does not store a failed group", async () => {
     const confluence = new FlumeConfluence()
     const failing = new MockSource({ failConnect: new Error("nope") })

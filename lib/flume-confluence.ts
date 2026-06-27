@@ -48,6 +48,14 @@ export class FlumeConfluence {
     const running = await flume.open()
     if (running instanceof Error) return running
 
+    // open() を await している間に同じ id が別の add() で確定する可能性がある (TOCTOU)。
+    // 後勝ちで Map を上書きすると前の FlumeRunning が宙に浮いて close されないので、
+    // 開き直した方をその場で閉じて id 重複として弾く
+    if (this.running.has(id)) {
+      await running.close()
+      return new FlumeStartError(`FlumeConfluence: id already added: ${id}`)
+    }
+
     this.running.set(id, running)
     return null
   }
