@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.2
+
+### Fixed
+
+- **`FlumeSlackSocketMode` now force-closes the socket after 90s (default, configurable via `idleTimeoutMs`) of frame silence.** Slack Socket Mode previously relied entirely on kernel TCP keepalive (defaults to 2h on macOS/Linux) to detect a silent NAT / corporate proxy / load-balancer idle drop. The result was that a host could go up to 2 hours without realising Slack notifications had stopped flowing. The watchdog ticks every 15s, compares `now() - lastFrameAt` against the limit, and triggers the existing close path so the source's reconnect picks it up. Discord already had this via heartbeat ack; Slack now matches.
+- `FlumeSlackSocketMode.props.deps` requires `setInterval` and `clearInterval` (the watchdog uses them). Hosts that constructed a raw `Deps` literal need to add those two fields; hosts using `createFlumeDefaultDeps()` need no change.
+
 ## 0.9.1
 
 ### Fixed

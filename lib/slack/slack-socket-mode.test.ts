@@ -79,6 +79,8 @@ const createDeps = (overrides?: {
     WebSocket: WS as unknown as new (url: string | URL) => WebSocket,
     fetch: overrides?.fetch ?? createMockFetch(),
     now: () => 1000,
+    setInterval: globalThis.setInterval as unknown as (fn: () => void, ms: number) => unknown,
+    clearInterval: globalThis.clearInterval as unknown as (id: unknown) => void,
   }
 
   const getSocket = () => instances[instances.length - 1] ?? null
@@ -312,5 +314,62 @@ describe("FlumeSlackSocketMode", () => {
     const result = await mode.connect()
 
     expect(result).toBeInstanceOf(FlumeHttpError)
+  })
+
+  it("force-closes the socket after the idle timeout elapses with no frames", async () => {
+    // Drive time via a fake clock + fake setInterval so we can step past the
+    // idle limit without real wall time. The watchdog should close the socket
+    // and onDisconnected should fire so the source's reconnect picks it up.
+    let nowMs = 1_000_000
+
+    const intervalCallbacks: Array<() => void> = []
+
+    const fakeSetInterval = (fn: () => void) => {
+      intervalCallbacks.push(fn)
+      return intervalCallbacks.length
+    }
+
+    const fakeClearInterval = () => {
+      // Real test stops the mode which will call clearInterval; we leave the
+      // callback array intact since the watchdog stops looking at it via
+      // hasConnected/isStoppedFlag.
+    }
+
+    const fakeNow = () => nowMs
+
+    const { deps, getSocket } = createDeps()
+    deps.now = fakeNow
+    deps.setInterval = fakeSetInterval as unknown as typeof deps.setInterval
+    deps.clearInterval = fakeClearInterval as unknown as typeof deps.clearInterval
+
+    const onDisconnected = vi.fn()
+    const mode = new FlumeSlackSocketMode({
+      appToken: "xapp-test",
+      onMessage: vi.fn(),
+      onConnected: vi.fn(),
+      onDisconnected,
+      deps,
+      idleTimeoutMs: 1_000,
+    })
+
+    const ready = mode.connect()
+    // Yield to the URL-fetch microtask so the WebSocket is constructed before
+    // we look for it.
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const socket = getSocket()
+    expect(socket).not.toBeNull()
+    socket!.simulateMessage(JSON.stringify({ type: "hello" }))
+
+    await ready
+    expect(mode.isConnected()).toBe(true)
+    expect(intervalCallbacks.length).toBeGreaterThan(0)
+
+    // Advance the clock past idleTimeoutMs without delivering any frames,
+    // then fire the watchdog tick. The mock WebSocket's close() invokes the
+    // close handler synchronously, which fires onDisconnected.
+    nowMs += 5_000
+    intervalCallbacks[0]!()
+
+    expect(onDisconnected).toHaveBeenCalledTimes(1)
   })
 })

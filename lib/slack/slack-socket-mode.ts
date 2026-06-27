@@ -11,7 +11,10 @@ import { safeErrorMessage } from "@/utils/safe-error-message"
 import { safeJsonParse } from "@/utils/safe-json-parse"
 import { safeStringify } from "@/utils/safe-stringify"
 
-type Deps = Pick<FlumeRuntimeDeps, "WebSocket" | "fetch" | "now">
+type Deps = Pick<
+  FlumeRuntimeDeps,
+  "WebSocket" | "fetch" | "now" | "setInterval" | "clearInterval"
+>
 
 type Props = {
   appToken: string
@@ -20,7 +23,19 @@ type Props = {
   onDisconnected: () => void
   onLog?: FlumeLogHandler
   deps: Deps
+  /**
+   * Force-close the socket after this many ms of frame silence. Defaults to
+   * 90s — long enough that Slack's ~30s server-side ping cadence keeps the
+   * pipe warm under normal load, short enough that a silent NAT / proxy /
+   * load-balancer idle drop (kernel TCP keepalive can take hours) is caught
+   * before the operator notices missing notifications. Closing the socket
+   * triggers the source's reconnect path.
+   */
+  idleTimeoutMs?: number
 }
+
+const DEFAULT_IDLE_TIMEOUT_MS = 90_000
+const IDLE_CHECK_INTERVAL_MS = 15_000
 
 type ConnectOptions = {
   signal?: AbortSignal
@@ -45,6 +60,10 @@ export class FlumeSlackSocketMode {
   private pendingResolve: ((value: FlumeConnectionError | null) => void) | null = null
 
   private pendingResolved = false
+
+  private lastFrameAt = 0
+
+  private idleWatchdog: unknown = null
 
   constructor(private readonly props: Props) {
     this.log = new FlumeLogger({
@@ -92,8 +111,63 @@ export class FlumeSlackSocketMode {
     this.log.info({ action: "disconnect", message: "stopping socket mode" })
     this.isStoppedFlag = true
 
+    this.disarmIdleWatchdog()
     this.closeSocket(this.ws)
     this.ws = null
+  }
+
+  private armIdleWatchdog(): void {
+    this.disarmIdleWatchdog()
+    const idleLimit = this.props.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS
+
+    const handle = attempt(() =>
+      this.props.deps.setInterval(() => this.checkIdle(idleLimit), IDLE_CHECK_INTERVAL_MS),
+    )
+
+    if (handle instanceof Error) {
+      this.log.error({
+        action: "idle.watchdog.schedule.error",
+        message: safeErrorMessage({ error: handle }),
+        error: handle,
+      })
+      return
+    }
+
+    this.idleWatchdog = handle
+  }
+
+  private disarmIdleWatchdog(): void {
+    if (!this.idleWatchdog) return
+
+    const handle = this.idleWatchdog
+    this.idleWatchdog = null
+
+    const result = attempt(() => this.props.deps.clearInterval(handle))
+    if (result instanceof Error) {
+      this.log.error({
+        action: "idle.watchdog.clear.error",
+        message: safeErrorMessage({ error: result }),
+        error: result,
+      })
+    }
+  }
+
+  private checkIdle(idleLimit: number): void {
+    if (!this.hasConnected || this.isStoppedFlag) return
+
+    const elapsed = this.props.deps.now() - this.lastFrameAt
+    if (elapsed < idleLimit) return
+
+    this.log.warn({
+      action: "idle.timeout",
+      message: `no frames for ${elapsed}ms (limit ${idleLimit}ms) — force-closing socket`,
+      detail: { elapsedMs: elapsed, limitMs: idleLimit },
+    })
+
+    // The watchdog only runs while connected, so we must disarm before
+    // triggering close so we do not race a second close from the close handler.
+    this.disarmIdleWatchdog()
+    this.closeSocket(this.ws)
   }
 
   isConnected(): boolean {
@@ -220,9 +294,14 @@ export class FlumeSlackSocketMode {
       detail: { length: raw.length },
     })
 
+    // Touch the idle watermark on every received frame — pings, envelopes,
+    // and Slack-side directives all count as proof the pipe is healthy.
+    this.lastFrameAt = this.props.deps.now()
+
     if (json.type === "hello") {
       this.log.info({ action: "socket.hello", message: "connection ready" })
       this.hasConnected = true
+      this.armIdleWatchdog()
       this.props.onConnected()
       this.completeConnect(null)
       return
@@ -273,6 +352,7 @@ export class FlumeSlackSocketMode {
       message: `code=${ev.code} reason=${ev.reason || "none"}`,
       detail: { code: ev.code, reason: ev.reason },
     })
+    this.disarmIdleWatchdog()
     this.ws = null
 
     if (this.hasConnected) {
