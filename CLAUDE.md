@@ -40,7 +40,7 @@ vp lint
 
 throw しない。`T | Error` を返し `instanceof` で判別する。カスタムエラーは `lib/errors/` に集約: `FlumeStartError`, `FlumeConnectionError`, `FlumeHttpError`, `FlumeParseError`
 
-公開境界 (constructor / start / stop / onEvent 呼び出し / signal abort / log handler) からは例外を一切漏らさない。汎用 HOF `attempt(fn)` で try/catch をラップし `T | Error` に正規化する。同期/非同期はオーバーロードで自動判定。`safeInvokeCallback({ fn, onError })` はユーザーコールバック (`onEvent` / `onStatus` / `onLog`) を例外隔離して呼ぶ薄いラッパー (`attempt` + `onError` 通知)。
+公開境界 (constructor / start / stop / onEvent 呼び出し / stream() / signal abort / log handler) からは例外を一切漏らさない。汎用 HOF `attempt(fn)` で try/catch をラップし `T | Error` に正規化する。同期/非同期はオーバーロードで自動判定。`safeInvokeCallback({ fn, onError })` はユーザーコールバック (`onEvent` / `onError`) を例外隔離して呼ぶ薄いラッパー (`attempt` + `onError` 通知)。firehose の `onEvent` 転送は再帰回避のため Flume 内で直接握り潰す。
 
 - 時刻: `safeNow({ deps })` (NaN / Infinity / throw を吸収して `Date.now()` フォールバック)
 - 乱数: `safeRandom({ deps })` (範囲外 / throw を吸収して `Math.random()` フォールバック)
@@ -52,8 +52,8 @@ throw しない。`T | Error` を返し `instanceof` で判別する。カスタ
 
 ### 観測性
 
-- `FlumeLogger` が全クラスに注入され `onLog` コールバックで全操作を通知
-- `FlumeLogger.error()` は `level: "error"` + `error` フィールドでハンドラに流れる。ユーザーが `onLog` 内で Sentry / Datadog / console など任意の送信先に振り分ける
+- `FlumeLogger` が全クラスに注入され、全操作が firehose に `{ kind: "log", log }` として流れる
+- `FlumeLogger.error()` は `level: "error"` + `error` フィールドで流れる。`onError` で error だけ受けるか、firehose を `item.log.level` で filter して Sentry / Datadog / console へ振り分ける
 - 外部サービスへの依存なし。`FlumeRuntimeDeps` は IO 境界（fetch / WebSocket / timer / clock / random）のみ
 
 ### 型定義
@@ -64,34 +64,34 @@ throw しない。`T | Error` を返し `instanceof` で判別する。カスタ
 
 `Flume` は複数の Source を1つのストリームに統合するマージャー。ライフサイクルを型レベルで分離した FSM (`.claude/skills/software-design/references/fsm.md` のクラス分割パターン):
 
-- `Flume` (idle) → `start()` → `FlumeRunning | FlumeStartError`
-- `FlumeRunning` → `stop()` → `FlumeStopped`
-- `FlumeStopped` は観測のみ (statuses)
+- `Flume` (idle) → `open()` → `FlumeRunning | FlumeStartError`
+- `FlumeRunning` → `close()` → `FlumeClosed`
+- `FlumeClosed` は観測のみ (statuses)
 
-これにより「stop 済みインスタンスへの再 start」「running 中の再 start」が型エラーになる。signal abort で `FlumeRunning` は自動的に `FlumeStopped` へ遷移する。
+これにより「close 済みインスタンスへの再 open」「running 中の再 open」が型エラーになる。signal abort で `FlumeRunning` は自動的に `FlumeClosed` へ遷移する。
 
-コンストラクタは `new Flume(sources, options?)` の 2 引数。`sources` だけ必須で `options` は全フィールド optional。cross-cutting (`onEvent` / `onLog` / `onStatus` / `signal` / `deps` / `reconnect`) は全て `options` で受け取り、各 Source へ `FlumeSourceStartContext` として注入する。`onEvent` 省略時は events が黙って捨てられる (接続観測専用モード)。Source コンストラクタは protocol 固有の config のみ。
+コンストラクタは `new Flume({ sources, ...options })` の単一オブジェクト。`sources` だけ必須で他は全て optional。cross-cutting (`onEvent` / `onError` / `signal` / `deps` / `reconnect`) も同じオブジェクトで受け取り、各 Source へ `FlumeSourceStartContext` として注入する。観測は 1 本の firehose に統合: `onEvent(item)` (push) と `FlumeRunning.stream()` (pull) が同じ `FlumeStreamItem` (`{ kind: "event" } | { kind: "log" }` の union) を流し、events も全ログ (status 遷移・error・debug) も含む。使う側が `item.kind` / `item.log.level` で filter する。`onError` は error レベル log だけの便利フィルタ (Sentry 等)。公開 status callback は持たない (接続断は status log として firehose に出る)。Source コンストラクタは protocol 固有の config のみ。
 
 ```ts
 import { Flume } from "@interactive-inc/flume"
 import { FlumeDiscordSource } from "@interactive-inc/flume/discord"
 import { FlumeSlackSource } from "@interactive-inc/flume/slack"
 
-const flume = new Flume(
-  [new FlumeDiscordSource({ token }), new FlumeSlackSource({ appToken, botToken })],
-  {
-    onEvent: (event) => console.log(event),
-    onLog,
-    onStatus: (e) => console.log(`${e.source} → ${e.status}`),
-    signal: controller.signal,
-    reconnect: { maxAttempts: 10 },
+const flume = new Flume({
+  sources: [new FlumeDiscordSource({ token }), new FlumeSlackSource({ appToken, botToken })],
+  onEvent: (item) => {
+    if (item.kind === "event") console.log(item.event)
+    if (item.kind === "log" && item.log.action === "status") console.log(item.log.message)
   },
-)
+  onError: (log) => Sentry.captureException(log.error ?? new Error(log.message)),
+  signal: controller.signal,
+  reconnect: { maxAttempts: 10 },
+})
 
-const running = await flume.start()
+const running = await flume.open()
 if (running instanceof Error) throw running
 
-await running.stop()
+await running.close()
 ```
 
 ### FlumeSource (抽象基底)
@@ -116,19 +116,21 @@ export class MySource extends FlumeSource {
 }
 ```
 
-`this.emit({...})` は base の serial queue 経由で `ctx.onEvent` に流す (`attempt` で例外隔離済み)。`this.setStatus(...)` は冪等遷移を握り潰しつつ log + `ctx.onStatus` に流す。subclass は try/catch を書く必要がない。
+`this.emit({...})` は base の serial queue 経由で `ctx.onEvent` に流す (`attempt` で例外隔離済み)。`this.setStatus(...)` は冪等遷移を握り潰しつつ status を log に出す (`ctx.onStatus` は内部ブリッジで optional)。subclass は try/catch を書く必要がない。
 
-主エントリ (`@interactive-inc/flume`) は `Flume` / `FlumeRunning` / `FlumeStopped` / `FlumeSource` / 型 / 共通ユーティリティのみ。Source 実装は `./discord` `./slack` `./github` の subpath エントリ (`lib/discord.ts` / `lib/slack.ts` / `lib/github.ts`) を介してのみロードされる。
+主エントリ (`@interactive-inc/flume`) は `Flume` / `FlumeRunning` / `FlumeClosed` / `FlumeSource` / 型 / 共通ユーティリティのみ。Source 実装は `./discord` `./slack` `./github` `./time` の subpath エントリ (`lib/discord.ts` / `lib/slack.ts` / `lib/github.ts` / `lib/time.ts`) を介してのみロードされる。
 
 ### モジュール構成
 
 - `lib/index.ts` - 公開エントリ (Flume / FlumeSource / 型 / 共通)
-- `lib/discord.ts` / `lib/slack.ts` / `lib/github.ts` - Source 別 subpath エントリ
-- `lib/flume.ts` / `lib/flume-running.ts` / `lib/flume-stopped.ts` - FSM 3 クラス
+- `lib/discord.ts` / `lib/slack.ts` / `lib/github.ts` / `lib/time.ts` - Source 別 subpath エントリ
+- `lib/flume.ts` / `lib/flume-running.ts` / `lib/flume-closed.ts` - FSM 3 クラス
+- `lib/flume-confluence.ts` - 複数 Flume を動的に増減する上位レイヤー (add/remove で firehose を1本に合流)
+- `lib/flume-stream-hub.ts` / `lib/flume-stream.ts` - firehose の push→pull fan-out (`FlumeStreamItem` の async iterator)
 - `lib/flume-source.ts` - 全 Source の抽象基底クラス
 - `lib/types.ts` - 全公開型 (`FlumeSourceStartContext` 含む)
 - `lib/deps.ts` - `createFlumeDefaultDeps()` ファクトリ
-- `lib/logger.ts` - 構造化ログ (`onLog` コールバックドリブン、`child(source)` で source 別 logger を派生)
+- `lib/logger.ts` - 構造化ログ (handler 経由で firehose に流す、`child(source)` で source 別 logger を派生)
 - `lib/reconnector.ts` / `lib/reconnect-config.ts` / `lib/schedule-reconnect.ts` - 指数バックオフ再接続と Source 共通スケジューラ
 - `lib/source-helpers/flume-status-emitter.ts` - Source 内部の status 集約 + 冪等通知
 - `lib/errors/` - カスタムエラークラス
@@ -136,3 +138,4 @@ export class MySource extends FlumeSource {
 - `lib/discord/` - Discord Gateway プロトコル一式と高レベル Source
 - `lib/slack/` - Slack Socket Mode プロトコル一式と高レベル Source
 - `lib/github/` - GitHub 通知ポーリングと高レベル Source
+- `lib/time/` - cron スケジューラ (自前 cron パーサ + next 計算) と高レベル Source

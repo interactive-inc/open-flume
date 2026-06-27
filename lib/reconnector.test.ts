@@ -135,4 +135,45 @@ describe("FlumeReconnector", () => {
     expect(clearTimeoutMock).not.toHaveBeenCalled()
     expect(fn).toHaveBeenCalled()
   })
+
+  it("does not advance attempt when setTimeout throws", () => {
+    const throwingSetTimeout = vi.fn(() => {
+      throw new Error("timer rejected")
+    })
+    const reconnector = new FlumeReconnector({
+      maxAttempts: 5,
+      baseDelay: 1000,
+      maxDelay: 30_000,
+      log: createLog(),
+      deps: { setTimeout: throwingSetTimeout, clearTimeout: vi.fn(), random: () => 0.5 },
+    })
+
+    const result = reconnector.schedule(vi.fn())
+
+    expect(result).toBe(0)
+    expect(reconnector.attempt).toBe(0)
+  })
+
+  it("keeps the same backoff delay after a failed schedule retries", () => {
+    let shouldThrow = true
+    const setTimeoutMock = vi.fn((_fn: () => void, _ms: number) => {
+      if (shouldThrow) throw new Error("timer rejected")
+      return 7
+    })
+    const reconnector = new FlumeReconnector({
+      maxAttempts: 5,
+      baseDelay: 1000,
+      maxDelay: 30_000,
+      log: createLog(),
+      deps: { setTimeout: setTimeoutMock, clearTimeout: vi.fn(), random: () => 0.5 },
+    })
+
+    reconnector.schedule(vi.fn())
+    shouldThrow = false
+    const delay = reconnector.schedule(vi.fn())
+
+    // 失敗で attempt が進んでいないので、再試行も attempt 0 の delay (baseDelay 基準) になる
+    expect(delay).toBe(1000 * (0.5 + 0.5 * 0.5))
+    expect(reconnector.attempt).toBe(1)
+  })
 })

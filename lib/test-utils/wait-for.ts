@@ -31,7 +31,5 @@ export const waitFor = async (
     await new Promise((resolve) => setTimeout(resolve, interval))
   }
 
-  throw lastError instanceof Error
-    ? lastError
-    : new Error(`waitFor: timed out after ${timeout}ms`)
+  throw lastError instanceof Error ? lastError : new Error(`waitFor: timed out after ${timeout}ms`)
 }

@@ -154,8 +154,8 @@ describe("throw isolation: public surface never throws", () => {
   }
 
   it("Flume.start does not throw when a source.connect throws synchronously", async () => {
-    const flume = new Flume([new SyncThrowOnConnect()], { onEvent: vi.fn() })
-    const result = await flume.start()
+    const flume = new Flume({ sources: [new SyncThrowOnConnect()], onEvent: vi.fn() })
+    const result = await flume.open()
 
     expect(result).toBeInstanceOf(Error)
     if (result instanceof Error) {
@@ -175,12 +175,12 @@ describe("throw isolation: public surface never throws", () => {
   }
 
   it("FlumeRunning.stop does not throw when a source.disconnect throws synchronously", async () => {
-    const flume = new Flume([new ThrowOnDisconnect()], { onEvent: vi.fn() })
-    const running = await flume.start()
+    const flume = new Flume({ sources: [new ThrowOnDisconnect()], onEvent: vi.fn() })
+    const running = await flume.open()
     if (!(running instanceof FlumeRunning)) throw new Error("expected FlumeRunning")
 
-    const stopped = await running.stop()
-    expect(stopped.statuses()[0]?.source).toBe("discord")
+    const closed = await running.close()
+    expect(closed.statuses()[0]?.source).toBe("discord")
   })
 
   class CursedNameSource extends FlumeSource {
@@ -195,13 +195,13 @@ describe("throw isolation: public surface never throws", () => {
   }
 
   it("Flume.start does not throw when third-party source.name getter throws", async () => {
-    const flume = new Flume([new CursedNameSource()], { onEvent: vi.fn() })
-    const running = await flume.start()
+    const flume = new Flume({ sources: [new CursedNameSource()], onEvent: vi.fn() })
+    const running = await flume.open()
 
     expect(running).toBeInstanceOf(FlumeRunning)
     if (running instanceof FlumeRunning) {
-      const stopped = await running.stop()
-      expect(stopped).toBeDefined()
+      const closed = await running.close()
+      expect(closed).toBeDefined()
     }
   })
 
@@ -229,8 +229,8 @@ describe("throw isolation: public surface never throws", () => {
     } as unknown as AbortSignal
 
     const source = new FlumeDiscordSource({ token: "t" })
-    const flume = new Flume([source], { onEvent: vi.fn(), signal: poisoned })
-    const result = await flume.start()
+    const flume = new Flume({ sources: [source], onEvent: vi.fn(), signal: poisoned })
+    const result = await flume.open()
     expect(result).toBeInstanceOf(Error)
   })
 

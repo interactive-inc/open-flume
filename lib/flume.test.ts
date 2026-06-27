@@ -1,9 +1,9 @@
 import { describe, it, expect, vi } from "vitest"
 import { waitFor } from "@/test-utils/wait-for"
-import type { FlumeEvent, FlumeSourceStartContext, FlumeStatusEvent } from "@/types"
+import type { FlumeEvent, FlumeLog, FlumeSourceStartContext, FlumeStreamItem } from "@/types"
 import { Flume } from "@/flume"
 import { FlumeRunning } from "@/flume-running"
-import { FlumeStopped } from "@/flume-stopped"
+import { FlumeClosed } from "@/flume-closed"
 import { FlumeSource } from "@/flume-source"
 
 type MockOptions = {
@@ -50,9 +50,9 @@ class MockSource extends FlumeSource {
 describe("Flume", () => {
   it("constructs with only sources (no options)", async () => {
     const a = new MockSource({ name: "discord" })
-    const flume = new Flume([a])
+    const flume = new Flume({ sources: [a] })
 
-    const result = await flume.start()
+    const result = await flume.open()
 
     expect(result).toBeInstanceOf(FlumeRunning)
     expect(a.startCount).toBe(1)
@@ -60,8 +60,8 @@ describe("Flume", () => {
 
   it("drops events silently when onEvent is omitted", async () => {
     const a = new MockSource({ name: "discord" })
-    const flume = new Flume([a])
-    await flume.start()
+    const flume = new Flume({ sources: [a] })
+    await flume.open()
 
     a.pushEvent!({ source: "discord", type: "x", data: {}, meta: {}, receivedAt: 1 })
 
@@ -71,9 +71,9 @@ describe("Flume", () => {
   it("start returns FlumeRunning and starts every source", async () => {
     const a = new MockSource({ name: "discord" })
     const b = new MockSource({ name: "slack" })
-    const flume = new Flume([a, b], { onEvent: vi.fn() })
+    const flume = new Flume({ sources: [a, b], onEvent: vi.fn() })
 
-    const result = await flume.start()
+    const result = await flume.open()
 
     expect(result).toBeInstanceOf(FlumeRunning)
     expect(a.startCount).toBe(1)
@@ -83,22 +83,27 @@ describe("Flume", () => {
   it("merges events from every source into one stream", async () => {
     const a = new MockSource({ name: "discord" })
     const b = new MockSource({ name: "slack" })
-    const onEvent = vi.fn()
-    const flume = new Flume([a, b], { onEvent })
-    await flume.start()
+    const events: FlumeEvent[] = []
+    const flume = new Flume({
+      sources: [a, b],
+      onEvent: (item) => {
+        if (item.kind === "event") events.push(item.event)
+      },
+    })
+    await flume.open()
 
     a.pushEvent!({ source: "discord", type: "x", data: {}, meta: {}, receivedAt: 1 })
     b.pushEvent!({ source: "slack", type: "y", data: {}, meta: {}, receivedAt: 2 })
 
-    await waitFor(() => expect(onEvent).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(events).toHaveLength(2))
   })
 
   it("rolls back started sources when one throws", async () => {
     const a = new MockSource({ name: "discord" })
     const b = new MockSource({ failOnConnect: new Error("boom"), name: "slack" })
-    const flume = new Flume([a, b], { onEvent: vi.fn() })
+    const flume = new Flume({ sources: [a, b], onEvent: vi.fn() })
 
-    const result = await flume.start()
+    const result = await flume.open()
 
     expect(result).toBeInstanceOf(Error)
     if (result instanceof Error) expect(result.message).toContain("slack: boom")
@@ -111,9 +116,9 @@ describe("Flume", () => {
       returnErrorOnConnect: new Error("connect refused"),
       name: "slack",
     })
-    const flume = new Flume([a, b], { onEvent: vi.fn() })
+    const flume = new Flume({ sources: [a, b], onEvent: vi.fn() })
 
-    const result = await flume.start()
+    const result = await flume.open()
 
     expect(result).toBeInstanceOf(Error)
     if (result instanceof Error) expect(result.message).toContain("slack: connect refused")
@@ -122,10 +127,10 @@ describe("Flume", () => {
 
   it("refuses double-start", async () => {
     const a = new MockSource({ name: "discord" })
-    const flume = new Flume([a], { onEvent: vi.fn() })
-    await flume.start()
+    const flume = new Flume({ sources: [a], onEvent: vi.fn() })
+    await flume.open()
 
-    const second = await flume.start()
+    const second = await flume.open()
 
     expect(second).toBeInstanceOf(Error)
     expect(a.startCount).toBe(1)
@@ -138,9 +143,9 @@ describe("Flume", () => {
       returnErrorOnConnect: new Error("c-failed"),
       name: "github",
     })
-    const flume = new Flume([a, b, c], { onEvent: vi.fn() })
+    const flume = new Flume({ sources: [a, b, c], onEvent: vi.fn() })
 
-    const result = await flume.start()
+    const result = await flume.open()
 
     expect(result).toBeInstanceOf(Error)
     expect(a.stopCount).toBe(1)
@@ -157,9 +162,9 @@ describe("Flume", () => {
       returnErrorOnConnect: new Error("b-failed"),
       name: "slack",
     })
-    const flume = new Flume([a, b], { onEvent: vi.fn() })
+    const flume = new Flume({ sources: [a, b], onEvent: vi.fn() })
 
-    const result = await flume.start()
+    const result = await flume.open()
 
     expect(result).toBeInstanceOf(Error)
     if (result instanceof Error) {
@@ -168,21 +173,23 @@ describe("Flume", () => {
     }
   })
 
-  it("forwards status events with source name through onStatus", async () => {
+  it("surfaces status transitions through the firehose (no dedicated status callback)", async () => {
     const a = new MockSource({ name: "discord" })
-    const events: FlumeStatusEvent[] = []
-    const flume = new Flume([a], {
-      onEvent: vi.fn(),
-      onStatus: (e) => events.push(e),
+    const logs: FlumeLog[] = []
+    const flume = new Flume({
+      sources: [a],
+      onEvent: (item) => {
+        if (item.kind === "log") logs.push(item.log)
+      },
     })
 
-    await flume.start()
+    await flume.open()
 
-    expect(events).toContainEqual({ source: "discord", status: "connected" })
+    const statusLog = logs.find((log) => log.action === "status" && log.source === "discord")
+    expect(statusLog?.message).toContain("connected")
   })
 
-  it("logs rollback failures via onLog when a source's stop() rejects", async () => {
-    const a = new MockSource({ name: "discord" })
+  it("logs rollback failures into the firehose when a source's stop() rejects", async () => {
     class FailingStop extends MockSource {
       protected override async disconnect(): Promise<void> {
         this.stopCount += 1
@@ -194,16 +201,15 @@ describe("Flume", () => {
       returnErrorOnConnect: new Error("b-failed"),
       name: "slack",
     })
-    void a
     const captured: Array<{ action: string; level: string }> = []
-    const flume = new Flume([failingA, b], {
-      onEvent: vi.fn(),
-      onLog: (log) => {
-        captured.push({ action: log.action, level: log.level })
+    const flume = new Flume({
+      sources: [failingA, b],
+      onEvent: (item) => {
+        if (item.kind === "log") captured.push({ action: item.log.action, level: item.log.level })
       },
     })
 
-    await flume.start()
+    await flume.open()
 
     expect(captured.some((c) => c.action === "flume.rollback.failed")).toBe(true)
   })
@@ -211,21 +217,18 @@ describe("Flume", () => {
   it("threads the host signal into source ctx so sources can listen for abort natively", async () => {
     const source = new MockSource({ name: "discord" })
     const controller = new AbortController()
-    const flume = new Flume([source], {
-      onEvent: vi.fn(),
-      signal: controller.signal,
-    })
+    const flume = new Flume({ sources: [source], onEvent: vi.fn(), signal: controller.signal })
 
-    const result = await flume.start()
+    const result = await flume.open()
     expect(result).not.toBeInstanceOf(Error)
     expect(source.capturedSignal).toBe(controller.signal)
   })
 
   it("passes undefined as ctx.signal when the host did not supply one", async () => {
     const source = new MockSource({ name: "discord" })
-    const flume = new Flume([source], { onEvent: vi.fn() })
+    const flume = new Flume({ sources: [source], onEvent: vi.fn() })
 
-    const result = await flume.start()
+    const result = await flume.open()
     expect(result).not.toBeInstanceOf(Error)
     expect(source.capturedSignal).toBeUndefined()
   })
@@ -234,12 +237,9 @@ describe("Flume", () => {
     const a = new MockSource({ name: "discord" })
     const controller = new AbortController()
     controller.abort()
-    const flume = new Flume([a], {
-      onEvent: vi.fn(),
-      signal: controller.signal,
-    })
+    const flume = new Flume({ sources: [a], onEvent: vi.fn(), signal: controller.signal })
 
-    const result = await flume.start()
+    const result = await flume.open()
 
     expect(result).toBeInstanceOf(Error)
     expect(a.startCount).toBe(0)
@@ -247,29 +247,29 @@ describe("Flume", () => {
 })
 
 describe("FlumeRunning", () => {
-  it("stop returns FlumeStopped and stops every source", async () => {
+  it("stop returns FlumeClosed and stops every source", async () => {
     const a = new MockSource({ name: "discord" })
     const b = new MockSource({ name: "slack" })
-    const flume = new Flume([a, b], { onEvent: vi.fn() })
+    const flume = new Flume({ sources: [a, b], onEvent: vi.fn() })
 
-    const running = await flume.start()
+    const running = await flume.open()
     if (running instanceof Error) throw running
 
-    const stopped = await running.stop()
+    const closed = await running.close()
 
-    expect(stopped).toBeInstanceOf(FlumeStopped)
+    expect(closed).toBeInstanceOf(FlumeClosed)
     expect(a.stopCount).toBe(1)
     expect(b.stopCount).toBe(1)
   })
 
   it("stop is idempotent and concurrent-safe", async () => {
     const a = new MockSource({ name: "discord" })
-    const flume = new Flume([a], { onEvent: vi.fn() })
+    const flume = new Flume({ sources: [a], onEvent: vi.fn() })
 
-    const running = await flume.start()
+    const running = await flume.open()
     if (running instanceof Error) throw running
 
-    const [first, second] = await Promise.all([running.stop(), running.stop()])
+    const [first, second] = await Promise.all([running.close(), running.close()])
 
     expect(first).toBe(second)
     expect(a.stopCount).toBe(1)
@@ -278,11 +278,8 @@ describe("FlumeRunning", () => {
   it("aborts all sources when signal fires", async () => {
     const a = new MockSource({ name: "discord" })
     const controller = new AbortController()
-    const flume = new Flume([a], {
-      onEvent: vi.fn(),
-      signal: controller.signal,
-    })
-    await flume.start()
+    const flume = new Flume({ sources: [a], onEvent: vi.fn(), signal: controller.signal })
+    await flume.open()
 
     controller.abort()
     await new Promise((resolve) => setTimeout(resolve, 0))
@@ -293,9 +290,9 @@ describe("FlumeRunning", () => {
   it("statuses reflects underlying source state", async () => {
     const a = new MockSource({ name: "discord" })
     const b = new MockSource({ name: "slack" })
-    const flume = new Flume([a, b], { onEvent: vi.fn() })
+    const flume = new Flume({ sources: [a, b], onEvent: vi.fn() })
 
-    const running = await flume.start()
+    const running = await flume.open()
     if (running instanceof Error) throw running
 
     expect(running.statuses()).toEqual([
@@ -308,8 +305,8 @@ describe("FlumeRunning", () => {
     const source = new MockSource({ name: "discord" })
     const controller = new AbortController()
 
-    const flume = new Flume([source], { onEvent: vi.fn(), signal: controller.signal })
-    const running = await flume.start()
+    const flume = new Flume({ sources: [source], onEvent: vi.fn(), signal: controller.signal })
+    const running = await flume.open()
     if (running instanceof Error) throw running
 
     expect(running.signal).toBe(controller.signal)
@@ -321,8 +318,8 @@ describe("FlumeRunning", () => {
 
   it("running.signal is undefined when the host did not supply one", async () => {
     const source = new MockSource({ name: "discord" })
-    const flume = new Flume([source], { onEvent: vi.fn() })
-    const running = await flume.start()
+    const flume = new Flume({ sources: [source], onEvent: vi.fn() })
+    const running = await flume.open()
     if (running instanceof Error) throw running
 
     expect(running.signal).toBeUndefined()
@@ -335,62 +332,192 @@ describe("FlumeRunning", () => {
     })
     const logs: { action: string; message: string; error?: Error }[] = []
 
-    const flume = new Flume([source], {
-      onEvent: vi.fn(),
-      onLog: (entry) => logs.push({ action: entry.action, message: entry.message, error: entry.error }),
+    const flume = new Flume({
+      sources: [source],
+      onEvent: (item) => {
+        if (item.kind === "log") {
+          logs.push({ action: item.log.action, message: item.log.message, error: item.log.error })
+        }
+      },
     })
 
-    const running = await flume.start()
+    const running = await flume.open()
     if (running instanceof Error) throw running
 
-    const stopped = await running.stop()
-    expect(stopped).toBeInstanceOf(FlumeStopped)
+    const closed = await running.close()
+    expect(closed).toBeInstanceOf(FlumeClosed)
 
-    const failures = logs.filter((l) => l.action === "flume.stop.failed")
+    const failures = logs.filter((l) => l.action === "flume.close.failed")
     expect(failures).toHaveLength(1)
     expect(failures[0]?.error?.message).toBe("ws close timeout")
     expect(failures[0]?.message).toContain("discord")
   })
 
-  it("FlumeStopped.errors() lists per-source disconnect failures so hosts skip the onLog grep", async () => {
+  it("FlumeClosed.errors() lists per-source disconnect failures so hosts skip the onLog grep", async () => {
     const ok = new MockSource({ name: "discord" })
     const bad = new MockSource({ name: "slack", failOnDisconnect: new Error("boom") })
 
-    const flume = new Flume([ok, bad], { onEvent: vi.fn() })
-    const running = await flume.start()
+    const flume = new Flume({ sources: [ok, bad], onEvent: vi.fn() })
+    const running = await flume.open()
     if (running instanceof Error) throw running
 
-    const stopped = await running.stop()
-    const errors = stopped.errors()
+    const closed = await running.close()
+    const errors = closed.errors()
 
     expect(errors).toHaveLength(1)
     expect(errors[0]?.source).toBe("slack")
     expect(errors[0]?.error.message).toBe("boom")
   })
 
-  it("FlumeStopped.errors() is empty when every source stops cleanly", async () => {
+  it("FlumeClosed.errors() is empty when every source stops cleanly", async () => {
     const a = new MockSource({ name: "discord" })
     const b = new MockSource({ name: "slack" })
 
-    const flume = new Flume([a, b], { onEvent: vi.fn() })
-    const running = await flume.start()
+    const flume = new Flume({ sources: [a, b], onEvent: vi.fn() })
+    const running = await flume.open()
     if (running instanceof Error) throw running
 
-    const stopped = await running.stop()
-    expect(stopped.errors()).toEqual([])
+    const closed = await running.close()
+    expect(closed.errors()).toEqual([])
   })
 })
 
-describe("FlumeStopped", () => {
+describe("FlumeClosed", () => {
   it("exposes a snapshot of final statuses without raw sources", async () => {
     const a = new MockSource({ name: "discord" })
-    const flume = new Flume([a], { onEvent: vi.fn() })
+    const flume = new Flume({ sources: [a], onEvent: vi.fn() })
 
-    const running = await flume.start()
+    const running = await flume.open()
     if (running instanceof Error) throw running
 
-    const stopped = await running.stop()
+    const closed = await running.close()
 
-    expect(stopped.statuses()).toEqual([{ source: "discord", status: "disconnected" }])
+    expect(closed.statuses()).toEqual([{ source: "discord", status: "disconnected" }])
+  })
+})
+
+describe("Flume onError", () => {
+  it("receives only error-level logs", async () => {
+    const failing = new MockSource({
+      returnErrorOnConnect: new Error("boom"),
+      name: "discord",
+    })
+    const errors: FlumeLog[] = []
+    const flume = new Flume({
+      sources: [failing],
+      onEvent: vi.fn(),
+      onError: (log) => errors.push(log),
+    })
+
+    await flume.open()
+
+    expect(errors.length).toBeGreaterThan(0)
+    expect(errors.every((log) => log.level === "error")).toBe(true)
+  })
+
+  it("delivers every level to the firehose while onError filters to errors", async () => {
+    const failing = new MockSource({
+      returnErrorOnConnect: new Error("boom"),
+      name: "discord",
+    })
+    const logs: FlumeLog[] = []
+    const errors: FlumeLog[] = []
+    const flume = new Flume({
+      sources: [failing],
+      onEvent: (item) => {
+        if (item.kind === "log") logs.push(item.log)
+      },
+      onError: (log) => errors.push(log),
+    })
+
+    await flume.open()
+
+    expect(logs.some((log) => log.level !== "error")).toBe(true)
+    expect(errors.length).toBeLessThan(logs.length)
+    expect(errors.every((log) => log.level === "error")).toBe(true)
+  })
+})
+
+describe("FlumeRunning.stream", () => {
+  it("yields event items to a for-await consumer", async () => {
+    const a = new MockSource({ name: "discord" })
+    const flume = new Flume({ sources: [a] })
+
+    const running = await flume.open()
+    if (running instanceof Error) throw running
+
+    const received: FlumeEvent[] = []
+    const consume = (async () => {
+      for await (const item of running.stream()) {
+        if (item.kind !== "event") continue
+        received.push(item.event)
+        if (received.length === 2) break
+      }
+    })()
+
+    const event: FlumeEvent = {
+      source: "discord",
+      type: "MESSAGE_CREATE",
+      data: {},
+      meta: {},
+      receivedAt: 0,
+    }
+    a.pushEvent?.(event)
+    a.pushEvent?.({ ...event, type: "SECOND" })
+
+    await consume
+
+    expect(received.map((e) => e.type)).toEqual(["MESSAGE_CREATE", "SECOND"])
+  })
+
+  it("ends the iterator when the flume stops", async () => {
+    const a = new MockSource({ name: "discord" })
+    const flume = new Flume({ sources: [a] })
+
+    const running = await flume.open()
+    if (running instanceof Error) throw running
+
+    const stream = running.stream()
+    const done = (async () => {
+      const items: FlumeStreamItem[] = []
+      for await (const item of stream) items.push(item)
+      return items
+    })()
+
+    await running.close()
+
+    // 停止で iterator は終端する (collected は stop 時の log item のみ、event は無し)
+    const items = await done
+    expect(items.every((item) => item.kind === "log")).toBe(true)
+  })
+
+  it("drops oldest items when the buffer overflows", async () => {
+    const a = new MockSource({ name: "discord" })
+    const flume = new Flume({ sources: [a] })
+
+    const running = await flume.open()
+    if (running instanceof Error) throw running
+
+    const stream = running.stream({ buffer: 2, onOverflow: "drop-oldest" })
+
+    const base: FlumeEvent = {
+      source: "discord",
+      type: "0",
+      data: {},
+      meta: {},
+      receivedAt: 0,
+    }
+    a.pushEvent?.({ ...base, type: "0" })
+    a.pushEvent?.({ ...base, type: "1" })
+    a.pushEvent?.({ ...base, type: "2" })
+
+    // serial queue を drain させてから読む (3 件とも buffer に積まれてから next する)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+
+    const first = await stream.next()
+    const second = await stream.next()
+    const firstType = first.value?.kind === "event" ? first.value.event.type : null
+    const secondType = second.value?.kind === "event" ? second.value.event.type : null
+    expect([firstType, secondType]).toEqual(["1", "2"])
   })
 })

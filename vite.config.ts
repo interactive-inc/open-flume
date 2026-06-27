@@ -3,7 +3,7 @@ import { defineConfig } from "vite-plus"
 
 export default defineConfig({
   resolve: { alias: { "@": fileURLToPath(new URL("./lib", import.meta.url)) } },
-  fmt: { semi: false },
+  fmt: { semi: false, ignorePatterns: [".claude/**"] },
   lint: {
     ignorePatterns: ["node_modules/**"],
   },
@@ -13,6 +13,7 @@ export default defineConfig({
       slack: "lib/slack.ts",
       discord: "lib/discord.ts",
       github: "lib/github.ts",
+      time: "lib/time.ts",
     },
     format: "esm",
     dts: true,

@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.9.0
+
+### Breaking
+
+- **Constructor takes a single options object: `new Flume({ sources, ...options })`.** `sources` is the only required field. The previous two-argument `new Flume(sources, options?)` form is removed.
+- **Lifecycle verbs renamed to `open()` / `close()`.** `Flume.start()` → `Flume.open()`, `FlumeRunning.stop()` → `FlumeRunning.close()`. The river-gate metaphor matches the streaming model (open the flume to let it flow, close it to stop).
+- **`FlumeStopped` → `FlumeClosed`** (`kind: "stopped"` → `"closed"`); **`FlumeStopError` → `FlumeCloseError`**. `FlumeRunning` keeps its name (`kind: "running"`).
+- **Observation collapsed into one firehose.** The separate `onEvent` (typed event), `onLog`, and `onStatus` callbacks are removed. A single `onEvent: (item: FlumeStreamItem) => void` now delivers received events **and** every log merged into one discriminated union (`{ kind: "event"; event } | { kind: "log"; log }`); the consumer filters by `item.kind` / `item.log.level`. Connection-state transitions ride the firehose as `status` log entries instead of a dedicated callback. `onError` is kept as a convenience filter for `level: "error"` logs (e.g. Sentry). Built for piping the whole picture into an agent (Claude / Codex) so it can notice disconnects itself.
+- **Log action renames:** `flume.start.*` → `flume.open.*`, `flume.stop.*` → `flume.close.*`.
+
+### Added
+
+- **`FlumeTimeSource`** (subpath `@interactive-inc/flume/time`) — emits a `tick` on a 5-field cron schedule (wall-clock, self-contained cron parser, no external deps). `message()` customizes each tick's `type` / `data` / `meta`. Also exports `parseCron` and `flumeCronNext`. Holds no connection, so it reaches `connected` immediately and is never a reconnect target.
+- **`FlumeRunning.stream(options?)`** — pull-style async iterator over the same firehose (`FlumeStreamItem`), for `for await` consumption. Bounded buffer with `{ buffer, onOverflow: "drop-oldest" | "drop-newest" }` (default 1000 / drop-oldest); ends cleanly on `close()` / signal abort.
+- **`FlumeConfluence`** — a higher-level supervisor that holds many `Flume` instances, merges all their firehoses into one `onEvent`, and lets you `add(id, sources)` / `remove(id)` / `closeAll()` groups at runtime while the others keep running. Each group is an independent `Flume`, so one group's failure never rolls back another.
+- **`FlumeOptions`** type is now exported.
+
+### Fixed
+
+- `FlumeReconnector` no longer advances the attempt counter when `setTimeout` itself throws — a rejected timer scheduling used to skip a backoff step, growing the next delay incorrectly.
+- GitHub poller: a rate limit on the **initial** poll no longer immediately re-arms the polling interval, which previously cancelled out the rate-limit pause. Added coverage for the `429` / `403 + X-RateLimit-Remaining: 0` paths (previously untested).
+- `FlumeGitHubSeenCache` / `FlumeSlackSeenCache` `trim()` now evicts the oldest keys in place (`O(evicted)`) instead of rebuilding the whole `Map` (`O(n)`).
+- Removed a redundant double `.catch()` on the GitHub poll interval (dead code — `poll()` never rejects).
+
 ## 0.8.0
 
 ### Breaking

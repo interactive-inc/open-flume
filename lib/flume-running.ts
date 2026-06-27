@@ -1,7 +1,8 @@
-import type { FlumeSourceStatus } from "@/types"
+import type { FlumeSourceStatus, FlumeStreamItem, FlumeStreamOptions } from "@/types"
+import type { FlumeStreamHub } from "@/flume-stream-hub"
 import type { FlumeSource } from "@/flume-source"
 import { FlumeLogger } from "@/logger"
-import { FlumeStopped, type FlumeStopError } from "@/flume-stopped"
+import { FlumeClosed, type FlumeCloseError } from "@/flume-closed"
 import { attempt } from "@/utils/attempt"
 import { safeErrorMessage } from "@/utils/safe-error-message"
 import { safeInvokeCallback } from "@/utils/safe-invoke-callback"
@@ -11,28 +12,29 @@ type Props = {
   sources: ReadonlyArray<FlumeSource>
   signal?: AbortSignal
   log: FlumeLogger
+  hub: FlumeStreamHub
 }
 
 /**
- * 稼働中の Flume。stop() で FlumeStopped へ遷移する。signal が abort されると自動 stop。
+ * 稼働中の Flume。close() で FlumeClosed へ遷移する。signal が abort されると自動 close。
  * 全ての source 呼び出し・signal 操作・status 読み取りを `attempt` 経由で扱い、
- * `runStop` の最外殻 try/catch で想定外の throw も `FlumeStopped` の resolve に変換する
+ * `runClose` の最外殻 try/catch で想定外の throw も `FlumeClosed` の resolve に変換する
  */
 export class FlumeRunning {
   readonly kind = "running" as const
 
-  private stopPromise: Promise<FlumeStopped> | null = null
+  private closePromise: Promise<FlumeClosed> | null = null
 
   private readonly onAbort: () => void
 
   constructor(private readonly props: Props) {
     this.onAbort = () => {
-      this.props.log.info({ action: "flume.abort", message: "signal aborted, stopping" })
+      this.props.log.info({ action: "flume.abort", message: "signal aborted, closing" })
       safeInvokeCallback({
-        fn: () => this.stop(),
+        fn: () => this.close(),
         onError: (error) => {
           this.props.log.error({
-            action: "flume.abort.stop.failed",
+            action: "flume.abort.close.failed",
             message: safeErrorMessage({ error }),
             error,
           })
@@ -54,15 +56,25 @@ export class FlumeRunning {
     }
   }
 
-  stop(): Promise<FlumeStopped> {
-    if (this.stopPromise) return this.stopPromise
+  close(): Promise<FlumeClosed> {
+    if (this.closePromise) return this.closePromise
 
-    this.stopPromise = this.runStop()
-    return this.stopPromise
+    this.closePromise = this.runClose()
+    return this.closePromise
   }
 
   statuses(): ReadonlyArray<FlumeSourceStatus> {
     return this.snapshotStatuses()
+  }
+
+  /**
+   * 統合 firehose を pull で受け取る async iterator。`for await (const item of running.stream())`。
+   * item は events + 全ログの union (`FlumeStreamItem`)。`item.kind` で判別する。
+   * close() / signal abort で iterator は自然に終了し、`break` すると hub から自動 unsubscribe する。
+   * consumer が遅れて buffer を超えたら `onOverflow` (既定 drop-oldest) に従う
+   */
+  stream(options?: FlumeStreamOptions): AsyncIterableIterator<FlumeStreamItem> {
+    return this.props.hub.subscribe(options)
   }
 
   /**
@@ -74,13 +86,13 @@ export class FlumeRunning {
     return this.props.signal
   }
 
-  private async runStop(): Promise<FlumeStopped> {
-    const stopErrors: FlumeStopError[] = []
+  private async runClose(): Promise<FlumeClosed> {
+    const closeErrors: FlumeCloseError[] = []
 
     try {
       this.props.log.info({
-        action: "flume.stop",
-        message: `stopping ${this.props.sources.length} source(s)`,
+        action: "flume.close",
+        message: `closing ${this.props.sources.length} source(s)`,
       })
 
       const settled = await Promise.allSettled(
@@ -92,9 +104,9 @@ export class FlumeRunning {
           const source = this.props.sources[index]
           const name = source ? this.sourceName(source) : "?"
           const error = safeNormalizeError({ value: result.reason })
-          stopErrors.push({ source: name, error })
+          closeErrors.push({ source: name, error })
           this.props.log.error({
-            action: "flume.stop.failed",
+            action: "flume.close.failed",
             message: `${name}: ${safeErrorMessage({ error })}`,
             error,
             detail: { source: name },
@@ -114,17 +126,19 @@ export class FlumeRunning {
           })
         }
       }
-      this.props.log.info({ action: "flume.stop.complete", message: "all sources stopped" })
+      this.props.log.info({ action: "flume.close.complete", message: "all sources closed" })
 
-      return new FlumeStopped({ finalStatuses: this.snapshotStatuses(), stopErrors })
+      this.props.hub.close()
+      return new FlumeClosed({ finalStatuses: this.snapshotStatuses(), closeErrors })
     } catch (err) {
       const error = safeNormalizeError({ value: err })
       this.props.log.error({
-        action: "flume.stop.unhandled",
+        action: "flume.close.unhandled",
         message: safeErrorMessage({ error }),
         error,
       })
-      return new FlumeStopped({ finalStatuses: this.snapshotStatuses(), stopErrors })
+      this.props.hub.close()
+      return new FlumeClosed({ finalStatuses: this.snapshotStatuses(), closeErrors })
     }
   }
 

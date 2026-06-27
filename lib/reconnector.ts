@@ -40,7 +40,7 @@ export class FlumeReconnector {
     if (this.currentAttempt >= this.props.maxAttempts) return -1
 
     this.clearTimer()
-    const delay = this.nextDelay()
+    const delay = this.computeDelay()
 
     const timerResult = attempt(() => this.props.deps.setTimeout(() => this.runRetry(fn), delay))
     if (timerResult instanceof Error) {
@@ -53,6 +53,7 @@ export class FlumeReconnector {
       return 0
     }
 
+    this.currentAttempt++
     this.timer = timerResult
     return delay
   }
@@ -95,10 +96,8 @@ export class FlumeReconnector {
     this.timer = null
   }
 
-  private nextDelay(): number {
+  private computeDelay(): number {
     const exp = Math.min(this.props.baseDelay * 2 ** this.currentAttempt, this.props.maxDelay)
-    const jitter = exp * (0.5 + safeRandom({ deps: this.props.deps }) * 0.5)
-    this.currentAttempt++
-    return jitter
+    return exp * (0.5 + safeRandom({ deps: this.props.deps }) * 0.5)
   }
 }
