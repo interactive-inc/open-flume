@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.1
+
+### Fixed
+
+- `FlumeConfluence.add()` no longer races on a duplicate `id`: the `has(id)` guard ran before `await flume.open()` while `set(id)` ran after, so two concurrent `add()` calls with the same id both passed the guard and the second overwrote the first — orphaning a `FlumeRunning` that never got closed. It now re-checks after `open()` and closes the loser.
+
 ## 0.9.0
 
 ### Breaking
