@@ -326,7 +326,8 @@ onEvent: (item) => {
 `reconnect` on `Flume` is an options object — omit it to disable reconnects entirely.
 
 ```ts
-new Flume(sources, {
+new Flume({
+  sources,
   onEvent: (item) => { ... },
   reconnect: {
     maxAttempts: 10,
