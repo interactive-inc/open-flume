@@ -97,6 +97,7 @@ export class FlumeSlackSource extends FlumeSource {
 
     this.socket = new FlumeSlackSocketMode({
       appToken: this.options.appToken,
+      idleTimeoutMs: this.options.idleTimeoutMs,
       onLog: ctx.log.handler,
       deps: ctx.deps,
       onMessage: (envelope) => this.handleMessage(ctx, envelope),

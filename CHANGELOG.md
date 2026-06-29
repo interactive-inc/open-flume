@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.4
+
+### Fixed
+
+- `FlumeSlackSource` now exposes and forwards `idleTimeoutMs` to the Slack Socket Mode transport. The watchdog remains opt-in, but hosts can now enable silent-connection detection without constructing `FlumeSlackSocketMode` directly.
+
 ## 0.9.3
 
 ### Fixed

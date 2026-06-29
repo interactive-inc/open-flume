@@ -168,6 +168,12 @@ export type FlumeSlackSourceOptions = {
    * `auth.test` での self 検出) が必ず使うため型で保持を強制する
    */
   botToken: string
+  /**
+   * Optional frame-silence watchdog. When set, the Slack WebSocket is closed
+   * and handed to the reconnect path after this many milliseconds without any
+   * inbound frame.
+   */
+  idleTimeoutMs?: number | null
 }
 
 export type FlumeGitHubSourceOptions = {

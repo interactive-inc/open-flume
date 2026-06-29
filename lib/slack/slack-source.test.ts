@@ -98,6 +98,7 @@ type CtxProps = {
   deps: FlumeRuntimeDeps
   onEvent?: (event: FlumeEvent) => void
   onStatus?: (status: FlumeStatus, detail?: string) => void
+  reconnect?: FlumeSourceStartContext["reconnect"]
 }
 
 const createCtx = (props: CtxProps): FlumeSourceStartContext => ({
@@ -105,7 +106,7 @@ const createCtx = (props: CtxProps): FlumeSourceStartContext => ({
   log: new FlumeLogger({ source: "slack", deps: props.deps }),
   deps: props.deps,
   onStatus: props.onStatus ?? (() => {}),
-  reconnect: null,
+  reconnect: props.reconnect ?? null,
 })
 
 describe("FlumeSlackSource", () => {
@@ -171,6 +172,46 @@ describe("FlumeSlackSource", () => {
     const source = new FlumeSlackSource({ appToken: "xapp-test", botToken: "xoxb-test" })
 
     expect(source.status()).toBe("disconnected")
+  })
+
+  it("passes idleTimeoutMs through and reconnects after socket silence", async () => {
+    TrackingMockWebSocket.latest = null
+    let nowMs = 1_000_000
+    const intervalCallbacks: Array<() => void> = []
+    const statuses: Array<FlumeStatus> = []
+    const deps = createDeps()
+    deps.now = () => nowMs
+    deps.setInterval = ((fn: () => void) => {
+      intervalCallbacks.push(fn)
+      return intervalCallbacks.length
+    }) as unknown as typeof deps.setInterval
+    deps.clearInterval = vi.fn()
+
+    const source = new FlumeSlackSource({
+      appToken: "xapp-test",
+      botToken: "xoxb-test",
+      idleTimeoutMs: 1_000,
+    })
+    const startPromise = source.start(
+      createCtx({
+        deps,
+        onStatus: (status) => statuses.push(status),
+        reconnect: { maxAttempts: 1, baseDelay: 1_000, maxDelay: 1_000 },
+      }),
+    )
+
+    await waitFor(() => {
+      expect(TrackingMockWebSocket.latest).not.toBeNull()
+    })
+
+    TrackingMockWebSocket.latest!.simulateMessage(JSON.stringify({ type: "hello" }))
+    await startPromise
+    expect(intervalCallbacks).toHaveLength(1)
+
+    nowMs += 5_000
+    intervalCallbacks[0]!()
+
+    expect(statuses).toContain("reconnecting")
   })
 })
 
