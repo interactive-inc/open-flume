@@ -68,6 +68,15 @@ export type FlumeStreamItem = { kind: "event"; event: FlumeEvent } | { kind: "lo
 
 export type FlumeStreamHandler = (item: FlumeStreamItem) => void
 
+/**
+ * `FlumeConfluence` が onEvent に渡す item。Flume 単体の `FlumeStreamItem` に
+ * `groupId` (`add(id, ...)` で渡したグループ識別子) をスタンプしたもの。
+ * 合流ストリームの provenance を呼び出し側で復元する必要がなくなる
+ */
+export type FlumeConfluenceItem = FlumeStreamItem & { readonly groupId: string }
+
+export type FlumeConfluenceItemHandler = (item: FlumeConfluenceItem) => void
+
 // Pull stream (FlumeRunning.stream() の async iterator オプション)
 
 export type FlumeStreamOverflow = "drop-oldest" | "drop-newest"
@@ -197,10 +206,44 @@ export type FlumeTimeMessage = {
   meta?: Record<string, string>
 }
 
+/**
+ * 起動 / 終了をまたいだ状態を 1 つ載せる純粋な DI ポート。flume 内部で fs / db / network を
+ * 触らないように、I/O の場所と方式は host が決める。load の失敗は null 復帰扱い、save の
+ * 失敗は best-effort (source 側で log するが throw しない)
+ */
+export type FlumeStatePersister<S> = {
+  load(): Promise<S | null>
+  save(state: S): Promise<void>
+}
+
+/** `FlumeTimeSource` の statePersister が保存する形 */
+export type FlumeTimeSourceState = {
+  readonly lastFiredAt: number
+}
+
+/**
+ * `FlumeTimeSource` の起動時 catch-up 方針。statePersister が読めた lastFiredAt から
+ * 現在時刻までに過ぎ去った cron マッチを再発火するかどうかを決める。
+ *  - "off"      : 何もしない (既定。後方互換)
+ *  - "lastOnly" : 直近に過ぎ去ったマッチを 1 件だけ再発火
+ *  - "missed"   : maxWindowMs (既定 24h) 以内のすべての過ぎ去ったマッチを順に再発火
+ */
+export type FlumeCatchupPolicy =
+  | { readonly mode: "off" }
+  | { readonly mode: "lastOnly" }
+  | { readonly mode: "missed"; readonly maxWindowMs?: number }
+
 export type FlumeTimeSourceOptions = {
   /** 5 フィールド cron 式 (minute hour day-of-month month day-of-week)。壁時計 (local time) 基準 */
   cron: string
   message?: (tick: FlumeTimeTick) => FlumeTimeMessage
+  /**
+   * 起動 / 終了をまたいで `lastFiredAt` を覚えておく口。未指定なら catchup は無効化される
+   * (lastFiredAt が分からないので)。flume は fs / db を触らないので host が実装を渡す
+   */
+  statePersister?: FlumeStatePersister<FlumeTimeSourceState>
+  /** statePersister が読めた lastFiredAt を元に過去 tick を再発火する方針 (既定 "off") */
+  catchupPolicy?: FlumeCatchupPolicy
 }
 
 // Zod inferred types

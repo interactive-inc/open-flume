@@ -174,4 +174,125 @@ describe("FlumeTimeSource", () => {
     expect(events).toHaveLength(0)
     expect(test.deps.clearTimeout).toHaveBeenCalled()
   })
+
+  it("statePersister: replays missed ticks under catchupPolicy.missed", async () => {
+    const startMs = 600_000
+    const lastFiredAt = startMs - 5 * 60_000
+
+    const test = createMockDeps(startMs)
+    const events: FlumeEvent[] = []
+    const saves: number[] = []
+
+    const persister = {
+      load: async () => ({ lastFiredAt }),
+      save: async (state: { lastFiredAt: number }) => {
+        saves.push(state.lastFiredAt)
+      },
+    }
+
+    const source = new FlumeTimeSource({
+      cron: "* * * * *",
+      statePersister: persister,
+      catchupPolicy: { mode: "missed" },
+    })
+
+    const result = await source.start(
+      createCtx({ deps: test.deps, onEvent: (e) => events.push(e) }),
+    )
+    await flushPromises()
+
+    expect(result).toBeNull()
+    expect(events.length).toBeGreaterThanOrEqual(5)
+    expect(saves.length).toBeGreaterThanOrEqual(1)
+  })
+
+  it("statePersister: lastOnly replays only the most recent missed tick", async () => {
+    const startMs = 600_000
+    const lastFiredAt = startMs - 5 * 60_000
+
+    const test = createMockDeps(startMs)
+    const events: FlumeEvent[] = []
+
+    const persister = {
+      load: async () => ({ lastFiredAt }),
+      save: async () => {},
+    }
+
+    const source = new FlumeTimeSource({
+      cron: "* * * * *",
+      statePersister: persister,
+      catchupPolicy: { mode: "lastOnly" },
+    })
+
+    await source.start(createCtx({ deps: test.deps, onEvent: (e) => events.push(e) }))
+    await flushPromises()
+
+    expect(events).toHaveLength(1)
+  })
+
+  it("statePersister: catchupPolicy default is off", async () => {
+    const startMs = 600_000
+    const lastFiredAt = startMs - 5 * 60_000
+
+    const test = createMockDeps(startMs)
+    const events: FlumeEvent[] = []
+
+    const persister = {
+      load: async () => ({ lastFiredAt }),
+      save: async () => {},
+    }
+
+    const source = new FlumeTimeSource({ cron: "* * * * *", statePersister: persister })
+
+    await source.start(createCtx({ deps: test.deps, onEvent: (e) => events.push(e) }))
+    await flushPromises()
+
+    expect(events).toHaveLength(0)
+  })
+
+  it("statePersister: save is called on every real tick", async () => {
+    const test = createMockDeps(0)
+    const saves: number[] = []
+
+    const persister = {
+      load: async () => null,
+      save: async (state: { lastFiredAt: number }) => {
+        saves.push(state.lastFiredAt)
+      },
+    }
+
+    const source = new FlumeTimeSource({ cron: "* * * * *", statePersister: persister })
+    await source.start(createCtx({ deps: test.deps }))
+
+    test.setNow(60_000)
+    test.fire()
+    await flushPromises()
+
+    expect(saves).toEqual([60_000])
+  })
+
+  it("statePersister: load error is non-fatal (catchup just skipped)", async () => {
+    const test = createMockDeps(600_000)
+    const events: FlumeEvent[] = []
+
+    const persister = {
+      load: async () => {
+        throw new Error("load failed")
+      },
+      save: async () => {},
+    }
+
+    const source = new FlumeTimeSource({
+      cron: "* * * * *",
+      statePersister: persister,
+      catchupPolicy: { mode: "missed" },
+    })
+
+    const result = await source.start(
+      createCtx({ deps: test.deps, onEvent: (e) => events.push(e) }),
+    )
+
+    expect(result).toBeNull()
+    expect(events).toHaveLength(0)
+  })
 })

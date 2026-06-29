@@ -134,4 +134,84 @@ describe("FlumeConfluence", () => {
     expect(b.stopCount).toBe(1)
     expect(confluence.ids()).toEqual([])
   })
+
+  it("stamps groupId on every item delivered to onEvent", async () => {
+    const items: { kind: string; groupId: string }[] = []
+    const confluence = new FlumeConfluence({
+      onEvent: (item) => items.push({ kind: item.kind, groupId: item.groupId }),
+    })
+
+    const a = new MockSource({ name: "slack" })
+    const b = new MockSource({ name: "discord" })
+    await confluence.add("group-a", [a])
+    await confluence.add("group-b", [b])
+
+    a.pushEvent?.(event("from-a"))
+    b.pushEvent?.(event("from-b"))
+
+    await waitFor(() => expect(items.filter((i) => i.kind === "event")).toHaveLength(2))
+    const groupsForEvents = items.filter((i) => i.kind === "event").map((i) => i.groupId).sort()
+    expect(groupsForEvents).toEqual(["group-a", "group-b"])
+  })
+
+  it("replace swaps the group while keeping the old one until the new one is up", async () => {
+    const stops: string[] = []
+    const items: { groupId: string; type: string }[] = []
+    const confluence = new FlumeConfluence({
+      onEvent: (item) => {
+        if (item.kind === "event") items.push({ groupId: item.groupId, type: item.event.type })
+      },
+    })
+
+    class TrackedSource extends MockSource {
+      constructor(private readonly label: string) {
+        super({ name: "slack" })
+      }
+      protected override disconnect(): void {
+        stops.push(this.label)
+        super.disconnect()
+      }
+    }
+
+    const oldSrc = new TrackedSource("old")
+    const newSrc = new TrackedSource("new")
+
+    expect(await confluence.add("rotating", [oldSrc])).toBeNull()
+    expect(await confluence.replace("rotating", [newSrc])).toBeNull()
+
+    expect(stops).toEqual(["old"])
+    newSrc.pushEvent?.(event("after-replace"))
+
+    await waitFor(() => expect(items).toHaveLength(1))
+    expect(items[0]?.groupId).toBe("rotating")
+    expect(items[0]?.type).toBe("after-replace")
+  })
+
+  it("replace returns Error and leaves the old group running when the new group fails to start", async () => {
+    const items: { groupId: string }[] = []
+    const confluence = new FlumeConfluence({
+      onEvent: (item) => {
+        if (item.kind === "event") items.push({ groupId: item.groupId })
+      },
+    })
+
+    const oldSrc = new MockSource({ name: "slack" })
+    const badSrc = new MockSource({ name: "slack", failConnect: new Error("boom") })
+
+    expect(await confluence.add("rotating", [oldSrc])).toBeNull()
+    const result = await confluence.replace("rotating", [badSrc])
+    expect(result).toBeInstanceOf(Error)
+
+    expect(oldSrc.stopCount).toBe(0)
+    oldSrc.pushEvent?.(event("still-old"))
+    await waitFor(() => expect(items).toHaveLength(1))
+    expect(items[0]?.groupId).toBe("rotating")
+  })
+
+  it("replace returns Error when the id is not currently running", async () => {
+    const confluence = new FlumeConfluence()
+    const src = new MockSource()
+    const result = await confluence.replace("missing", [src])
+    expect(result).toBeInstanceOf(Error)
+  })
 })
