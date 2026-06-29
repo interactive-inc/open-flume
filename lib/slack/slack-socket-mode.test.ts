@@ -316,10 +316,38 @@ describe("FlumeSlackSocketMode", () => {
     expect(result).toBeInstanceOf(FlumeHttpError)
   })
 
-  it("force-closes the socket after the idle timeout elapses with no frames", async () => {
+  it("does not arm the idle watchdog by default", async () => {
+    const intervalCallbacks: Array<() => void> = []
+    const { deps, getSocket } = createDeps()
+    deps.setInterval = ((fn: () => void) => {
+      intervalCallbacks.push(fn)
+      return intervalCallbacks.length
+    }) as unknown as typeof deps.setInterval
+
+    const mode = new FlumeSlackSocketMode({
+      appToken: "xapp-test",
+      onMessage: vi.fn(),
+      onConnected: vi.fn(),
+      onDisconnected: vi.fn(),
+      deps,
+    })
+
+    const ready = mode.connect()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const socket = getSocket()
+    expect(socket).not.toBeNull()
+    socket!.simulateMessage(JSON.stringify({ type: "hello" }))
+
+    await ready
+    expect(mode.isConnected()).toBe(true)
+    expect(intervalCallbacks).toHaveLength(0)
+  })
+
+  it("force-closes the socket after the configured idle timeout elapses with no frames", async () => {
     // Drive time via a fake clock + fake setInterval so we can step past the
-    // idle limit without real wall time. The watchdog should close the socket
-    // and onDisconnected should fire so the source's reconnect picks it up.
+    // configured idle limit without real wall time. The watchdog should close
+    // the socket and onDisconnected should fire so the source's reconnect
+    // picks it up.
     let nowMs = 1_000_000
 
     const intervalCallbacks: Array<() => void> = []

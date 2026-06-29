@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.3
+
+### Fixed
+
+- Slack Socket Mode no longer force-closes quiet-but-healthy sockets by default. The frame-silence watchdog added in 0.9.2 remains available through `idleTimeoutMs`, but it is now opt-in because Slack does not guarantee regular application-level frames during idle periods across all runtimes and network paths.
+
 ## 0.9.2
 
 ### Fixed

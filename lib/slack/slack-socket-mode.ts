@@ -24,17 +24,15 @@ type Props = {
   onLog?: FlumeLogHandler
   deps: Deps
   /**
-   * Force-close the socket after this many ms of frame silence. Defaults to
-   * 90s — long enough that Slack's ~30s server-side ping cadence keeps the
-   * pipe warm under normal load, short enough that a silent NAT / proxy /
-   * load-balancer idle drop (kernel TCP keepalive can take hours) is caught
-   * before the operator notices missing notifications. Closing the socket
-   * triggers the source's reconnect path.
+   * Optional frame-silence watchdog. Disabled by default because Slack Socket
+   * Mode does not guarantee regular application-level frames during quiet
+   * periods in every runtime/proxy combination. Hosts that want an aggressive
+   * stale-connection heuristic may opt in by setting a positive millisecond
+   * limit; closing the socket triggers the source's reconnect path.
    */
-  idleTimeoutMs?: number
+  idleTimeoutMs?: number | null
 }
 
-const DEFAULT_IDLE_TIMEOUT_MS = 90_000
 const IDLE_CHECK_INTERVAL_MS = 15_000
 
 type ConnectOptions = {
@@ -118,7 +116,8 @@ export class FlumeSlackSocketMode {
 
   private armIdleWatchdog(): void {
     this.disarmIdleWatchdog()
-    const idleLimit = this.props.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS
+    const idleLimit = this.props.idleTimeoutMs
+    if (idleLimit === null || idleLimit === undefined || idleLimit <= 0) return
 
     const handle = attempt(() =>
       this.props.deps.setInterval(() => this.checkIdle(idleLimit), IDLE_CHECK_INTERVAL_MS),
