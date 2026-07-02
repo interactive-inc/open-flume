@@ -34,9 +34,11 @@ type Props = {
 const NOTIFICATIONS_URL = "https://api.github.com/notifications"
 const CONSECUTIVE_ERRORS_TO_DISCONNECT = 3
 const SEEN_CACHE_MAX = 5000
+const MAX_PAGES = 10
 
 /**
  * GitHub /notifications を条件付きポーリングする (ETag / Last-Modified)。
+ * Link: rel="next" を MAX_PAGES まで辿って全ページを集約し、
  * 304 / X-Poll-Interval / レート制限を尊重し、stop() / abort() で in-flight 通信を打ち切る
  */
 export class FlumeGitHubPoller {
@@ -61,6 +63,8 @@ export class FlumeGitHubPoller {
   private inFlight = false
 
   private consecutiveErrors = 0
+
+  private degraded = false
 
   private effectiveIntervalSec: number
 
@@ -177,43 +181,20 @@ export class FlumeGitHubPoller {
     const params = new URLSearchParams({ all: "false", per_page: "50" })
     if (this.since) params.set("since", this.since)
 
-    const url = `${NOTIFICATIONS_URL}?${params}`
-    this.log.debug({ action: "http.request", message: `GET ${url}` })
-
-    const headers: Record<string, string> = {
-      Authorization: `Bearer ${this.props.token}`,
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-    }
-    if (this.etag) headers["If-None-Match"] = this.etag
-    if (this.lastModified) headers["If-Modified-Since"] = this.lastModified
-
-    const response = await attempt(() =>
-      this.props.deps.fetch(url, { headers, signal: this.controller?.signal }),
-    )
+    const response = await this.fetchPage(`${NOTIFICATIONS_URL}?${params}`, true)
 
     if (this.isStoppedFlag) return null
 
     if (response instanceof Error) {
-      this.log.error({
-        action: "http.error",
-        message: safeErrorMessage({ error: response }),
-        error: response,
-      })
       return this.recordFailure({ kind: "network", message: response.message, cause: response })
     }
 
-    this.log.debug({
-      action: "http.response",
-      message: `GET ${response.status}`,
-      detail: { status: response.status, url },
-    })
-
-    this.maybeWidenInterval(response.headers.get("X-Poll-Interval"))
+    this.followPollIntervalHeader(response.headers.get("X-Poll-Interval"))
 
     if (response.status === 304) {
       this.consecutiveErrors = 0
       this.log.debug({ action: "poll.not-modified", message: "304 Not Modified" })
+      this.notifyRecoveredIfDegraded()
       return null
     }
 
@@ -230,19 +211,138 @@ export class FlumeGitHubPoller {
       return this.recordFailure({ kind: "http", message: safeErrorMessage({ error }), error })
     }
 
-    this.consecutiveErrors = 0
-    this.etag = response.headers.get("ETag")
-    this.lastModified = response.headers.get("Last-Modified")
+    // 検証子は全ページの body 処理が成功するまでコミットしない。
+    // 途中で失敗した場合に未処理コンテンツの ETag で 304 を引いて通知を取り零すのを防ぐ
+    const nextEtag = response.headers.get("ETag")
+    const nextLastModified = response.headers.get("Last-Modified")
 
+    const rawNotifications = await this.collectPages(response)
+    if (!Array.isArray(rawNotifications)) return rawNotifications
+
+    this.processNotifications(rawNotifications)
+
+    this.consecutiveErrors = 0
+    this.etag = nextEtag
+    this.lastModified = nextLastModified
+    this.advanceCursor()
+    this.notifyRecoveredIfDegraded()
+    return null
+  }
+
+  /**
+   * 先頭ページの body を読み、Link: rel="next" を MAX_PAGES まで辿って
+   * 全ページの生 notifications を集約する。2 ページ目以降は無条件リクエスト
+   * (If-None-Match / If-Modified-Since なし)。失敗・停止・rate limit 時は
+   * Error | null を返し pollOnce がそのまま返す
+   */
+  private async collectPages(firstResponse: Response): Promise<unknown[] | Error | null> {
+    const rawNotifications: unknown[] = []
+
+    let pageResponse = firstResponse
+
+    let pageCount = 1
+
+    while (true) {
+      const body = await this.readPageBody(pageResponse)
+      if (this.isStoppedFlag) return null
+      if (body instanceof Error) {
+        return this.recordFailure({ kind: "http", message: body.message, error: body })
+      }
+      if (body === null) return null
+
+      for (const item of body) rawNotifications.push(item)
+
+      const nextUrl = this.findNextPageUrl(pageResponse.headers.get("Link"))
+      if (nextUrl === null) return rawNotifications
+
+      if (pageCount >= MAX_PAGES) {
+        this.log.warn({
+          action: "poll.pages.truncated",
+          message: `stopped after ${MAX_PAGES} pages, next page remains`,
+          detail: { pageCount, nextUrl },
+        })
+        return rawNotifications
+      }
+
+      const nextResponse = await this.fetchPage(nextUrl, false)
+      if (this.isStoppedFlag) return null
+      if (nextResponse instanceof Error) {
+        return this.recordFailure({
+          kind: "network",
+          message: nextResponse.message,
+          cause: nextResponse,
+        })
+      }
+      if (this.isRateLimited(nextResponse)) {
+        this.handleRateLimit(nextResponse)
+        return null
+      }
+      if (!nextResponse.ok) {
+        const error = new FlumeHttpError({
+          message: `HTTP ${nextResponse.status}`,
+          status: nextResponse.status,
+        })
+        return this.recordFailure({ kind: "http", message: safeErrorMessage({ error }), error })
+      }
+
+      pageResponse = nextResponse
+      pageCount++
+    }
+  }
+
+  /**
+   * 1 ページ分を fetch する。条件付きヘッダ (If-None-Match / If-Modified-Since) は
+   * 先頭ページのみ付与する
+   */
+  private async fetchPage(url: string, isFirstPage: boolean): Promise<Response | Error> {
+    this.log.debug({ action: "http.request", message: `GET ${url}` })
+
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${this.props.token}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    if (isFirstPage && this.etag) headers["If-None-Match"] = this.etag
+
+    if (isFirstPage && this.lastModified) headers["If-Modified-Since"] = this.lastModified
+
+    const response = await attempt(() =>
+      this.props.deps.fetch(url, { headers, signal: this.controller?.signal }),
+    )
+
+    if (response instanceof Error) {
+      this.log.error({
+        action: "http.error",
+        message: safeErrorMessage({ error: response }),
+        error: response,
+      })
+      return response
+    }
+
+    this.log.debug({
+      action: "http.response",
+      message: `GET ${response.status}`,
+      detail: { status: response.status, url },
+    })
+
+    return response
+  }
+
+  /**
+   * body を読んで JSON 配列に解決する。読み取り失敗は FlumeHttpError (呼び出し側で
+   * recordFailure する)、JSON 破損・非配列は warn 済みの null (poll ごと破棄) を返す
+   */
+  private async readPageBody(response: Response): Promise<unknown[] | Error | null> {
     const text = await safeReadText({ response, context: "notifications" })
-    if (this.isStoppedFlag) return null
+
     if (text instanceof FlumeHttpError) {
       this.log.warn({
         action: "http.body.read",
         message: safeErrorMessage({ error: text }),
         error: text,
       })
-      return this.recordFailure({ kind: "http", message: text.message, error: text })
+      return text
     }
 
     const json = safeJsonParse(text)
@@ -261,7 +361,19 @@ export class FlumeGitHubPoller {
       return null
     }
 
-    this.processNotifications(json)
+    return json
+  }
+
+  private findNextPageUrl(linkHeader: string | null): string | null {
+    if (linkHeader === null) return null
+
+    for (const part of linkHeader.split(",")) {
+      if (!part.includes('rel="next"')) continue
+      const match = part.match(/<([^>]+)>/)
+      const url = match?.[1]
+      if (url !== undefined) return url
+    }
+
     return null
   }
 
@@ -282,6 +394,7 @@ export class FlumeGitHubPoller {
     })
 
     if (this.consecutiveErrors >= CONSECUTIVE_ERRORS_TO_DISCONNECT && !this.isStoppedFlag) {
+      this.degraded = true
       this.props.onDisconnected(input.kind === "network" ? "network error" : input.message)
     }
 
@@ -289,10 +402,26 @@ export class FlumeGitHubPoller {
     return null
   }
 
+  /**
+   * onDisconnected 通知後に poll が完全成功したら connected へ戻す。
+   * degraded でなければ何もしない (冪等)
+   */
+  private notifyRecoveredIfDegraded(): void {
+    if (!this.degraded) return
+
+    this.degraded = false
+    this.props.onConnected()
+  }
+
+  /**
+   * 429 は常に rate limit。403 は Retry-After 付き (secondary rate limit、
+   * X-RateLimit-Remaining が 0 でないことがある) か X-RateLimit-Remaining が 0 の場合
+   */
   private isRateLimited(response: Response): boolean {
     if (response.status === 429) return true
-    if (response.status === 403 && response.headers.get("X-RateLimit-Remaining") === "0")
-      return true
+    if (response.status !== 403) return false
+    if (response.headers.get("Retry-After") !== null) return true
+    if (response.headers.get("X-RateLimit-Remaining") === "0") return true
     return false
   }
 
@@ -324,7 +453,17 @@ export class FlumeGitHubPoller {
       this.props.deps.setTimeout(() => {
         this.rateLimitTimer = null
         if (this.isStoppedFlag) return
+
+        // 一時停止明けは interval 1 周分をさらに待たず、すぐ 1 回 poll する
         this.scheduleInterval()
+        this.poll().catch((err) => {
+          const error = safeNormalizeError({ value: err })
+          this.log.error({
+            action: "poll.unhandled",
+            message: safeErrorMessage({ error }),
+            error,
+          })
+        })
       }, delaySec * 1000),
     )
     if (timerResult instanceof Error) {
@@ -367,18 +506,26 @@ export class FlumeGitHubPoller {
     this.rateLimitTimer = null
   }
 
-  private maybeWidenInterval(headerValue: string | null): void {
+  /**
+   * X-Poll-Interval を双方向に追従する。下限はユーザー指定 interval。
+   * ヘッダ欠落・非数値は現在の実効値を維持する
+   */
+  private followPollIntervalHeader(headerValue: string | null): void {
     if (headerValue === null) return
-    const required = Number.parseInt(headerValue, 10)
-    if (!Number.isFinite(required) || required <= this.effectiveIntervalSec) return
+
+    const headerSec = Number.parseInt(headerValue, 10)
+    if (!Number.isFinite(headerSec)) return
+
+    const nextSec = Math.max(this.props.interval, headerSec)
+    if (nextSec === this.effectiveIntervalSec) return
 
     this.log.info({
-      action: "poll.widen-interval",
-      message: `widening interval ${this.effectiveIntervalSec}s -> ${required}s per X-Poll-Interval`,
-      detail: { from: this.effectiveIntervalSec, to: required },
+      action: "poll.interval.follow",
+      message: `adjusting interval ${this.effectiveIntervalSec}s -> ${nextSec}s per X-Poll-Interval`,
+      detail: { from: this.effectiveIntervalSec, to: nextSec },
     })
 
-    this.effectiveIntervalSec = required
+    this.effectiveIntervalSec = nextSec
     if (this.timer !== null) this.scheduleInterval()
   }
 
@@ -409,11 +556,11 @@ export class FlumeGitHubPoller {
       for (const notification of notifications) {
         this.cache.add(notification.id, notification.updated_at)
       }
-      this.advanceCursor()
       this.log.info({
         action: "poller.bootstrap",
         message: `seeded ${notifications.length} existing notifications`,
       })
+      this.degraded = false
       this.props.onConnected()
       return
     }
@@ -425,7 +572,6 @@ export class FlumeGitHubPoller {
     })
 
     this.cache.trim()
-    this.advanceCursor()
 
     if (fresh.length > 0) {
       this.log.info({

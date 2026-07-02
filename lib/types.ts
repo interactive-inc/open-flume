@@ -153,11 +153,11 @@ export type FlumeSourceStartContext = {
   onStatus?: FlumeSourceLocalStatusHandler
   reconnect: FlumeReconnectConfig | null
   /**
-   * Flume.start() に渡された signal をそのまま転送する。
-   * source 実装が自前で `fetch(url, { signal })` / `setTimeout` cancel / WS close を
-   * host abort 経由で発火させたい時に使う (Flume 自身は最外殻で runClose を駆動するので
-   * source は signal を無視しても動作的には停止する — 自然な伝播パスが欲しい場合のみ)。
-   * Flume.options.signal が未設定なら省略される。
+   * Flume に渡された signal をそのまま転送する。
+   * connect 中の abort は `FlumeSource` 基底クラスが購読して `stop()` を発火する
+   * (進行中の接続を中断して `Flume.open()` を解放する)。connect 完了後の abort は
+   * FlumeRunning が runClose を駆動する。source 実装が自前で `fetch(url, { signal })`
+   * などへ伝播させたい場合にも使える。Flume.options.signal が未設定なら省略される。
    */
   signal?: AbortSignal
 }
@@ -167,7 +167,18 @@ export type FlumeSourceStartContext = {
 
 export type FlumeDiscordSourceOptions = {
   token: string
+  /**
+   * Gateway intent ビットフラグ。既定は Guilds | GuildMessages | DirectMessages。
+   * message の `content` 本文が必要な場合は privileged intent の `MessageContent` を
+   * Developer Portal で有効化した上で明示的に足す (未承認のまま足すと close 4014 で終端する)
+   */
   intents?: number
+  /**
+   * WebSocket open から READY/RESUMED までの上限 (ms)。既定 30_000。
+   * HELLO が来ない half-open socket で `connect()` (ひいては `Flume.open()`) が
+   * 永久にハングするのを防ぐ
+   */
+  handshakeTimeoutMs?: number
 }
 
 export type FlumeSlackSourceOptions = {
@@ -183,6 +194,12 @@ export type FlumeSlackSourceOptions = {
    * inbound frame.
    */
   idleTimeoutMs?: number | null
+  /**
+   * WebSocket open から hello 受信までの上限 (ms)。既定 30_000。
+   * hello が来ない half-open socket で `connect()` (ひいては `Flume.open()`) が
+   * 永久にハングするのを防ぐ
+   */
+  handshakeTimeoutMs?: number
 }
 
 export type FlumeGitHubSourceOptions = {

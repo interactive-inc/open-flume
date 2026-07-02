@@ -9,15 +9,19 @@ type Props = {
   log: FlumeLogger
   setStatus: (status: FlumeStatus) => void
   retry: () => void
+  /** backoff の下限 (identify 間隔や Retry-After をソース側が指定する) */
+  minDelayMs?: number
 }
 
 /**
  * 接続が落ちた際の共通再接続スケジューラ。
- * 再接続の設定状況 (無効 / 中止 / 試行尽き) を見極めてからステータス遷移する。
+ * 再接続の設定状況 (無効 / 中止 / 試行尽き / timer 拒否) を見極めてからステータス遷移する。
  * - reconnector が無ければ reconnect.disabled を info ログし disconnected へ
  * - cancel 済みなら reconnect.aborted を info ログし disconnected へ
- * - schedule() が -1 を返したら reconnect.exhausted を error ログし disconnected へ
- * - それ以外は reconnecting へ遷移し reconnect.scheduled を info ログ
+ * - schedule() が exhausted なら reconnect.exhausted を error ログし disconnected へ
+ * - schedule() が refused (timer 予約失敗) なら reconnect.refused を error ログし disconnected へ
+ *   ("reconnecting" のまま発火しない timer を待ち続けるハングを防ぐ)
+ * - scheduled なら reconnecting へ遷移し reconnect.scheduled を info ログ
  */
 export function scheduleFlumeReconnect(props: Props): void {
   if (!props.reconnector) {
@@ -38,9 +42,9 @@ export function scheduleFlumeReconnect(props: Props): void {
     return
   }
 
-  const delay = props.reconnector.schedule(props.retry)
+  const schedule = props.reconnector.schedule(props.retry, { minDelayMs: props.minDelayMs })
 
-  if (delay === -1) {
+  if (schedule.kind === "exhausted") {
     const error = new FlumeConnectionError(
       `reconnect exhausted after ${props.reconnector.attempt} attempts`,
     )
@@ -53,10 +57,21 @@ export function scheduleFlumeReconnect(props: Props): void {
     return
   }
 
+  if (schedule.kind === "refused") {
+    const error = new FlumeConnectionError("reconnect timer could not be scheduled")
+    props.log.error({
+      action: "reconnect.refused",
+      message: safeErrorMessage({ error }),
+      error,
+    })
+    props.setStatus("disconnected")
+    return
+  }
+
   props.setStatus("reconnecting")
   props.log.info({
     action: "reconnect.scheduled",
-    message: `next attempt in ${Math.round(delay)}ms`,
-    detail: { attempt: props.reconnector.attempt, delayMs: Math.round(delay) },
+    message: `next attempt in ${Math.round(schedule.delayMs)}ms`,
+    detail: { attempt: props.reconnector.attempt, delayMs: Math.round(schedule.delayMs) },
   })
 }

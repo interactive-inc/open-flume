@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest"
 import { FlumeGitHubPoller } from "@/github/github-poller"
-import type { FlumeRuntimeDeps } from "@/types"
+import type { FlumeLog, FlumeRuntimeDeps } from "@/types"
 
 function makeNotification(id: string, updatedAt: string) {
   return {
@@ -16,11 +16,20 @@ function makeNotification(id: string, updatedAt: string) {
 const timerHandle = globalThis.setTimeout(() => {}, 0)
 globalThis.clearTimeout(timerHandle)
 
-function makeJsonResponse(body: unknown, status = 200) {
+function makeJsonResponse(body: unknown, status = 200, extraHeaders: Record<string, string> = {}) {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...extraHeaders },
   })
+}
+
+function makeBrokenBodyResponse(headers: Record<string, string>) {
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.error(new Error("body stream failure"))
+    },
+  })
+  return new Response(stream, { status: 200, headers })
 }
 
 type Deps = Pick<
@@ -462,5 +471,227 @@ describe("FlumeGitHubPoller", () => {
     rateTimerCallback!()
 
     expect(test.mockSetInterval).toHaveBeenCalledTimes(1)
+  })
+
+  it("follows Link rel=next, aggregates pages, and sends conditional headers only on page 1", async () => {
+    const test = createTestDeps()
+    const onNotifications = vi.fn()
+
+    test.mockFetch.mockResolvedValueOnce(makeJsonResponse([], 200, { ETag: 'W/"etag-1"' }))
+    test.mockFetch.mockResolvedValueOnce(
+      makeJsonResponse([makeNotification("2", "2024-01-02T00:00:00Z")], 200, {
+        Link: '<https://api.github.com/notifications?page=2&per_page=50>; rel="next"',
+      }),
+    )
+    test.mockFetch.mockResolvedValueOnce(
+      makeJsonResponse([makeNotification("3", "2024-01-03T00:00:00Z")]),
+    )
+
+    const poller = new FlumeGitHubPoller({
+      token: "ghp_test",
+      interval: 60,
+      onNotifications,
+      onConnected: vi.fn(),
+      onDisconnected: vi.fn(),
+      deps: test.deps,
+    })
+
+    await poller.start()
+
+    test.getIntervalCallback()!()
+    await flushPromises()
+
+    expect(onNotifications).toHaveBeenCalledTimes(1)
+    expect(onNotifications.mock.calls[0]![0]).toHaveLength(2)
+    expect(onNotifications.mock.calls[0]![0]![0].id).toBe("2")
+    expect(onNotifications.mock.calls[0]![0]![1].id).toBe("3")
+
+    expect(test.mockFetch.mock.calls[2]![0]).toBe(
+      "https://api.github.com/notifications?page=2&per_page=50",
+    )
+    expect(test.mockFetch.mock.calls[1]![1]?.headers).toEqual(
+      expect.objectContaining({ "If-None-Match": 'W/"etag-1"' }),
+    )
+
+    const pageTwoHeaders = test.mockFetch.mock.calls[2]![1]?.headers
+    expect(pageTwoHeaders).not.toHaveProperty("If-None-Match")
+    expect(pageTwoHeaders).not.toHaveProperty("If-Modified-Since")
+  })
+
+  it("caps pagination at 10 pages and warns poll.pages.truncated", async () => {
+    const test = createTestDeps()
+    const logs: FlumeLog[] = []
+
+    test.mockFetch.mockImplementation(() =>
+      Promise.resolve(
+        makeJsonResponse([], 200, {
+          Link: '<https://api.github.com/notifications?page=2>; rel="next"',
+        }),
+      ),
+    )
+
+    const poller = new FlumeGitHubPoller({
+      token: "ghp_test",
+      interval: 60,
+      onNotifications: vi.fn(),
+      onConnected: vi.fn(),
+      onDisconnected: vi.fn(),
+      onLog: (log) => logs.push(log),
+      deps: test.deps,
+    })
+
+    await poller.start()
+
+    expect(test.mockFetch).toHaveBeenCalledTimes(10)
+
+    const truncatedWarns = logs.filter((log) => log.action === "poll.pages.truncated")
+    expect(truncatedWarns).toHaveLength(1)
+    expect(truncatedWarns[0]!.level).toBe("warn")
+  })
+
+  it("does not commit validators when body read fails, next poll sends the previous ETag", async () => {
+    const test = createTestDeps()
+
+    test.mockFetch.mockResolvedValueOnce(makeJsonResponse([], 200, { ETag: 'W/"good"' }))
+    test.mockFetch.mockResolvedValueOnce(makeBrokenBodyResponse({ ETag: 'W/"bad"' }))
+    test.mockFetch.mockResolvedValueOnce(makeJsonResponse([]))
+
+    const poller = new FlumeGitHubPoller({
+      token: "ghp_test",
+      interval: 60,
+      onNotifications: vi.fn(),
+      onConnected: vi.fn(),
+      onDisconnected: vi.fn(),
+      deps: test.deps,
+    })
+
+    await poller.start()
+
+    const cb = test.getIntervalCallback()
+    cb!()
+    await flushPromises()
+    cb!()
+    await flushPromises()
+
+    expect(test.mockFetch.mock.calls[2]![1]?.headers).toEqual(
+      expect.objectContaining({ "If-None-Match": 'W/"good"' }),
+    )
+  })
+
+  it("re-emits connected after recovering from disconnected", async () => {
+    const test = createTestDeps()
+    const onConnected = vi.fn()
+    const onDisconnected = vi.fn()
+
+    test.mockFetch.mockResolvedValueOnce(makeJsonResponse([]))
+    test.mockFetch.mockResolvedValueOnce(makeJsonResponse(null, 500))
+    test.mockFetch.mockResolvedValueOnce(makeJsonResponse(null, 500))
+    test.mockFetch.mockResolvedValueOnce(makeJsonResponse(null, 500))
+    test.mockFetch.mockResolvedValueOnce(makeJsonResponse([]))
+
+    const poller = new FlumeGitHubPoller({
+      token: "ghp_test",
+      interval: 60,
+      onNotifications: vi.fn(),
+      onConnected,
+      onDisconnected,
+      deps: test.deps,
+    })
+
+    await poller.start()
+    expect(onConnected).toHaveBeenCalledTimes(1)
+
+    const cb = test.getIntervalCallback()
+    cb!()
+    await flushPromises()
+    cb!()
+    await flushPromises()
+    cb!()
+    await flushPromises()
+
+    expect(onDisconnected).toHaveBeenCalledTimes(1)
+
+    cb!()
+    await flushPromises()
+
+    expect(onConnected).toHaveBeenCalledTimes(2)
+  })
+
+  it("403 with Retry-After and nonzero remaining pauses, then polls immediately after the pause", async () => {
+    let rateTimerCallback: (() => void) | null = null
+    const mockSetTimeout = vi.fn((fn: () => void, _ms: number) => {
+      rateTimerCallback = fn
+      return timerHandle
+    })
+    const test = createTestDeps({ setTimeout: mockSetTimeout })
+    const onDisconnected = vi.fn()
+
+    test.mockFetch.mockResolvedValueOnce(makeJsonResponse([]))
+    test.mockFetch.mockResolvedValueOnce(
+      new Response("", {
+        status: 403,
+        headers: { "Retry-After": "7", "X-RateLimit-Remaining": "42" },
+      }),
+    )
+    test.mockFetch.mockResolvedValueOnce(makeJsonResponse([]))
+
+    const poller = new FlumeGitHubPoller({
+      token: "ghp_test",
+      interval: 60,
+      onNotifications: vi.fn(),
+      onConnected: vi.fn(),
+      onDisconnected,
+      deps: test.deps,
+    })
+
+    await poller.start()
+
+    test.getIntervalCallback()!()
+    await flushPromises()
+
+    expect(onDisconnected).not.toHaveBeenCalled()
+    expect(mockSetTimeout).toHaveBeenCalledWith(expect.any(Function), 7000)
+    expect(test.mockFetch).toHaveBeenCalledTimes(2)
+
+    rateTimerCallback!()
+    await flushPromises()
+
+    // 一時停止明けは interval 1 周分を待たずに即 1 回 poll し、interval も再開する
+    expect(test.mockFetch).toHaveBeenCalledTimes(3)
+    expect(test.mockSetInterval).toHaveBeenCalledTimes(2)
+  })
+
+  it("follows X-Poll-Interval in both directions with the user interval as floor", async () => {
+    const test = createTestDeps()
+
+    test.mockFetch.mockResolvedValueOnce(makeJsonResponse([], 200, { "X-Poll-Interval": "120" }))
+    test.mockFetch.mockResolvedValueOnce(makeJsonResponse([], 200, { "X-Poll-Interval": "10" }))
+    test.mockFetch.mockResolvedValueOnce(makeJsonResponse([]))
+
+    const poller = new FlumeGitHubPoller({
+      token: "ghp_test",
+      interval: 30,
+      onNotifications: vi.fn(),
+      onConnected: vi.fn(),
+      onDisconnected: vi.fn(),
+      deps: test.deps,
+    })
+
+    await poller.start()
+
+    // 初回 poll がヘッダ 120s を採用し、start() が 120s で interval を張る
+    expect(test.mockSetInterval).toHaveBeenLastCalledWith(expect.any(Function), 120_000)
+
+    test.getIntervalCallback()!()
+    await flushPromises()
+
+    // ヘッダ 10s はユーザー下限 30s でクランプしつつ狭める方向にも追従する
+    expect(test.mockSetInterval).toHaveBeenLastCalledWith(expect.any(Function), 30_000)
+
+    test.getIntervalCallback()!()
+    await flushPromises()
+
+    // ヘッダ無しは現在の実効値を維持する (再スケジュールなし)
+    expect(test.mockSetInterval).toHaveBeenCalledTimes(2)
   })
 })

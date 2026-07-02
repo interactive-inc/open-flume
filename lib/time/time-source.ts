@@ -29,7 +29,11 @@ import { safeNow } from "@/utils/safe-now"
  *  2. lastFiredAt から now までの過ぎ去った cron マッチを policy に従って再発火する
  *  3. 各 tick 後に lastFiredAt を保存する (best-effort, ブロックしない)
  *
- * 保存先や形式は flume の関知ではなく statePersister の実装が決める (純粋 DI)
+ * 保存先や形式は flume の関知ではなく statePersister の実装が決める (純粋 DI)。
+ *
+ * DST 制限: fall-back (時計の巻き戻し) の二重発火は dedup で防ぐが、spring-forward
+ * (時計の飛び越し) でスキップされた壁時計時刻 (例: 02:30 が存在しない日) にスケジュール
+ * された job はその日は実行されない。cron は壁時計 (local time) 基準のため仕様とする
  */
 export class FlumeTimeSource extends FlumeSource {
   readonly name = "time" as const
@@ -61,9 +65,14 @@ export class FlumeTimeSource extends FlumeSource {
       onLog: ctx.log.handler,
       deps: ctx.deps,
       onTick: (firedAt) => this.handleTick(ctx, firedAt, persister),
+      onHalt: () => this.handleSchedulerHalt(ctx),
     })
 
-    const result = this.scheduler.start()
+    // catchup (<= startedAt) とスケジューラ初回ターゲット (> startedAt) の境界を同一時刻に
+    // 揃えるため、タイムスタンプは 1 回だけ取る (分境界の二重発火防止)
+    const startedAt = safeNow({ deps: ctx.deps })
+
+    const result = this.scheduler.start(startedAt)
     if (result instanceof Error) {
       const error = new FlumeStartError(`Time source: ${safeErrorMessage({ error: result })}`)
       this.setStatus("disconnected", error.message)
@@ -73,7 +82,7 @@ export class FlumeTimeSource extends FlumeSource {
     this.setStatus("connected")
 
     if (lastFiredAt !== null && persister !== null) {
-      this.runCatchup({ ctx, cron, lastFiredAt, persister })
+      this.runCatchup({ ctx, cron, lastFiredAt, persister, now: startedAt })
     }
 
     return null
@@ -111,26 +120,36 @@ export class FlumeTimeSource extends FlumeSource {
     cron: FlumeCron
     lastFiredAt: number
     persister: FlumeStatePersister<FlumeTimeSourceState>
+    now: number
   }): void {
     const policy: FlumeCatchupPolicy = this.options.catchupPolicy ?? { mode: "off" }
     if (policy.mode === "off") return
 
-    const matches = flumeCollectCatchupMatches({
+    const collected = flumeCollectCatchupMatches({
       cron: props.cron,
       lastFiredAt: props.lastFiredAt,
-      now: safeNow({ deps: props.ctx.deps }),
+      now: props.now,
       policy,
     })
 
-    if (matches instanceof FlumeParseError) {
+    if (collected instanceof FlumeParseError) {
       props.ctx.log.warn({
         action: "time.catchup.failed",
-        message: matches.message,
-        error: matches,
+        message: collected.message,
+        error: collected,
       })
       return
     }
 
+    if (collected.truncated) {
+      props.ctx.log.warn({
+        action: "time.catchup.truncated",
+        message: "catchup exceeded the match cap; oldest missed tick(s) were dropped",
+        detail: { kept: collected.matches.length, policy: policy.mode },
+      })
+    }
+
+    const matches = collected.matches
     if (matches.length === 0) return
 
     props.ctx.log.info({
@@ -145,6 +164,15 @@ export class FlumeTimeSource extends FlumeSource {
 
     const last = matches[matches.length - 1]
     if (last !== undefined) this.saveLastFiredAt(props.ctx, props.persister, last)
+  }
+
+  /** スケジューラが cron エラーで恒久停止した (dead-but-green を防ぐため接続状態を落とす) */
+  private handleSchedulerHalt(ctx: FlumeSourceStartContext): void {
+    ctx.log.error({
+      action: "time.scheduler.halted",
+      message: "scheduler halted due to cron error; time source will not tick again",
+    })
+    this.setStatus("disconnected", "scheduler halted")
   }
 
   private async loadLastFiredAt(

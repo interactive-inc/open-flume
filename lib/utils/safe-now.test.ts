@@ -1,28 +1,34 @@
 import { describe, expect, it } from "vitest"
 import { safeNow } from "@/utils/safe-now"
 
+const expectCloseToNow = (value: number) => {
+  const now = Date.now()
+  expect(value).toBeGreaterThanOrEqual(now - 5000)
+  expect(value).toBeLessThanOrEqual(now + 5000)
+}
+
 describe("safeNow", () => {
   it("returns deps.now() when it succeeds", () => {
     expect(safeNow({ deps: { now: () => 12345 } })).toBe(12345)
   })
 
-  it("returns 0 when deps.now() throws", () => {
-    expect(
-      safeNow({
-        deps: {
-          now: () => {
-            throw new Error("boom")
-          },
+  it("falls back to Date.now() when deps.now() throws", () => {
+    const value = safeNow({
+      deps: {
+        now: () => {
+          throw new Error("boom")
         },
-      }),
-    ).toBe(0)
+      },
+    })
+
+    expectCloseToNow(value)
   })
 
-  it("returns 0 when deps.now() returns NaN", () => {
-    expect(safeNow({ deps: { now: () => Number.NaN } })).toBe(0)
+  it("falls back to Date.now() when deps.now() returns NaN", () => {
+    expectCloseToNow(safeNow({ deps: { now: () => Number.NaN } }))
   })
 
-  it("returns 0 when deps.now() returns Infinity", () => {
-    expect(safeNow({ deps: { now: () => Number.POSITIVE_INFINITY } })).toBe(0)
+  it("falls back to Date.now() when deps.now() returns Infinity", () => {
+    expectCloseToNow(safeNow({ deps: { now: () => Number.POSITIVE_INFINITY } }))
   })
 })

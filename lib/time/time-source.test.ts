@@ -2,7 +2,13 @@ import { describe, it, expect, vi } from "vitest"
 import { FlumeLogger } from "@/logger"
 import { FlumeStartError } from "@/errors/start-error"
 import { FlumeTimeSource } from "@/time/time-source"
-import type { FlumeEvent, FlumeRuntimeDeps, FlumeSourceStartContext, FlumeStatus } from "@/types"
+import type {
+  FlumeEvent,
+  FlumeLog,
+  FlumeRuntimeDeps,
+  FlumeSourceStartContext,
+  FlumeStatus,
+} from "@/types"
 
 const timerHandle = globalThis.setTimeout(() => {}, 0)
 globalThis.clearTimeout(timerHandle)
@@ -38,11 +44,12 @@ type CtxProps = {
   deps: FlumeRuntimeDeps
   onEvent?: (event: FlumeEvent) => void
   onStatus?: (status: FlumeStatus, detail?: string) => void
+  onLog?: (log: FlumeLog) => void
 }
 
 const createCtx = (props: CtxProps): FlumeSourceStartContext => ({
   onEvent: props.onEvent ?? (() => {}),
-  log: new FlumeLogger({ source: "time", deps: props.deps }),
+  log: new FlumeLogger({ source: "time", deps: props.deps, handler: props.onLog }),
   deps: props.deps,
   onStatus: props.onStatus ?? (() => {}),
   reconnect: null,
@@ -50,6 +57,11 @@ const createCtx = (props: CtxProps): FlumeSourceStartContext => ({
 
 function flushPromises() {
   return new Promise<void>((resolve) => globalThis.setTimeout(resolve, 0))
+}
+
+function tickFiredAt(event: FlumeEvent): unknown {
+  if (event.source !== "time") throw new Error(`expected time event, got ${event.source}`)
+  return event.data.firedAt
 }
 
 describe("FlumeTimeSource", () => {
@@ -269,6 +281,97 @@ describe("FlumeTimeSource", () => {
     await flushPromises()
 
     expect(saves).toEqual([60_000])
+  })
+
+  it("transitions to disconnected when the scheduler halts on a cron error", async () => {
+    const test = createMockDeps(0)
+    const statuses: FlumeStatus[] = []
+
+    const source = new FlumeTimeSource({ cron: "* * * * *" })
+    await source.start(createCtx({ deps: test.deps, onStatus: (s) => statuses.push(s) }))
+
+    expect(source.status()).toBe("connected")
+
+    // Date の表現可能上限を超えた now で cron-next が mid-run に失敗する
+    test.setNow(8_700_000_000_000_000)
+    test.fire()
+    await flushPromises()
+
+    expect(statuses[statuses.length - 1]).toBe("disconnected")
+    expect(source.status()).toBe("disconnected")
+  })
+
+  it("does not double-fire a minute boundary between catchup and scheduler start", async () => {
+    // 起動処理の途中 (scheduler start と catchup の間) で時計が分境界 600_000 を跨ぐ状況:
+    // 最初の safeNow (= startedAt) だけ 570_000 を返し、以降は 630_000 を返す
+    let nowCallCount = 0
+    let lastCallback: (() => void) | null = null
+
+    const deps: FlumeRuntimeDeps = {
+      fetch: vi.fn(),
+      now: () => {
+        nowCallCount += 1
+        return nowCallCount === 1 ? 570_000 : 630_000
+      },
+      setTimeout: vi.fn((fn: () => void, _ms: number) => {
+        lastCallback = fn
+        return timerHandle
+      }),
+      clearTimeout: vi.fn(),
+      setInterval: vi.fn(() => timerHandle),
+      clearInterval: vi.fn(),
+      random: () => 0.5,
+      WebSocket: globalThis.WebSocket,
+    }
+    const fire = () => lastCallback?.()
+
+    const events: FlumeEvent[] = []
+    const persister = {
+      load: async () => ({ lastFiredAt: 480_000 }),
+      save: async () => {},
+    }
+
+    const source = new FlumeTimeSource({
+      cron: "* * * * *",
+      statePersister: persister,
+      catchupPolicy: { mode: "missed" },
+    })
+
+    await source.start(createCtx({ deps, onEvent: (e) => events.push(e) }))
+    fire()
+    await flushPromises()
+
+    // catchup は startedAt (570_000) まで → 540_000 のみ。境界 600_000 は scheduler からのみ
+    expect(events.map(tickFiredAt)).toEqual([540_000, 600_000])
+  })
+
+  it("statePersister: warns and keeps the newest ticks when catchup truncates", async () => {
+    const startMs = 30_000 * 60_000
+    const test = createMockDeps(startMs)
+    const events: FlumeEvent[] = []
+    const logs: FlumeLog[] = []
+
+    const persister = {
+      load: async () => ({ lastFiredAt: 0 }),
+      save: async () => {},
+    }
+
+    const source = new FlumeTimeSource({
+      cron: "* * * * *",
+      statePersister: persister,
+      catchupPolicy: { mode: "missed", maxWindowMs: 15_000 * 60_000 },
+    })
+
+    await source.start(
+      createCtx({ deps: test.deps, onEvent: (e) => events.push(e), onLog: (l) => logs.push(l) }),
+    )
+    await flushPromises()
+
+    expect(logs.some((log) => log.action === "time.catchup.truncated")).toBe(true)
+    expect(events).toHaveLength(10_000)
+
+    expect(tickFiredAt(events[0]!)).toBe(20_001 * 60_000)
+    expect(tickFiredAt(events[events.length - 1]!)).toBe(startMs)
   })
 
   it("statePersister: load error is non-fatal (catchup just skipped)", async () => {

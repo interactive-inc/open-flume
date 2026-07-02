@@ -78,9 +78,10 @@ export class FlumeRunning {
   }
 
   /**
-   * Host が `Flume({ signal })` で渡した AbortSignal をそのまま公開する。
+   * `Flume({ signal })` に渡された AbortSignal をそのまま公開する。
    * 直接の controller を持っていない呼び出し元が `running.signal?.aborted`
-   * で abort 状態を確認できる
+   * で abort 状態を確認できる。`FlumeConfluence` 経由で開かれたグループでは
+   * host の signal ではなく confluence 内部の timeout controller の signal になる点に注意
    */
   get signal(): AbortSignal | undefined {
     return this.props.signal
@@ -100,18 +101,24 @@ export class FlumeRunning {
       )
 
       for (const [index, result] of settled.entries()) {
-        if (result.status === "rejected") {
-          const source = this.props.sources[index]
-          const name = source ? this.sourceName(source) : "?"
-          const error = safeNormalizeError({ value: result.reason })
-          closeErrors.push({ source: name, error })
-          this.props.log.error({
-            action: "flume.close.failed",
-            message: `${name}: ${safeErrorMessage({ error })}`,
-            error,
-            detail: { source: name },
-          })
-        }
+        const source = this.props.sources[index]
+        const name = source ? this.sourceName(source) : "?"
+
+        const error =
+          result.status === "rejected"
+            ? safeNormalizeError({ value: result.reason })
+            : result.value instanceof Error
+              ? result.value
+              : null
+        if (error === null) continue
+
+        closeErrors.push({ source: name, error })
+        this.props.log.error({
+          action: "flume.close.failed",
+          message: `${name}: ${safeErrorMessage({ error })}`,
+          error,
+          detail: { source: name },
+        })
       }
 
       const signal = this.props.signal

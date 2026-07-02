@@ -1,5 +1,6 @@
 import type { FlumeLogHandler, FlumeRuntimeDeps } from "@/types"
 import { FlumeSlackConnectionResponseSchema } from "@/slack/slack-connection-response-schema"
+import { readSlackRetryAfterMs } from "@/slack/read-slack-retry-after-ms"
 import { FlumeConnectionError } from "@/errors/connection-error"
 import { FlumeHttpError } from "@/errors/http-error"
 import { FlumeParseError } from "@/errors/parse-error"
@@ -49,6 +50,21 @@ export async function obtainSlackUrl(
     detail: { status: response.status, url: URL_ENDPOINT },
   })
 
+  const retryAfterMs = readSlackRetryAfterMs({ response })
+
+  if (response.status === 429) {
+    log.warn({
+      action: "http.rate-limited",
+      message: `apps.connections.open: rate limited (429), retry-after ${retryAfterMs ?? "unknown"}ms`,
+      detail: { retryAfterMs },
+    })
+    return new FlumeHttpError({
+      message: "apps.connections.open: rate limited (429)",
+      status: response.status,
+      retryAfterMs,
+    })
+  }
+
   const text = await safeReadText({ response, context: "apps.connections.open" })
   if (text instanceof FlumeHttpError) {
     log.warn({ action: "http.body.read", message: safeErrorMessage({ error: text }), error: text })
@@ -63,6 +79,7 @@ export async function obtainSlackUrl(
       message: `apps.connections.open: invalid JSON body`,
       status: response.status,
       cause: json,
+      retryAfterMs,
     })
   }
 
@@ -85,6 +102,7 @@ export async function obtainSlackUrl(
       message: "apps.connections.open: invalid response shape",
       status: response.status,
       cause: parsed.error,
+      retryAfterMs,
     })
   }
 
@@ -92,10 +110,13 @@ export async function obtainSlackUrl(
     log.warn({
       action: "slack.api.error",
       message: `apps.connections.open failed: ${parsed.data.error ?? "no url"}`,
+      detail: { code: parsed.data.error ?? null },
     })
     return new FlumeHttpError({
       message: `apps.connections.open failed: ${parsed.data.error ?? "no url"}`,
       status: response.status,
+      code: parsed.data.error ?? null,
+      retryAfterMs,
     })
   }
 

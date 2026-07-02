@@ -11,7 +11,12 @@ export class FlumeGitHubSeenCache {
     return this.seen.get(id) === updatedAt
   }
 
+  /**
+   * 既存キーは delete → set で挿入順を末尾へ更新する (LRU)。
+   * これをしないと trim() が「長寿命で更新され続ける thread」から先に追い出す
+   */
   add(id: string, updatedAt: string): void {
+    this.seen.delete(id)
     this.seen.set(id, updatedAt)
   }
 

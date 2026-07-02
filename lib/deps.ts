@@ -6,9 +6,9 @@ type NativeIntervalArg = Parameters<typeof globalThis.clearInterval>[0]
 
 /**
  * `globalThis.WebSocket` の現在の値を返す。
- * 取得は呼び出しごとに行う — `createFlumeDefaultDeps()` がモジュール初期化時ではなく
- * 呼ばれた瞬間の `globalThis.WebSocket` を見るので、jsdom / happy-dom / vitest の
- * `beforeEach` で `globalThis.WebSocket` を差し込むテスト戦略がそのまま機能する。
+ * `createFlumeDefaultDeps()` が返す deps の `WebSocket` は getter でここへ委譲するため、
+ * `new Flume()` 後に `globalThis.WebSocket` を差し込む (jsdom / happy-dom / vitest の
+ * `beforeEach` パッチ) テスト戦略がそのまま機能する — 参照は常にアクセス時点の最新値。
  * `WebSocket` が無い環境 (Node の素の global など) では `null` を返す。
  */
 function resolveCurrentWebSocket(): (new (url: string | URL) => WebSocket) | null {
@@ -32,7 +32,9 @@ function resolveCurrentWebSocket(): (new (url: string | URL) => WebSocket) | nul
 export function createFlumeDefaultDeps(): FlumeRuntimeDeps {
   return {
     fetch: (url, init) => globalThis.fetch(url, init),
-    WebSocket: resolveCurrentWebSocket(),
+    get WebSocket() {
+      return resolveCurrentWebSocket()
+    },
     now: () => Date.now(),
     random: () => Math.random(),
     setTimeout: (fn, ms): FlumeTimerHandle => globalThis.setTimeout(fn, ms),

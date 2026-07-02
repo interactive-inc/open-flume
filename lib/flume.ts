@@ -21,6 +21,7 @@ import { resolveFlumeReconnectConfig } from "@/reconnect-config"
 import { attempt } from "@/utils/attempt"
 import { safeErrorMessage } from "@/utils/safe-error-message"
 import { safeNormalizeError } from "@/utils/safe-normalize-error"
+import { safeNow } from "@/utils/safe-now"
 
 export type FlumeOptions = {
   /** 統合する Source 群 (必須) */
@@ -35,7 +36,12 @@ export type FlumeOptions = {
   onError?: FlumeErrorHandler
   signal?: AbortSignal
   deps?: FlumeRuntimeDeps
-  reconnect?: FlumeReconnectOptions
+  /**
+   * 再接続方針。未指定 / false は無効 (接続断で source は disconnected のまま)。
+   * true は既定値 (maxAttempts: Infinity / baseDelay: 1s / maxDelay: 30s)。
+   * 常駐リスナー用途では明示的に有効化を推奨
+   */
+  reconnect?: boolean | FlumeReconnectOptions
 }
 
 type Failure = {
@@ -47,8 +53,8 @@ type Failure = {
  * 起動前の Flume。`open()` で `FlumeRunning` へ遷移する。
  * コンストラクタは単一オブジェクト `{ sources, ...options }` を受け取る (`sources` のみ必須)。
  * events も全ログも 1 本の firehose (`onEvent` push / `stream()` pull) に流れ、購読側が filter する。
- * いずれかの source 失敗時は既に成功した source を全て `stop()` してロールバックし
- * `FlumeStartError` を返す。
+ * いずれかの source 失敗時は全 source を `stop()` してロールバックし `FlumeStartError` を返す
+ * (失敗した source も半接続状態のリソースを持ち得るため、成功分だけでなく全数を stop する)。
  * `source.start()` / `source.stop()` の sync throw も `Promise.resolve().then` 経由で
  * Promise rejection に正規化して `allSettled` で捕捉する (`open()` は決して reject しない)
  */
@@ -63,17 +69,46 @@ export class Flume {
 
   private readonly sourceEventHandler: FlumeEventHandler
 
-  private readonly hub = new FlumeStreamHub()
+  private readonly hub: FlumeStreamHub
 
   constructor(private readonly options: FlumeOptions) {
-    this.sources = options.sources
+    // 呼び出し側の配列 mutate で start/stop/status の対象集合がズレないよう防御コピー
+    this.sources = [...options.sources]
     this.deps = options.deps ?? createFlumeDefaultDeps()
+    this.hub = new FlumeStreamHub({
+      onDrop: () => this.notifyStreamOverflow(),
+    })
     this.log = new FlumeLogger({
       source: "flume",
       handler: this.buildLogHandler(),
       deps: this.deps,
     })
     this.sourceEventHandler = (event: FlumeEvent) => this.emitItem({ kind: "event", event })
+  }
+
+  /**
+   * stream の buffer 溢れ通知 (stream ごとに初回 1 回)。
+   * firehose (hub) には流さない — 溢れている stream 自身に還流して実イベントを
+   * さらに追い出す自己破壊になるため、push の `onEvent` にだけ warn log として届ける
+   */
+  private notifyStreamOverflow(): void {
+    const onEvent = this.options.onEvent
+    if (!onEvent) return
+
+    const log: FlumeLog = {
+      level: "warn",
+      source: "flume",
+      action: "stream.overflow",
+      message:
+        "stream buffer overflowed, dropping items (notified once per stream; see FlumeStreamOptions.buffer)",
+      timestamp: safeNow({ deps: this.deps }),
+    }
+
+    try {
+      Promise.resolve(onEvent({ kind: "log", log })).catch(() => {})
+    } catch {
+      // 溢れ通知はベストエフォート
+    }
   }
 
   /** source が受信したログを firehose へ流す handler。error は onError にも分岐する */
@@ -94,10 +129,13 @@ export class Flume {
 
   /**
    * firehose の単一 sink: pull の hub と push の onEvent の両方へ item を配る。
+   * close 後の遅延 emit (stop 中の straggler) は push 側にも流さない (pull 側と対称にする)。
    * onEvent への転送は this.log を経由しない (経由すると log item 経路で再帰する) ため
    * 例外をここで握り潰す
    */
   private emitItem(item: FlumeStreamItem): void {
+    if (this.hub.isClosed) return
+
     this.hub.publish(item)
 
     const onEvent = this.options.onEvent
@@ -121,14 +159,13 @@ export class Flume {
       detail: { count: this.sources.length },
     })
 
-    const reconnect = resolveFlumeReconnectConfig(this.options.reconnect)
+    const reconnect = this.resolveReconnect()
 
     const settled = await Promise.allSettled(
       this.sources.map((source) => this.safeStart(source, reconnect)),
     )
 
     const failures: Failure[] = []
-    const started: FlumeSource[] = []
 
     for (const [index, result] of settled.entries()) {
       const source = this.sources[index]
@@ -142,10 +179,7 @@ export class Flume {
 
       if (result.value instanceof Error) {
         failures.push({ name, error: result.value })
-        continue
       }
-
-      started.push(source)
     }
 
     if (failures.length > 0) {
@@ -158,7 +192,7 @@ export class Flume {
         })
       }
 
-      await this.rollback(started)
+      await this.rollback(this.sources)
 
       const detail = failures
         .map((f) => `${f.name}: ${safeErrorMessage({ error: f.error })}`)
@@ -202,6 +236,20 @@ export class Flume {
     return null
   }
 
+  /** reconnect オプションの解決。throwing getter を持つ hostile 入力でも open() を reject させない */
+  private resolveReconnect(): FlumeReconnectConfig | null {
+    const result = attempt(() => resolveFlumeReconnectConfig(this.options.reconnect))
+    if (result instanceof Error) {
+      this.log.warn({
+        action: "reconnect.config.invalid",
+        message: safeErrorMessage({ error: result }),
+        error: result,
+      })
+      return null
+    }
+    return result
+  }
+
   private isSignalAborted(): boolean {
     const signal = this.options.signal
     if (!signal) return false
@@ -237,17 +285,27 @@ export class Flume {
     )
 
     for (const [index, result] of settled.entries()) {
+      const source = sources[index]
+      const name = source ? this.sourceName(source) : "?"
+
       if (result.status === "rejected") {
-        const source = sources[index]
-        const name = source ? this.sourceName(source) : "?"
         const error = safeNormalizeError({ value: result.reason })
-        this.log.error({
-          action: "flume.rollback.failed",
-          message: `${name}: ${safeErrorMessage({ error })}`,
-          error,
-          detail: { source: name },
-        })
+        this.logRollbackFailure(name, error)
+        continue
+      }
+
+      if (result.value instanceof Error) {
+        this.logRollbackFailure(name, result.value)
       }
     }
+  }
+
+  private logRollbackFailure(name: string, error: Error): void {
+    this.log.error({
+      action: "flume.rollback.failed",
+      message: `${name}: ${safeErrorMessage({ error })}`,
+      error,
+      detail: { source: name },
+    })
   }
 }

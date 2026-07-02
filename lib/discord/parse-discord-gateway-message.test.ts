@@ -60,6 +60,27 @@ describe("parseFlumeDiscordGatewayMessage", () => {
     expect(message.d).toBe(false)
   })
 
+  it("frame omitting s and t (bare op-11 ACK) is accepted and normalized to null", () => {
+    const message = parseFlumeDiscordGatewayMessage('{"op":11}')
+
+    expect(message).not.toBeInstanceOf(FlumeParseError)
+    if (message instanceof FlumeParseError) return
+    expect(message.op).toBe(11)
+    expect(message.s).toBe(null)
+    expect(message.t).toBe(null)
+    expect(message.d).toBe(null)
+  })
+
+  it("frame with undefined-producing omissions keeps boolean d intact", () => {
+    const message = parseFlumeDiscordGatewayMessage('{"op":9,"d":false}')
+
+    expect(message).not.toBeInstanceOf(FlumeParseError)
+    if (message instanceof FlumeParseError) return
+    expect(message.d).toBe(false)
+    expect(message.s).toBe(null)
+    expect(message.t).toBe(null)
+  })
+
   it("HEARTBEAT with numeric d (last seq) is accepted", () => {
     const raw = JSON.stringify({ op: 1, d: 42, s: null, t: null })
 

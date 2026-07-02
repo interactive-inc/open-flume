@@ -11,6 +11,8 @@ import { safeErrorMessage } from "@/utils/safe-error-message"
 import { safeNormalizeError } from "@/utils/safe-normalize-error"
 import { safeNow } from "@/utils/safe-now"
 
+const DEFAULT_POLL_INTERVAL_SEC = 60
+
 export class FlumeGitHubSource extends FlumeSource {
   readonly name = "github" as const
 
@@ -25,7 +27,7 @@ export class FlumeGitHubSource extends FlumeSource {
 
     this.poller = new FlumeGitHubPoller({
       token: this.options.token,
-      interval: this.options.pollInterval ?? 60,
+      interval: this.getPollIntervalSec(),
       onLog: ctx.log.handler,
       deps: ctx.deps,
       onNotifications: (notifications) => this.handleNotifications(ctx, notifications),
@@ -51,6 +53,17 @@ export class FlumeGitHubSource extends FlumeSource {
   protected disconnect(): void {
     this.poller?.stop()
     this.poller = null
+  }
+
+  /**
+   * pollInterval が非数値・非有限・0 以下の場合は既定値へフォールバックする
+   */
+  private getPollIntervalSec(): number {
+    const requested = this.options.pollInterval
+    if (typeof requested !== "number") return DEFAULT_POLL_INTERVAL_SEC
+    if (!Number.isFinite(requested)) return DEFAULT_POLL_INTERVAL_SEC
+    if (requested <= 0) return DEFAULT_POLL_INTERVAL_SEC
+    return requested
   }
 
   private handleNotifications(

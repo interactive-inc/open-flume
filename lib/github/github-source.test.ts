@@ -115,6 +115,30 @@ describe("FlumeGitHubSource", () => {
 
     expect(source.status()).toBe("disconnected")
   })
+
+  it("falls back to the default interval when pollInterval is 0", async () => {
+    const test = createMockDeps()
+
+    test.mockFetch.mockResolvedValue(makeJsonResponse([]))
+
+    const source = new FlumeGitHubSource({ token: "ghp_test", pollInterval: 0 })
+
+    await source.start(createCtx({ deps: test.deps }))
+
+    expect(test.deps.setInterval).toHaveBeenCalledWith(expect.any(Function), 60_000)
+  })
+
+  it("falls back to the default interval when pollInterval is not finite", async () => {
+    const test = createMockDeps()
+
+    test.mockFetch.mockResolvedValue(makeJsonResponse([]))
+
+    const source = new FlumeGitHubSource({ token: "ghp_test", pollInterval: Number.NaN })
+
+    await source.start(createCtx({ deps: test.deps }))
+
+    expect(test.deps.setInterval).toHaveBeenCalledWith(expect.any(Function), 60_000)
+  })
 })
 
 describe("flumeExtractGitHubMeta", () => {

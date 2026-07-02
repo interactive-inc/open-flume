@@ -3,6 +3,7 @@ import { FlumeStartError } from "@/errors/start-error"
 import { FlumeStatusEmitter } from "@/source-helpers/flume-status-emitter"
 import { attempt } from "@/utils/attempt"
 import { safeErrorMessage } from "@/utils/safe-error-message"
+import { safeNormalizeError } from "@/utils/safe-normalize-error"
 import { FlumeSerialQueue } from "@/utils/serial-queue"
 
 /**
@@ -11,6 +12,10 @@ import { FlumeSerialQueue } from "@/utils/serial-queue"
  * cross-cutting concern は base が引き受ける。Flume 側で全 source に注入される
  * `FlumeSourceStartContext` (handler / log / deps / onStatus / reconnect) を
  * `start()` で受け取り、subclass の `connect(ctx)` に手渡す。
+ *
+ * `ctx.signal` の購読も base が行う: connect 中に abort されたら `stop()` を発火して
+ * 進行中の接続を中断する (subclass の `disconnect()` が pending な connect を解決する契約)。
+ * connect 完了後の abort は Flume / FlumeRunning が runClose 経由で駆動する。
  *
  * subclass のテンプレート:
  *
@@ -42,36 +47,54 @@ export abstract class FlumeSource {
 
   private statusEmitter: FlumeStatusEmitter | null = null
 
+  private abortHandler: (() => void) | null = null
+
   private readonly queue = new FlumeSerialQueue()
 
   async start(ctx: FlumeSourceStartContext): Promise<Error | null> {
     if (this.consumed) {
       return new FlumeStartError(`${this.name}: already started`)
     }
+    if (this.stopped) {
+      // stop() 済みの source を start すると「二度と stop できない接続」が生まれるため拒否する
+      return new FlumeStartError(`${this.name}: already stopped`)
+    }
     this.consumed = true
 
     this.ctx = ctx
     this.statusEmitter = new FlumeStatusEmitter({ log: ctx.log, onStatus: ctx.onStatus })
 
-    return await this.connect(ctx)
+    if (this.isSignalAborted(ctx)) {
+      return new FlumeStartError(`${this.name}: aborted before connect`)
+    }
+
+    this.attachAbortListener(ctx)
+
+    const result = await attempt(async () => await this.connect(ctx))
+
+    this.detachAbortListener(ctx)
+
+    return result instanceof Error ? safeNormalizeError({ value: result }) : result
   }
 
-  async stop(): Promise<void> {
-    if (this.stopped) return
+  /**
+   * 冪等。`disconnect()` の throw は捕捉して `Error` として返す (公開境界から reject しない)。
+   * Flume.runClose / Flume.rollback は戻り値の Error を `flume.close.failed` /
+   * `flume.rollback.failed` として firehose に流す
+   */
+  async stop(): Promise<Error | null> {
+    if (this.stopped) return null
     this.stopped = true
 
-    // disconnect() の throw は意図的に握らず再 throw する。Flume.runClose /
-    // Flume.rollback は allSettled で吸収して `flume.close.failed` /
-    // `flume.rollback.failed` として firehose に流すので、ここで catch する
-    // と同じ事象が二重ログになる。基底クラスの責務は queue.drain と
-    // statusEmitter の最終化までで、エラー観測は Flume 側に委ねる。
-    try {
+    const disconnectResult = await attempt(async () => {
       await this.disconnect()
-    } finally {
-      await this.queue.drain()
-      this.statusEmitter?.set("disconnected")
-      this.ctx = null
-    }
+    })
+
+    await this.queue.drain()
+    this.statusEmitter?.set("disconnected")
+    this.ctx = null
+
+    return disconnectResult instanceof Error ? disconnectResult : null
   }
 
   status(): FlumeStatus {
@@ -113,6 +136,47 @@ export abstract class FlumeSource {
   /** subclass が start ctx を再参照したい場合 (stop 後は null) */
   protected get context(): FlumeSourceStartContext | null {
     return this.ctx
+  }
+
+  private isSignalAborted(ctx: FlumeSourceStartContext): boolean {
+    const signal = ctx.signal
+    if (!signal) return false
+
+    const result = attempt(() => signal.aborted === true)
+    return result instanceof Error ? true : result
+  }
+
+  private attachAbortListener(ctx: FlumeSourceStartContext): void {
+    const signal = ctx.signal
+    if (!signal) return
+
+    const handler = () => {
+      void attempt(async () => {
+        await this.stop()
+      })
+    }
+
+    const result = attempt(() => signal.addEventListener("abort", handler, { once: true }))
+    if (result instanceof Error) {
+      ctx.log.warn({
+        action: "signal.addListener.failed",
+        message: safeErrorMessage({ error: result }),
+        error: result,
+      })
+      return
+    }
+    this.abortHandler = handler
+  }
+
+  private detachAbortListener(ctx: FlumeSourceStartContext): void {
+    const handler = this.abortHandler
+    if (!handler) return
+    this.abortHandler = null
+
+    const signal = ctx.signal
+    if (!signal) return
+
+    attempt(() => signal.removeEventListener("abort", handler))
   }
 
   /** protocol 接続。subclass 実装 */

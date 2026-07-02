@@ -1,4 +1,5 @@
 import type { FlumeSlackEnvelope, FlumeSlackSourceOptions, FlumeSourceStartContext } from "@/types"
+import { FlumeHttpError } from "@/errors/http-error"
 import { FlumeStartError } from "@/errors/start-error"
 import { FlumeReconnector } from "@/reconnector"
 import { scheduleFlumeReconnect } from "@/schedule-reconnect"
@@ -13,6 +14,17 @@ import { safeNow } from "@/utils/safe-now"
 
 const SEEN_CACHE_MAX = 1024
 const SEEN_CACHE_TTL_MS = 5 * 60 * 1000
+
+/**
+ * `apps.connections.open` が返す恒久エラー。トークンが無効な状態で再接続しても
+ * 回復しないため、reconnect を打ち切って呼び出し側へエラーを返す
+ */
+const TERMINAL_SLACK_ERROR_CODES = new Set([
+  "invalid_auth",
+  "account_inactive",
+  "token_revoked",
+  "not_authed",
+])
 
 export class FlumeSlackSource extends FlumeSource {
   readonly name = "slack" as const
@@ -95,9 +107,12 @@ export class FlumeSlackSource extends FlumeSource {
   private async connectInternal(ctx: FlumeSourceStartContext): Promise<Error | null> {
     this.setStatus("connecting")
 
-    this.socket = new FlumeSlackSocketMode({
+    // close()/disconnect() は this.socket を null 化するため、await 以降と callback 内の
+    // 参照は closure に捕捉したローカル参照で行う (mutable field の null-deref race を避ける)
+    const socket = new FlumeSlackSocketMode({
       appToken: this.options.appToken,
       idleTimeoutMs: this.options.idleTimeoutMs,
+      handshakeTimeoutMs: this.options.handshakeTimeoutMs,
       onLog: ctx.log.handler,
       deps: ctx.deps,
       onMessage: (envelope) => this.handleMessage(ctx, envelope),
@@ -112,7 +127,7 @@ export class FlumeSlackSource extends FlumeSource {
         this.setStatus("connected")
       },
       onDisconnected: () => {
-        if (this.socket?.isStopped) {
+        if (socket.isStopped) {
           this.setStatus("disconnected")
           return
         }
@@ -120,36 +135,65 @@ export class FlumeSlackSource extends FlumeSource {
       },
     })
 
-    const error = await this.socket.connect({ signal: this.internalController?.signal })
+    this.socket = socket
+
+    const error = await socket.connect({ signal: this.internalController?.signal })
 
     if (error instanceof Error) {
       ctx.log.error({ action: "connect.failed", message: safeErrorMessage({ error }), error })
 
-      if (this.socket.isStopped || !this.reconnector || this.reconnector.aborted) {
+      if (this.isTerminalSlackError(error)) {
+        ctx.log.error({
+          action: "reconnect.terminal",
+          message: `permanent Slack API error, not reconnecting: ${safeErrorMessage({ error })}`,
+          error,
+        })
         this.setStatus("disconnected")
         return error
       }
 
-      this.scheduleReconnect(ctx)
+      if (socket.isStopped || !this.reconnector || this.reconnector.aborted) {
+        this.setStatus("disconnected")
+        return error
+      }
+
+      this.scheduleReconnect(ctx, this.minRetryDelayMs(error))
     }
 
     return null
+  }
+
+  private isTerminalSlackError(error: Error): boolean {
+    if (!(error instanceof FlumeHttpError)) return false
+    if (error.code === null) return false
+    return TERMINAL_SLACK_ERROR_CODES.has(error.code)
+  }
+
+  private minRetryDelayMs(error: Error): number | undefined {
+    if (!(error instanceof FlumeHttpError)) return undefined
+    return error.retryAfterMs ?? undefined
   }
 
   private handleMessage(ctx: FlumeSourceStartContext, envelope: FlumeSlackEnvelope): void {
     const seen = this.seen
     if (!seen) return
 
-    if (seen.has(envelope.envelope_id)) {
+    const dedupKey = this.toDedupKey(envelope)
+
+    if (seen.has(dedupKey)) {
       ctx.log.debug({
         action: "dedup.skip",
-        message: `duplicate envelope_id=${envelope.envelope_id}`,
-        detail: { envelope_id: envelope.envelope_id, retry_attempt: envelope.retry_attempt },
+        message: `duplicate key=${dedupKey}`,
+        detail: {
+          dedup_key: dedupKey,
+          envelope_id: envelope.envelope_id,
+          retry_attempt: envelope.retry_attempt,
+        },
       })
       return
     }
 
-    seen.add(envelope.envelope_id)
+    seen.add(dedupKey)
     seen.trim()
 
     this.emit({
@@ -159,6 +203,16 @@ export class FlumeSlackSource extends FlumeSource {
       meta: this.safeExtractMeta(ctx, envelope),
       receivedAt: safeNow({ deps: ctx.deps }),
     })
+  }
+
+  /**
+   * Events API の再配送は envelope_id が変わり得るため、payload.event_id があれば
+   * そちらを重複判定キーとして優先する (再配送をまたいで安定な識別子)
+   */
+  private toDedupKey(envelope: FlumeSlackEnvelope): string {
+    const eventId = envelope.payload.event_id
+    if (typeof eventId === "string" && eventId.length > 0) return eventId
+    return envelope.envelope_id
   }
 
   private safeExtractMeta(
@@ -179,11 +233,12 @@ export class FlumeSlackSource extends FlumeSource {
     return result
   }
 
-  private scheduleReconnect(ctx: FlumeSourceStartContext): void {
+  private scheduleReconnect(ctx: FlumeSourceStartContext, minDelayMs?: number): void {
     scheduleFlumeReconnect({
       reconnector: this.reconnector,
       log: ctx.log,
       setStatus: (status) => this.setStatus(status),
+      minDelayMs,
       retry: () => {
         this.connectInternal(ctx).catch((err: unknown) => {
           const error = safeNormalizeError({ value: err })

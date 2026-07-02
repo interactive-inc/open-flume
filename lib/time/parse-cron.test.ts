@@ -66,4 +66,14 @@ describe("parseCron", () => {
     expect(parseCron("10-5 * * * *")).toBeInstanceOf(FlumeParseError)
     expect(parseCron("a * * * *")).toBeInstanceOf(FlumeParseError)
   })
+
+  it("rejects empty tokens instead of coercing Number('') to 0", () => {
+    expect(parseCron("5, * * * *")).toBeInstanceOf(FlumeParseError)
+    expect(parseCron(",5 * * * *")).toBeInstanceOf(FlumeParseError)
+    expect(parseCron("-5 * * * *")).toBeInstanceOf(FlumeParseError)
+    expect(parseCron("5- * * * *")).toBeInstanceOf(FlumeParseError)
+    expect(parseCron("/5 * * * *")).toBeInstanceOf(FlumeParseError)
+    expect(parseCron("5/ * * * *")).toBeInstanceOf(FlumeParseError)
+    expect(parseCron("5,,6 * * * *")).toBeInstanceOf(FlumeParseError)
+  })
 })

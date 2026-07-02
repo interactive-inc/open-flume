@@ -2,8 +2,16 @@ import { describe, it, expect, vi } from "vitest"
 import { waitFor } from "@/test-utils/wait-for"
 import { FlumeSlackSource } from "@/slack/slack-source"
 import { flumeExtractSlackMeta } from "@/slack/extract-slack-meta"
+import { FlumeHttpError } from "@/errors/http-error"
 import { FlumeLogger } from "@/logger"
-import type { FlumeEvent, FlumeRuntimeDeps, FlumeSourceStartContext, FlumeStatus } from "@/types"
+import type {
+  FlumeEvent,
+  FlumeLog,
+  FlumeLogHandler,
+  FlumeRuntimeDeps,
+  FlumeSourceStartContext,
+  FlumeStatus,
+} from "@/types"
 
 type Listener = (ev: unknown) => void
 
@@ -73,18 +81,28 @@ const createMockFetch = () => {
   })
 }
 
-const createDeps = (): FlumeRuntimeDeps => {
-  return {
+type RecordedTimeout = { fn: () => void; ms: number; cleared: boolean }
+
+// deps.setTimeout は自動発火しない記録式にする。handshake timer / reconnect backoff が
+// 勝手に発火するとテストの制御が効かないため、必要なテストだけ entry.fn() で明示的に発火する
+const createDeps = (): { deps: FlumeRuntimeDeps; timeouts: Array<RecordedTimeout> } => {
+  const timeouts: Array<RecordedTimeout> = []
+
+  const deps: FlumeRuntimeDeps = {
     WebSocket: TrackingMockWebSocket as unknown as new (url: string | URL) => WebSocket,
     fetch: createMockFetch(),
     now: () => 1000,
     random: () => 0.5,
-    setTimeout: vi.fn((fn: () => void, _ms: number) => {
-      return globalThis.setTimeout(fn, 0)
-    }),
-    clearTimeout: vi.fn((id) => {
-      globalThis.clearTimeout(id)
-    }),
+    setTimeout: (fn: () => void, ms: number) => {
+      const entry: RecordedTimeout = { fn, ms, cleared: false }
+      timeouts.push(entry)
+      return entry
+    },
+    clearTimeout: (id) => {
+      for (const entry of timeouts) {
+        if (entry === id) entry.cleared = true
+      }
+    },
     setInterval: vi.fn((fn: () => void, ms: number) => {
       return globalThis.setInterval(fn, ms)
     }),
@@ -92,18 +110,21 @@ const createDeps = (): FlumeRuntimeDeps => {
       globalThis.clearInterval(id)
     }),
   }
+
+  return { deps, timeouts }
 }
 
 type CtxProps = {
   deps: FlumeRuntimeDeps
   onEvent?: (event: FlumeEvent) => void
   onStatus?: (status: FlumeStatus, detail?: string) => void
+  onLog?: FlumeLogHandler
   reconnect?: FlumeSourceStartContext["reconnect"]
 }
 
 const createCtx = (props: CtxProps): FlumeSourceStartContext => ({
   onEvent: props.onEvent ?? (() => {}),
-  log: new FlumeLogger({ source: "slack", deps: props.deps }),
+  log: new FlumeLogger({ source: "slack", deps: props.deps, handler: props.onLog }),
   deps: props.deps,
   onStatus: props.onStatus ?? (() => {}),
   reconnect: props.reconnect ?? null,
@@ -113,12 +134,12 @@ describe("FlumeSlackSource", () => {
   it("start() connects and forwards events to onEvent", async () => {
     TrackingMockWebSocket.latest = null
     const receivedEvents: Array<FlumeEvent> = []
-    const deps = createDeps()
+    const bundle = createDeps()
 
     const source = new FlumeSlackSource({ appToken: "xapp-test", botToken: "xoxb-test" })
 
     const startPromise = source.start(
-      createCtx({ deps, onEvent: (event) => receivedEvents.push(event) }),
+      createCtx({ deps: bundle.deps, onEvent: (event) => receivedEvents.push(event) }),
     )
 
     await waitFor(() => {
@@ -149,10 +170,12 @@ describe("FlumeSlackSource", () => {
   it("stop() disconnects and sets status to disconnected", async () => {
     TrackingMockWebSocket.latest = null
     const statuses: Array<FlumeStatus> = []
-    const deps = createDeps()
+    const bundle = createDeps()
 
     const source = new FlumeSlackSource({ appToken: "xapp-test", botToken: "xoxb-test" })
-    const startPromise = source.start(createCtx({ deps, onStatus: (s) => statuses.push(s) }))
+    const startPromise = source.start(
+      createCtx({ deps: bundle.deps, onStatus: (s) => statuses.push(s) }),
+    )
 
     await waitFor(() => {
       expect(TrackingMockWebSocket.latest).not.toBeNull()
@@ -179,13 +202,13 @@ describe("FlumeSlackSource", () => {
     let nowMs = 1_000_000
     const intervalCallbacks: Array<() => void> = []
     const statuses: Array<FlumeStatus> = []
-    const deps = createDeps()
-    deps.now = () => nowMs
-    deps.setInterval = ((fn: () => void) => {
+    const bundle = createDeps()
+    bundle.deps.now = () => nowMs
+    bundle.deps.setInterval = ((fn: () => void) => {
       intervalCallbacks.push(fn)
       return intervalCallbacks.length
-    }) as unknown as typeof deps.setInterval
-    deps.clearInterval = vi.fn()
+    }) as unknown as typeof bundle.deps.setInterval
+    bundle.deps.clearInterval = vi.fn()
 
     const source = new FlumeSlackSource({
       appToken: "xapp-test",
@@ -194,7 +217,7 @@ describe("FlumeSlackSource", () => {
     })
     const startPromise = source.start(
       createCtx({
-        deps,
+        deps: bundle.deps,
         onStatus: (status) => statuses.push(status),
         reconnect: { maxAttempts: 1, baseDelay: 1_000, maxDelay: 1_000 },
       }),
@@ -212,6 +235,152 @@ describe("FlumeSlackSource", () => {
     intervalCallbacks[0]!()
 
     expect(statuses).toContain("reconnecting")
+  })
+
+  it("treats invalid_auth as terminal: start() fails and no reconnect is scheduled", async () => {
+    TrackingMockWebSocket.latest = null
+    const statuses: Array<FlumeStatus> = []
+    const logs: Array<FlumeLog> = []
+    const bundle = createDeps()
+    bundle.deps.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: () => Promise.resolve(JSON.stringify({ ok: false, error: "invalid_auth" })),
+    })
+
+    const source = new FlumeSlackSource({ appToken: "xapp-bad", botToken: "xoxb-test" })
+    const result = await source.start(
+      createCtx({
+        deps: bundle.deps,
+        onStatus: (status) => statuses.push(status),
+        onLog: (log) => logs.push(log),
+        reconnect: { maxAttempts: 5, baseDelay: 10, maxDelay: 100 },
+      }),
+    )
+
+    expect(result).toBeInstanceOf(FlumeHttpError)
+    if (result instanceof FlumeHttpError) {
+      expect(result.code).toBe("invalid_auth")
+    }
+    expect(statuses).toContain("disconnected")
+    expect(statuses).not.toContain("reconnecting")
+    expect(logs.some((log) => log.action === "reconnect.terminal")).toBe(true)
+    expect(logs.some((log) => log.action === "reconnect.scheduled")).toBe(false)
+    expect(bundle.timeouts).toHaveLength(0)
+  })
+
+  it("respects 429 Retry-After as the reconnect backoff floor", async () => {
+    TrackingMockWebSocket.latest = null
+    const logs: Array<FlumeLog> = []
+    const bundle = createDeps()
+    bundle.deps.fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 429,
+      headers: {
+        get: (name: string) => (name.toLowerCase() === "retry-after" ? "7" : null),
+      },
+      text: () => Promise.resolve(JSON.stringify({ ok: false, error: "ratelimited" })),
+    })
+
+    const source = new FlumeSlackSource({ appToken: "xapp-test", botToken: "xoxb-test" })
+    const result = await source.start(
+      createCtx({
+        deps: bundle.deps,
+        onLog: (log) => logs.push(log),
+        reconnect: { maxAttempts: 3, baseDelay: 10, maxDelay: 50 },
+      }),
+    )
+
+    expect(result).toBeNull()
+
+    const scheduled = logs.find((log) => log.action === "reconnect.scheduled")
+    expect(scheduled).toBeDefined()
+    expect(Number(scheduled!.detail!.delayMs)).toBeGreaterThanOrEqual(7_000)
+
+    const pendingTimer = bundle.timeouts.find((entry) => !entry.cleared)
+    expect(pendingTimer).toBeDefined()
+    expect(pendingTimer!.ms).toBeGreaterThanOrEqual(7_000)
+  })
+
+  it("dedups Events API redeliveries by payload.event_id across envelope_ids", async () => {
+    TrackingMockWebSocket.latest = null
+    const receivedEvents: Array<FlumeEvent> = []
+    const bundle = createDeps()
+
+    const source = new FlumeSlackSource({ appToken: "xapp-test", botToken: "xoxb-test" })
+    const startPromise = source.start(
+      createCtx({ deps: bundle.deps, onEvent: (event) => receivedEvents.push(event) }),
+    )
+
+    await waitFor(() => {
+      expect(TrackingMockWebSocket.latest).not.toBeNull()
+    })
+
+    const ws = TrackingMockWebSocket.latest!
+    ws.simulateMessage(JSON.stringify({ type: "hello" }))
+    await startPromise
+
+    ws.simulateMessage(
+      JSON.stringify({
+        envelope_id: "env-1",
+        type: "events_api",
+        payload: { event_id: "Ev123", event: { type: "message" } },
+      }),
+    )
+    // Slack の再配送: envelope_id は変わるが event_id は同一
+    ws.simulateMessage(
+      JSON.stringify({
+        envelope_id: "env-2",
+        type: "events_api",
+        payload: { event_id: "Ev123", event: { type: "message" } },
+        retry_attempt: 1,
+      }),
+    )
+    ws.simulateMessage(
+      JSON.stringify({
+        envelope_id: "env-3",
+        type: "events_api",
+        payload: { event_id: "Ev456", event: { type: "message" } },
+      }),
+    )
+
+    await waitFor(() => {
+      expect(receivedEvents.length).toBe(2)
+    })
+
+    expect(receivedEvents.length).toBe(2)
+  })
+
+  it("falls back to envelope_id dedup when payload has no event_id", async () => {
+    TrackingMockWebSocket.latest = null
+    const receivedEvents: Array<FlumeEvent> = []
+    const bundle = createDeps()
+
+    const source = new FlumeSlackSource({ appToken: "xapp-test", botToken: "xoxb-test" })
+    const startPromise = source.start(
+      createCtx({ deps: bundle.deps, onEvent: (event) => receivedEvents.push(event) }),
+    )
+
+    await waitFor(() => {
+      expect(TrackingMockWebSocket.latest).not.toBeNull()
+    })
+
+    const ws = TrackingMockWebSocket.latest!
+    ws.simulateMessage(JSON.stringify({ type: "hello" }))
+    await startPromise
+
+    const envelope = { envelope_id: "env-9", type: "slash_commands", payload: {} }
+    ws.simulateMessage(JSON.stringify(envelope))
+    ws.simulateMessage(JSON.stringify(envelope))
+    ws.simulateMessage(
+      JSON.stringify({ envelope_id: "env-10", type: "slash_commands", payload: {} }),
+    )
+
+    await waitFor(() => {
+      expect(receivedEvents.length).toBe(2)
+    })
+
+    expect(receivedEvents.length).toBe(2)
   })
 })
 

@@ -89,6 +89,46 @@ describe("FlumeSerialQueue", () => {
     expect(queue.isCancelled()).toBe(true)
   })
 
+  it("cancel() skips already-queued tasks and depth settles at 0", async () => {
+    const queue = new FlumeSerialQueue()
+    const executed: number[] = []
+    let release: () => void = () => {}
+    const blocker = new Promise<void>((r) => {
+      release = r
+    })
+
+    queue.add(() => blocker)
+    queue.add(async () => {
+      executed.push(2)
+    })
+    queue.add(async () => {
+      executed.push(3)
+    })
+
+    queue.cancel()
+    release()
+    await queue.drain()
+
+    expect(executed).toEqual([])
+    expect(queue.size()).toBe(0)
+  })
+
+  it("drain() waits for tasks added while draining", async () => {
+    const queue = new FlumeSerialQueue()
+    const executed: number[] = []
+
+    queue.add(async () => {
+      executed.push(1)
+      queue.add(async () => {
+        executed.push(2)
+      })
+    })
+
+    await queue.drain()
+
+    expect(executed).toEqual([1, 2])
+  })
+
   it("size() decreases as tasks complete", async () => {
     const queue = new FlumeSerialQueue()
     let release: () => void = () => {}

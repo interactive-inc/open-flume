@@ -24,6 +24,10 @@ type Deps = Pick<
 type Props = {
   token: string
   intents: number
+  /** WebSocket 生成から READY/RESUMED までの上限 (ms)。非有限・0 以下は既定 30_000 に丸める */
+  handshakeTimeoutMs?: number
+  /** 前回接続から引き継ぐ session。`canResume()` なら HELLO 後に IDENTIFY でなく RESUME を送る */
+  session?: FlumeDiscordGatewaySession
   onDispatch: (event: string, data: Record<string, unknown>) => void
   onStatus: (status: "connected" | "disconnected") => void
   onLog?: FlumeLogHandler
@@ -31,6 +35,15 @@ type Props = {
 }
 
 const GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json"
+
+const GATEWAY_VERSION = "10"
+
+const GATEWAY_ENCODING = "json"
+
+const DEFAULT_HANDSHAKE_TIMEOUT_MS = 30_000
+
+// 強制 close (zombie / handshake timeout) 後、close event が届かない場合に teardown を合成するまでの猶予
+const FORCED_CLOSE_FALLBACK_MS = 5_000
 
 const OP_DISPATCH = 0
 const OP_HEARTBEAT = 1
@@ -66,10 +79,18 @@ const TERMINAL_CLOSE_CODES = new Set<number>([
   4014, // Disallowed intents
 ])
 
+// session が無効化される close code。次の接続は RESUME せず IDENTIFY し直す
+const NON_RESUMABLE_CLOSE_CODES = new Set<number>([
+  4007, // Invalid seq
+  4009, // Session timed out
+])
+
 /**
  * Discord Gateway v10 の最小実装。HELLO -> IDENTIFY/RESUME -> READY/RESUMED -> dispatch を扱う。
  * READY 後の WebSocket 切断のみ `onStatus("disconnected")` を発火し source 側で再接続する。
  * 終端 close code (4004 / 401x) を受けた場合は stopped 化して再接続を抑止。
+ * close code 4007/4009 と INVALID_SESSION (resumable=false) では session を破棄する
+ * (source が次の gateway へ session を引き継ぐ前にここでリセットしておく)。
  * IO 境界は全て `attempt` 経由で扱い、コンストラクタ throw も `FlumeConnectionError` として返す
  * (`connect()` は決して reject しない)
  */
@@ -80,7 +101,7 @@ export class FlumeDiscordGateway {
 
   private heartbeat: FlumeDiscordHeartbeat | null = null
 
-  private currentSession = FlumeDiscordGatewaySession.empty()
+  private currentSession: FlumeDiscordGatewaySession
 
   private isStoppedFlag = false
 
@@ -92,7 +113,14 @@ export class FlumeDiscordGateway {
 
   private invalidSessionTimer: FlumeTimerHandle | null = null
 
+  private handshakeTimer: FlumeTimerHandle | null = null
+
+  private forcedCloseFallbackTimer: FlumeTimerHandle | null = null
+
+  private teardownDone = false
+
   constructor(private readonly props: Props) {
+    this.currentSession = props.session ?? FlumeDiscordGatewaySession.empty()
     this.log = new FlumeLogger({
       source: "discord.gateway",
       handler: props.onLog,
@@ -116,12 +144,13 @@ export class FlumeDiscordGateway {
       return Promise.resolve(error)
     }
 
-    const target = url ?? GATEWAY_URL
+    const target = this.resolveTargetUrl(url)
     const hostResult = attempt(() => new URL(target).hostname)
     const host = hostResult instanceof Error ? "unknown" : hostResult
     this.log.info({ action: "connect.start", message: `host=${host}` })
     this.pendingResolved = false
     this.hasConnected = false
+    this.teardownDone = false
 
     return new Promise<FlumeConnectionError | null>((resolve) => {
       this.pendingResolve = resolve
@@ -156,10 +185,14 @@ export class FlumeDiscordGateway {
           { cause: listenerResult },
         )
         this.log.error({ action: "ws.listener.error", message: safeErrorMessage({ error }), error })
+        this.closeSocket({ ws: socket })
         this.ws = null
         this.pendingResolved = true
         resolve(error)
+        return
       }
+
+      this.armHandshakeTimer()
     })
   }
 
@@ -168,6 +201,10 @@ export class FlumeDiscordGateway {
     this.isStoppedFlag = true
     this.heartbeat?.stop()
     this.clearInvalidSessionTimer()
+    this.clearForcedCloseFallbackTimer()
+
+    // close event が来ない socket でも pending な connect() を確実に解放する
+    this.completeConnect(new FlumeConnectionError("gateway disconnected before ready"))
 
     this.closeSocket({ ws: this.ws, code: 1000, reason: "shutdown" })
     this.ws = null
@@ -177,7 +214,171 @@ export class FlumeDiscordGateway {
     return this.ws !== null && this.ws.readyState === WS_OPEN
   }
 
+  /**
+   * resume 時は Discord の `resume_gateway_url` に query (?v=10&encoding=json) を付与する
+   * (Discord が返す URL に query は付かない)。URL が壊れている場合は session を破棄して
+   * 通常の Gateway URL で IDENTIFY し直す
+   */
+  private resolveTargetUrl(url?: string): string {
+    if (url === undefined) return GATEWAY_URL
+
+    const rebuilt = attempt(() => {
+      const parsed = new URL(url)
+      parsed.searchParams.set("v", GATEWAY_VERSION)
+      parsed.searchParams.set("encoding", GATEWAY_ENCODING)
+      return parsed.toString()
+    })
+    if (rebuilt instanceof Error) {
+      this.log.warn({
+        action: "resume.url.invalid",
+        message: `resume url unparseable, dropping session and identifying fresh: ${safeErrorMessage({ error: rebuilt })}`,
+      })
+      this.currentSession = this.currentSession.withReset()
+      return GATEWAY_URL
+    }
+    return rebuilt
+  }
+
+  private resolveHandshakeTimeoutMs(): number {
+    const configured = this.props.handshakeTimeoutMs
+    if (typeof configured !== "number" || !Number.isFinite(configured) || configured <= 0) {
+      return DEFAULT_HANDSHAKE_TIMEOUT_MS
+    }
+    return configured
+  }
+
+  private armHandshakeTimer(): void {
+    this.clearHandshakeTimer()
+
+    const timeoutMs = this.resolveHandshakeTimeoutMs()
+    const timerResult = attempt(() =>
+      this.props.deps.setTimeout(() => {
+        this.handshakeTimer = null
+        this.onHandshakeTimeout(timeoutMs)
+      }, timeoutMs),
+    )
+    if (timerResult instanceof Error) {
+      this.log.error({
+        action: "handshake.timer.schedule.error",
+        message: safeErrorMessage({ error: timerResult }),
+        error: timerResult,
+      })
+      this.handshakeTimer = null
+      return
+    }
+    this.handshakeTimer = timerResult
+  }
+
+  private clearHandshakeTimer(): void {
+    if (this.handshakeTimer === null) return
+
+    const handle = this.handshakeTimer
+    const result = attempt(() => this.props.deps.clearTimeout(handle))
+    if (result instanceof Error) {
+      this.log.error({
+        action: "handshake.timer.clear.error",
+        message: safeErrorMessage({ error: result }),
+        error: result,
+      })
+    }
+    this.handshakeTimer = null
+  }
+
+  /**
+   * READY/RESUMED が期限内に来なかった half-open socket。connect() を Error で解放して
+   * source の再接続経路に乗せ、socket は強制 close する (close event が来なければ
+   * fallback が teardown を合成する)
+   */
+  private onHandshakeTimeout(timeoutMs: number): void {
+    if (this.pendingResolved) return
+
+    const error = new FlumeConnectionError(
+      `handshake timeout after ${timeoutMs}ms (no READY/RESUMED)`,
+    )
+    this.log.error({ action: "handshake.timeout", message: safeErrorMessage({ error }), error })
+    this.completeConnect(error)
+    this.forceClose({ code: 4000, reason: "handshake timeout" })
+  }
+
+  /**
+   * zombie / handshake timeout / malformed HELLO で自発的に接続を落とす。死んだ TCP 経路では
+   * close event が届かないことがあるため fallback timer で teardown を保証する。heartbeat は
+   * 即座に止めて onZombie が interval ごとに再発火するのを防ぐ。close code は resume 可能な
+   * 4000 を使う (4009 は session 無効化コードと衝突する)
+   */
+  private forceClose(input: { code: number; reason: string }): void {
+    this.heartbeat?.stop()
+    this.closeSocket({ ws: this.ws, code: input.code, reason: input.reason })
+    this.armForcedCloseFallback()
+  }
+
+  private armForcedCloseFallback(): void {
+    if (this.teardownDone) return
+    if (this.forcedCloseFallbackTimer !== null) return
+
+    const timerResult = attempt(() =>
+      this.props.deps.setTimeout(() => {
+        this.forcedCloseFallbackTimer = null
+        this.synthesizeTeardown()
+      }, FORCED_CLOSE_FALLBACK_MS),
+    )
+    if (timerResult instanceof Error) {
+      this.log.error({
+        action: "ws.close.fallback.schedule.error",
+        message: safeErrorMessage({ error: timerResult }),
+        error: timerResult,
+      })
+      this.forcedCloseFallbackTimer = null
+      return
+    }
+    this.forcedCloseFallbackTimer = timerResult
+  }
+
+  private clearForcedCloseFallbackTimer(): void {
+    if (this.forcedCloseFallbackTimer === null) return
+
+    const handle = this.forcedCloseFallbackTimer
+    const result = attempt(() => this.props.deps.clearTimeout(handle))
+    if (result instanceof Error) {
+      this.log.error({
+        action: "ws.close.fallback.clear.error",
+        message: safeErrorMessage({ error: result }),
+        error: result,
+      })
+    }
+    this.forcedCloseFallbackTimer = null
+  }
+
+  /**
+   * 強制 close 後に close event が届かなかった場合の合成 teardown。`onClose` と排他で
+   * 一度だけ実行する。READY 後なら `onStatus("disconnected")` で source の再接続に繋ぐ
+   * (READY 前は connect() の Error 解決が既に再接続を駆動しているため通知しない)
+   */
+  private synthesizeTeardown(): void {
+    if (this.teardownDone) return
+    this.teardownDone = true
+
+    this.log.warn({
+      action: "ws.close.synthesized",
+      message: "close event not received after forced close, synthesizing teardown",
+    })
+
+    this.ws = null
+    this.heartbeat?.stop()
+    this.clearInvalidSessionTimer()
+
+    if (!this.pendingResolved) {
+      this.completeConnect(new FlumeConnectionError("WebSocket force-closed (no close event)"))
+    }
+
+    if (this.hasConnected && !this.isStoppedFlag) {
+      this.props.onStatus("disconnected")
+    }
+  }
+
   private completeConnect(error: FlumeConnectionError | null): void {
+    this.clearHandshakeTimer()
+
     if (this.pendingResolved || !this.pendingResolve) return
     this.pendingResolved = true
     this.pendingResolve(error)
@@ -237,7 +438,7 @@ export class FlumeDiscordGateway {
       detail: { op: parsed.op, t: parsed.t, s: parsed.s, length: raw.length },
     })
 
-    if (parsed.s !== null) {
+    if (typeof parsed.s === "number") {
       this.currentSession = this.currentSession.withSeq(parsed.s)
     }
 
@@ -257,7 +458,25 @@ export class FlumeDiscordGateway {
 
   private onHello(msg: FlumeGatewayMessage): void {
     const d = isRecord(msg.d) ? msg.d : null
-    const interval = d && typeof d.heartbeat_interval === "number" ? d.heartbeat_interval : 0
+    const rawInterval = d === null ? null : d.heartbeat_interval
+
+    if (typeof rawInterval !== "number" || !Number.isFinite(rawInterval) || rawInterval <= 0) {
+      // interval 0 のまま setInterval すると heartbeat flood になるためプロトコルエラー扱い
+      const error = new FlumeConnectionError(
+        "malformed HELLO: heartbeat_interval is not a finite number > 0",
+      )
+      this.log.error({
+        action: "gateway.hello.invalid",
+        message: safeErrorMessage({ error }),
+        error,
+        detail: { intervalType: typeof rawInterval },
+      })
+      this.completeConnect(error)
+      this.forceClose({ code: 4000, reason: "malformed HELLO" })
+      return
+    }
+
+    const interval = rawInterval
     this.log.info({
       action: "gateway.hello",
       message: `heartbeat_interval=${interval}ms`,
@@ -277,7 +496,7 @@ export class FlumeDiscordGateway {
           action: "heartbeat.zombie",
           message: "no ACK received, closing connection",
         })
-        this.closeSocket({ ws: this.ws, code: 4009, reason: "zombie connection" })
+        this.forceClose({ code: 4000, reason: "zombie connection" })
       },
     })
 
@@ -374,6 +593,19 @@ export class FlumeDiscordGateway {
   }
 
   private onClose(ev: CloseEvent): void {
+    this.clearForcedCloseFallbackTimer()
+
+    if (this.teardownDone) {
+      // fallback が teardown を合成済み。遅れて届いた close は二重通知になるため無視する
+      this.log.debug({
+        action: "ws.close.stale",
+        message: `ignored close after synthesized teardown (code=${ev.code})`,
+        detail: { code: ev.code },
+      })
+      return
+    }
+    this.teardownDone = true
+
     const terminal = TERMINAL_CLOSE_CODES.has(ev.code)
     this.log.info({
       action: "ws.close",
@@ -384,6 +616,16 @@ export class FlumeDiscordGateway {
     this.ws = null
     this.heartbeat?.stop()
     this.clearInvalidSessionTimer()
+
+    if (NON_RESUMABLE_CLOSE_CODES.has(ev.code)) {
+      // onStatus より前に破棄する: source はこの後の disconnected 通知で session を捕捉する
+      this.log.info({
+        action: "session.reset",
+        message: `close code ${ev.code} invalidates session, next attempt will identify`,
+        detail: { code: ev.code },
+      })
+      this.currentSession = this.currentSession.withReset()
+    }
 
     if (terminal) {
       this.isStoppedFlag = true

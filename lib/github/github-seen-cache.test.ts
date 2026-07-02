@@ -47,4 +47,19 @@ describe("FlumeGitHubSeenCache", () => {
 
     expect(cache.size).toBe(2)
   })
+
+  it("re-adding an existing id refreshes recency so trim evicts the stalest entry (LRU)", () => {
+    const cache = new FlumeGitHubSeenCache({ maxSize: 2 })
+
+    cache.add("id-1", "2024-01-01")
+    cache.add("id-2", "2024-01-02")
+    cache.add("id-1", "2024-01-03")
+    cache.add("id-3", "2024-01-04")
+    cache.trim()
+
+    expect(cache.size).toBe(2)
+    expect(cache.has("id-2", "2024-01-02")).toBe(false)
+    expect(cache.has("id-1", "2024-01-03")).toBe(true)
+    expect(cache.has("id-3", "2024-01-04")).toBe(true)
+  })
 })

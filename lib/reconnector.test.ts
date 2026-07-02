@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest"
 import { FlumeLogger } from "@/logger"
-import { FlumeReconnector } from "@/reconnector"
+import { FlumeReconnector, type FlumeReconnectSchedule } from "@/reconnector"
 
 const createDeps = () => ({
   setTimeout: vi.fn(() => 42),
@@ -27,13 +27,19 @@ const createReconnector = (
   return { reconnector, deps }
 }
 
+const delayOf = (schedule: FlumeReconnectSchedule): number => {
+  if (schedule.kind !== "scheduled") throw new Error(`expected scheduled, got ${schedule.kind}`)
+  return schedule.delayMs
+}
+
 describe("FlumeReconnector", () => {
   it("schedule calls setTimeout with jittered delay", () => {
     const { reconnector, deps } = createReconnector()
     const fn = vi.fn()
 
-    const delay = reconnector.schedule(fn)
+    const schedule = reconnector.schedule(fn)
 
+    const delay = delayOf(schedule)
     expect(deps.setTimeout).toHaveBeenCalledWith(expect.any(Function), delay)
     expect(delay).toBe(1000 * (0.5 + 0.5 * 0.5))
   })
@@ -65,21 +71,21 @@ describe("FlumeReconnector", () => {
     expect(deps.clearTimeout).toHaveBeenCalled()
   })
 
-  it("schedule after cancel returns 0", () => {
+  it("schedule after cancel returns refused", () => {
     const { reconnector } = createReconnector()
 
     reconnector.cancel()
-    const delay = reconnector.schedule(vi.fn())
+    const schedule = reconnector.schedule(vi.fn())
 
-    expect(delay).toBe(0)
+    expect(schedule.kind).toBe("refused")
   })
 
-  it("schedule when attempt >= maxAttempts returns -1", () => {
+  it("schedule when attempt >= maxAttempts returns exhausted", () => {
     const { reconnector } = createReconnector({ maxAttempts: 0 })
 
-    const delay = reconnector.schedule(vi.fn())
+    const schedule = reconnector.schedule(vi.fn())
 
-    expect(delay).toBe(-1)
+    expect(schedule.kind).toBe("exhausted")
   })
 
   it("schedule clears the previous pending timer before scheduling another", () => {
@@ -91,12 +97,12 @@ describe("FlumeReconnector", () => {
     expect(deps.clearTimeout).toHaveBeenCalledTimes(1)
   })
 
-  it("returns -1 once attempts hit the limit even after successful schedules", () => {
+  it("returns exhausted once attempts hit the limit even after successful schedules", () => {
     const { reconnector } = createReconnector({ maxAttempts: 2 })
 
-    expect(reconnector.schedule(vi.fn())).toBeGreaterThan(0)
-    expect(reconnector.schedule(vi.fn())).toBeGreaterThan(0)
-    expect(reconnector.schedule(vi.fn())).toBe(-1)
+    expect(reconnector.schedule(vi.fn()).kind).toBe("scheduled")
+    expect(reconnector.schedule(vi.fn()).kind).toBe("scheduled")
+    expect(reconnector.schedule(vi.fn()).kind).toBe("exhausted")
   })
 
   it("cancel after exhaustion is a no-op (aborted true, no extra clear)", () => {
@@ -148,9 +154,9 @@ describe("FlumeReconnector", () => {
       deps: { setTimeout: throwingSetTimeout, clearTimeout: vi.fn(), random: () => 0.5 },
     })
 
-    const result = reconnector.schedule(vi.fn())
+    const schedule = reconnector.schedule(vi.fn())
 
-    expect(result).toBe(0)
+    expect(schedule.kind).toBe("refused")
     expect(reconnector.attempt).toBe(0)
   })
 
@@ -170,10 +176,75 @@ describe("FlumeReconnector", () => {
 
     reconnector.schedule(vi.fn())
     shouldThrow = false
-    const delay = reconnector.schedule(vi.fn())
+    const schedule = reconnector.schedule(vi.fn())
 
     // 失敗で attempt が進んでいないので、再試行も attempt 0 の delay (baseDelay 基準) になる
-    expect(delay).toBe(1000 * (0.5 + 0.5 * 0.5))
+    expect(delayOf(schedule)).toBe(1000 * (0.5 + 0.5 * 0.5))
     expect(reconnector.attempt).toBe(1)
+  })
+
+  it("applies minDelayMs as a floor over the computed backoff", () => {
+    const { reconnector } = createReconnector({ baseDelay: 1000 })
+
+    const schedule = reconnector.schedule(vi.fn(), { minDelayMs: 5000 })
+
+    expect(delayOf(schedule)).toBe(5000)
+  })
+
+  it("stale timer callback is ignored after cancel even if clearTimeout failed", () => {
+    let captured = (): void => {}
+    const setTimeoutMock = vi.fn((fn: () => void, _ms: number) => {
+      captured = fn
+      return 1
+    })
+    const throwingClearTimeout = vi.fn(() => {
+      throw new Error("clear rejected")
+    })
+    const reconnector = new FlumeReconnector({
+      maxAttempts: 5,
+      baseDelay: 100,
+      maxDelay: 1000,
+      log: createLog(),
+      deps: { setTimeout: setTimeoutMock, clearTimeout: throwingClearTimeout, random: () => 0.5 },
+    })
+
+    const fn = vi.fn()
+    reconnector.schedule(fn)
+    reconnector.cancel()
+    captured()
+
+    expect(fn).not.toHaveBeenCalled()
+  })
+
+  it("stale timer callback is ignored after re-schedule even if clearTimeout failed", () => {
+    const capturedFns: Array<() => void> = []
+    const setTimeoutMock = vi.fn((fn: () => void, _ms: number) => {
+      capturedFns.push(fn)
+      return capturedFns.length
+    })
+    const throwingClearTimeout = vi.fn(() => {
+      throw new Error("clear rejected")
+    })
+    const reconnector = new FlumeReconnector({
+      maxAttempts: 5,
+      baseDelay: 100,
+      maxDelay: 1000,
+      log: createLog(),
+      deps: { setTimeout: setTimeoutMock, clearTimeout: throwingClearTimeout, random: () => 0.5 },
+    })
+
+    const staleFn = vi.fn()
+    const freshFn = vi.fn()
+    reconnector.schedule(staleFn)
+    reconnector.schedule(freshFn)
+
+    const stale = capturedFns[0]
+    const fresh = capturedFns[1]
+    if (!stale || !fresh) throw new Error("expected two captured timers")
+    stale()
+    fresh()
+
+    expect(staleFn).not.toHaveBeenCalled()
+    expect(freshFn).toHaveBeenCalled()
   })
 })

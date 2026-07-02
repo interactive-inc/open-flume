@@ -2,7 +2,9 @@ import { FlumeParseError } from "@/errors/parse-error"
 
 /**
  * 単一 cron フィールド (minute など) の spec を許可値の Set に展開する。
- * 対応: `*` / `* /n` / `a` / `a-b` / `a-b/n` とそれらのカンマ区切り。名前 (JAN, MON) は非対応
+ * 対応: `*` / `* /n` / `a` / `a-b` / `a-b/n` とそれらのカンマ区切り。名前 (JAN, MON) は非対応。
+ * 空トークン (`"5,"` / `"-5"` / `"/5"` など) は `Number("") === 0` の暗黙変換で
+ * 0 に化けるため、数値が期待される位置の空文字列は明示的に拒否する
  */
 export function parseCronField(
   spec: string,
@@ -12,6 +14,8 @@ export function parseCronField(
   const values = new Set<number>()
 
   for (const part of spec.split(",")) {
+    if (part === "") return new FlumeParseError(`empty cron list segment: "${spec}"`)
+
     const expanded = expandCronPart(part, min, max)
     if (expanded instanceof FlumeParseError) return expanded
 
@@ -23,17 +27,15 @@ export function parseCronField(
 }
 
 function expandCronPart(part: string, min: number, max: number): number[] | FlumeParseError {
-  let range = part
-  let step = 1
-
   const slash = part.indexOf("/")
-  if (slash !== -1) {
-    range = part.slice(0, slash)
-    const parsed = Number(part.slice(slash + 1))
-    if (!Number.isInteger(parsed) || parsed <= 0) {
-      return new FlumeParseError(`invalid cron step: "${part}"`)
-    }
-    step = parsed
+  const range = slash === -1 ? part : part.slice(0, slash)
+  const stepToken = slash === -1 ? null : part.slice(slash + 1)
+
+  if (stepToken === "") return new FlumeParseError(`invalid cron step: "${part}"`)
+
+  const step = stepToken === null ? 1 : Number(stepToken)
+  if (!Number.isInteger(step) || step <= 0) {
+    return new FlumeParseError(`invalid cron step: "${part}"`)
   }
 
   const bounds = resolveBounds(range, min, max)
@@ -52,8 +54,15 @@ function resolveBounds(
   if (range === "*") return { lo: min, hi: max }
 
   const dash = range.indexOf("-")
-  const lo = dash === -1 ? Number(range) : Number(range.slice(0, dash))
-  const hi = dash === -1 ? lo : Number(range.slice(dash + 1))
+  const loToken = dash === -1 ? range : range.slice(0, dash)
+  const hiToken = dash === -1 ? loToken : range.slice(dash + 1)
+
+  if (loToken === "" || hiToken === "") {
+    return new FlumeParseError(`invalid cron range: "${range}"`)
+  }
+
+  const lo = Number(loToken)
+  const hi = Number(hiToken)
 
   if (!Number.isInteger(lo) || !Number.isInteger(hi)) {
     return new FlumeParseError(`invalid cron range: "${range}"`)

@@ -150,7 +150,8 @@ describe("Flume", () => {
     expect(result).toBeInstanceOf(Error)
     expect(a.stopCount).toBe(1)
     expect(b.stopCount).toBe(1)
-    expect(c.stopCount).toBe(0)
+    // 失敗した source も半接続状態のリソースを持ち得るため stop される
+    expect(c.stopCount).toBe(1)
   })
 
   it("aggregates messages from multiple failing sources", async () => {

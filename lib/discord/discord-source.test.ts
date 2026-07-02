@@ -1,8 +1,14 @@
 import { describe, it, expect, vi } from "vitest"
 import { waitFor } from "@/test-utils/wait-for"
-import type { FlumeEvent, FlumeRuntimeDeps, FlumeSourceStartContext } from "@/types"
+import type {
+  FlumeEvent,
+  FlumeReconnectConfig,
+  FlumeRuntimeDeps,
+  FlumeSourceStartContext,
+} from "@/types"
 import { FlumeDiscordSource } from "@/discord/discord-source"
 import { flumeExtractDiscordMeta } from "@/discord/extract-discord-meta"
+import { FlumeConnectionError } from "@/errors/connection-error"
 import { FlumeLogger } from "@/logger"
 
 type Listener = (ev: unknown) => void
@@ -50,6 +56,14 @@ class MockWebSocket {
       fn({ data })
     }
   }
+
+  simulateClose(code: number, reason: string): void {
+    this.readyState = MockWebSocket.CLOSED
+    const listeners = this.listeners["close"] ?? []
+    for (const fn of listeners) {
+      fn({ code, reason })
+    }
+  }
 }
 
 const HELLO_MSG = '{"op":10,"d":{"heartbeat_interval":45000},"s":null,"t":null}'
@@ -72,10 +86,58 @@ const createMockDeps = (): FlumeRuntimeDeps => {
   }
 }
 
+type FakeTimer = {
+  fn: () => void
+  ms: number
+  kind: "timeout" | "interval"
+  cleared: boolean
+}
+
+const createTimerDeps = () => {
+  const timers: Array<FakeTimer> = []
+
+  const clearByHandle = (handle: unknown) => {
+    if (typeof handle === "number" && timers[handle] !== undefined) {
+      timers[handle]!.cleared = true
+    }
+  }
+
+  const deps: FlumeRuntimeDeps = {
+    WebSocket: MockWebSocket as unknown as FlumeRuntimeDeps["WebSocket"],
+    setTimeout: (fn: () => void, ms: number) => {
+      timers.push({ fn, ms, kind: "timeout", cleared: false })
+      return timers.length - 1
+    },
+    clearTimeout: clearByHandle,
+    setInterval: (fn: () => void, ms: number) => {
+      timers.push({ fn, ms, kind: "interval", cleared: false })
+      return timers.length - 1
+    },
+    clearInterval: clearByHandle,
+    random: () => 0.5,
+    now: () => 1000,
+    fetch: vi.fn(),
+  }
+
+  const fireTimer = (predicate: (timer: FakeTimer) => boolean): boolean => {
+    const target = timers.find((timer) => !timer.cleared && predicate(timer))
+    if (!target) return false
+
+    if (target.kind === "timeout") {
+      target.cleared = true
+    }
+    target.fn()
+    return true
+  }
+
+  return { deps, timers, fireTimer }
+}
+
 type CtxProps = {
   deps: FlumeRuntimeDeps
   onEvent?: (event: FlumeEvent) => void
   onStatus?: (status: string, detail?: string) => void
+  reconnect?: FlumeReconnectConfig | null
 }
 
 const createCtx = (props: CtxProps): FlumeSourceStartContext => ({
@@ -83,7 +145,7 @@ const createCtx = (props: CtxProps): FlumeSourceStartContext => ({
   log: new FlumeLogger({ source: "discord", deps: props.deps }),
   deps: props.deps,
   onStatus: props.onStatus ?? (() => {}),
-  reconnect: null,
+  reconnect: props.reconnect ?? null,
 })
 
 const simulateReadySequence = () => {
@@ -181,6 +243,108 @@ describe("FlumeDiscordSource", () => {
     const second = await source.start(createCtx({ deps }))
 
     expect(second).toBeInstanceOf(Error)
+  })
+})
+
+describe("FlumeDiscordSource reconnect", () => {
+  const RECONNECT: FlumeReconnectConfig = { maxAttempts: 3, baseDelay: 100, maxDelay: 1000 }
+
+  it("threads the session across reconnect attempts and sends RESUME", async () => {
+    const harness = createTimerDeps()
+
+    MockWebSocket.latest = null
+
+    const source = new FlumeDiscordSource({ token: "test-token" })
+    const startPromise = source.start(createCtx({ deps: harness.deps, reconnect: RECONNECT }))
+
+    simulateReadySequence()
+    await startPromise
+
+    const firstSocket = MockWebSocket.latest!
+
+    firstSocket.simulateClose(1006, "network drop")
+
+    // resume 可能 → 通常 backoff (100 * (0.5 + 0.5 * 0.5) = 75ms)。identify 下限 5000ms は適用されない
+    expect(harness.fireTimer((timer) => timer.kind === "timeout" && timer.ms === 75)).toBe(true)
+
+    const secondSocket = MockWebSocket.latest!
+
+    expect(secondSocket).not.toBe(firstSocket)
+    expect(secondSocket.url).toBe("wss://resume.example.com/?v=10&encoding=json")
+
+    secondSocket.simulateMessage(HELLO_MSG)
+
+    const frames = secondSocket.sentMessages.map((raw) => JSON.parse(raw))
+    const resumes = frames.filter((frame) => frame.op === 6)
+
+    expect(resumes.length).toBe(1)
+    expect(resumes[0]!.d.session_id).toBe("abc")
+    expect(resumes[0]!.d.seq).toBe(1)
+    expect(frames.filter((frame) => frame.op === 2).length).toBe(0)
+
+    await source.stop()
+  })
+
+  it("applies the 5s identify floor when the session was invalidated by close 4009", async () => {
+    const harness = createTimerDeps()
+
+    MockWebSocket.latest = null
+
+    const source = new FlumeDiscordSource({ token: "test-token" })
+    const startPromise = source.start(createCtx({ deps: harness.deps, reconnect: RECONNECT }))
+
+    simulateReadySequence()
+    await startPromise
+
+    MockWebSocket.latest!.simulateClose(4009, "session timed out")
+
+    // session 破棄 → IDENTIFY し直し → backoff 75ms が 5000ms へ底上げされる
+    expect(harness.fireTimer((timer) => timer.kind === "timeout" && timer.ms === 5000)).toBe(true)
+
+    const secondSocket = MockWebSocket.latest!
+
+    expect(secondSocket.url).toBe("wss://gateway.discord.gg/?v=10&encoding=json")
+
+    secondSocket.simulateMessage(HELLO_MSG)
+
+    const frames = secondSocket.sentMessages.map((raw) => JSON.parse(raw))
+
+    expect(frames.filter((frame) => frame.op === 2).length).toBe(1)
+    expect(frames.filter((frame) => frame.op === 6).length).toBe(0)
+
+    await source.stop()
+  })
+
+  it("stop() during a pending connect resolves start() with a connection error", async () => {
+    const deps = createMockDeps()
+
+    MockWebSocket.latest = null
+
+    const source = new FlumeDiscordSource({ token: "test-token" })
+    const startPromise = source.start(createCtx({ deps }))
+
+    // READY 前に stop: this.gateway が null 化されても local 参照で TypeError を出さず終了する
+    await source.stop()
+
+    const startResult = await startPromise
+
+    expect(startResult).toBeInstanceOf(FlumeConnectionError)
+  })
+
+  it("threads handshakeTimeoutMs into the gateway handshake timer", async () => {
+    const harness = createTimerDeps()
+
+    MockWebSocket.latest = null
+
+    const source = new FlumeDiscordSource({ token: "test-token", handshakeTimeoutMs: 1234 })
+    const startPromise = source.start(createCtx({ deps: harness.deps }))
+
+    const armed = harness.timers.some((timer) => timer.kind === "timeout" && timer.ms === 1234)
+    expect(armed).toBe(true)
+
+    simulateReadySequence()
+    await startPromise
+    await source.stop()
   })
 })
 

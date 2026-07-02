@@ -7,6 +7,8 @@ import { FlumeSource } from "@/flume-source"
 class MockSource extends FlumeSource {
   readonly name: "discord" | "slack"
 
+  startCount = 0
+
   stopCount = 0
 
   pushEvent: ((event: FlumeEvent) => void) | null = null
@@ -19,6 +21,7 @@ class MockSource extends FlumeSource {
   }
 
   protected async connect(): Promise<Error | null> {
+    this.startCount += 1
     if (this.mockOptions.failConnect) return this.mockOptions.failConnect
 
     this.setStatus("connected")
@@ -87,8 +90,9 @@ describe("FlumeConfluence", () => {
     expect(outcomes.filter((r) => r instanceof Error)).toHaveLength(1)
     expect(confluence.ids()).toEqual(["dup"])
 
-    // 負けた側の source は開かれても確実に close される (リークしない)
-    expect(a.stopCount + b.stopCount).toBe(1)
+    // 負けた側は pending 追跡により open される前に弾かれる (start も stop も走らない)
+    expect(a.startCount + b.startCount).toBe(1)
+    expect(a.stopCount + b.stopCount).toBe(0)
   })
 
   it("returns the start error and does not store a failed group", async () => {
@@ -150,7 +154,10 @@ describe("FlumeConfluence", () => {
     b.pushEvent?.(event("from-b"))
 
     await waitFor(() => expect(items.filter((i) => i.kind === "event")).toHaveLength(2))
-    const groupsForEvents = items.filter((i) => i.kind === "event").map((i) => i.groupId).sort()
+    const groupsForEvents = items
+      .filter((i) => i.kind === "event")
+      .map((i) => i.groupId)
+      .sort()
     expect(groupsForEvents).toEqual(["group-a", "group-b"])
   })
 

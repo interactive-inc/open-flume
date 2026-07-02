@@ -63,6 +63,8 @@ const createMockFetch = () => {
   })
 }
 
+type RecordedTimeout = { fn: () => void; ms: number; cleared: boolean }
+
 const createDeps = (overrides?: {
   fetch?: (url: string | URL, init?: RequestInit) => Promise<Response>
 }) => {
@@ -75,17 +77,31 @@ const createDeps = (overrides?: {
     }
   }
 
+  // setTimeout は自動発火しない記録式。handshake / close-fallback timer を
+  // テスト側から entry.fn() で明示的に発火させる
+  const timeouts: Array<RecordedTimeout> = []
+
   const deps = {
     WebSocket: WS as unknown as new (url: string | URL) => WebSocket,
     fetch: overrides?.fetch ?? createMockFetch(),
     now: () => 1000,
+    setTimeout: (fn: () => void, ms: number) => {
+      const entry: RecordedTimeout = { fn, ms, cleared: false }
+      timeouts.push(entry)
+      return entry
+    },
+    clearTimeout: (id: unknown) => {
+      for (const entry of timeouts) {
+        if (entry === id) entry.cleared = true
+      }
+    },
     setInterval: globalThis.setInterval as unknown as (fn: () => void, ms: number) => unknown,
     clearInterval: globalThis.clearInterval as unknown as (id: unknown) => void,
   }
 
   const getSocket = () => instances[instances.length - 1] ?? null
 
-  return { deps, getSocket }
+  return { deps, getSocket, timeouts }
 }
 
 describe("FlumeSlackSocketMode", () => {
@@ -399,5 +415,184 @@ describe("FlumeSlackSocketMode", () => {
     intervalCallbacks[0]!()
 
     expect(onDisconnected).toHaveBeenCalledTimes(1)
+  })
+
+  it("resolves connect with FlumeConnectionError when hello never arrives (handshake timeout)", async () => {
+    const { deps, getSocket, timeouts } = createDeps()
+    const onDisconnected = vi.fn()
+
+    const mode = new FlumeSlackSocketMode({
+      appToken: "xapp-test",
+      onMessage: vi.fn(),
+      onConnected: vi.fn(),
+      onDisconnected,
+      deps,
+      handshakeTimeoutMs: 100,
+    })
+
+    const connectPromise = mode.connect()
+
+    await waitFor(() => {
+      expect(getSocket()).not.toBeNull()
+    })
+
+    const handshake = timeouts.find((entry) => entry.ms === 100)
+    expect(handshake).toBeDefined()
+
+    handshake!.fn()
+
+    const result = await connectPromise
+
+    expect(result).toBeInstanceOf(FlumeConnectionError)
+    if (result instanceof FlumeConnectionError) {
+      expect(result.message).toContain("handshake timeout")
+    }
+    // hello 前なので onDisconnected は発火しない (connect の戻り値がエラーを運ぶ)
+    expect(onDisconnected).not.toHaveBeenCalled()
+  })
+
+  it("sanitizes non-finite handshakeTimeoutMs to the 30s default", async () => {
+    const { deps, getSocket, timeouts } = createDeps()
+
+    const mode = new FlumeSlackSocketMode({
+      appToken: "xapp-test",
+      onMessage: vi.fn(),
+      onConnected: vi.fn(),
+      onDisconnected: vi.fn(),
+      deps,
+      handshakeTimeoutMs: Number.NaN,
+    })
+
+    const connectPromise = mode.connect()
+
+    await waitFor(() => {
+      expect(getSocket()).not.toBeNull()
+    })
+
+    const handshake = timeouts.find((entry) => entry.ms === 30_000)
+    expect(handshake).toBeDefined()
+
+    getSocket()!.simulateMessage(JSON.stringify({ type: "hello" }))
+    await connectPromise
+
+    // hello 到着で handshake timer は解除される
+    expect(handshake!.cleared).toBe(true)
+  })
+
+  it("synthesizes the close teardown when the close event never arrives after idle force-close", async () => {
+    let nowMs = 1_000_000
+    const intervalCallbacks: Array<() => void> = []
+
+    const { deps, getSocket, timeouts } = createDeps()
+    deps.now = () => nowMs
+    deps.setInterval = ((fn: () => void) => {
+      intervalCallbacks.push(fn)
+      return intervalCallbacks.length
+    }) as unknown as typeof deps.setInterval
+    deps.clearInterval = (() => {}) as unknown as typeof deps.clearInterval
+
+    const onDisconnected = vi.fn()
+    const mode = new FlumeSlackSocketMode({
+      appToken: "xapp-test",
+      onMessage: vi.fn(),
+      onConnected: vi.fn(),
+      onDisconnected,
+      deps,
+      idleTimeoutMs: 1_000,
+    })
+
+    const ready = mode.connect()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const socket = getSocket()
+    expect(socket).not.toBeNull()
+
+    // Dead pipe: close() を呼んでも close イベントが配達されない NAT/proxy 断を再現
+    socket!.close = () => {}
+
+    socket!.simulateMessage(JSON.stringify({ type: "hello" }))
+    await ready
+
+    nowMs += 5_000
+    intervalCallbacks[0]!()
+
+    // close イベントが来ないので teardown はまだ走らない
+    expect(onDisconnected).not.toHaveBeenCalled()
+
+    const fallback = timeouts.find((entry) => entry.ms === 5_000 && !entry.cleared)
+    expect(fallback).toBeDefined()
+
+    fallback!.fn()
+
+    expect(onDisconnected).toHaveBeenCalledTimes(1)
+    expect(mode.isConnected()).toBe(false)
+
+    // 遅れて実 close が届いても teardown は二重に走らない
+    socket!.simulateClose(1006, "late")
+    expect(onDisconnected).toHaveBeenCalledTimes(1)
+  })
+
+  it("disables the idle watchdog when idleTimeoutMs is NaN", async () => {
+    const intervalCallbacks: Array<() => void> = []
+    const { deps, getSocket } = createDeps()
+    deps.setInterval = ((fn: () => void) => {
+      intervalCallbacks.push(fn)
+      return intervalCallbacks.length
+    }) as unknown as typeof deps.setInterval
+
+    const mode = new FlumeSlackSocketMode({
+      appToken: "xapp-test",
+      onMessage: vi.fn(),
+      onConnected: vi.fn(),
+      onDisconnected: vi.fn(),
+      deps,
+      idleTimeoutMs: Number.NaN,
+    })
+
+    const ready = mode.connect()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const socket = getSocket()
+    expect(socket).not.toBeNull()
+    socket!.simulateMessage(JSON.stringify({ type: "hello" }))
+
+    await ready
+    expect(mode.isConnected()).toBe(true)
+    expect(intervalCallbacks).toHaveLength(0)
+  })
+
+  it("counts unparseable frames as liveness for the idle watchdog", async () => {
+    let nowMs = 1_000_000
+    const intervalCallbacks: Array<() => void> = []
+
+    const { deps, getSocket } = createDeps()
+    deps.now = () => nowMs
+    deps.setInterval = ((fn: () => void) => {
+      intervalCallbacks.push(fn)
+      return intervalCallbacks.length
+    }) as unknown as typeof deps.setInterval
+    deps.clearInterval = (() => {}) as unknown as typeof deps.clearInterval
+
+    const onDisconnected = vi.fn()
+    const mode = new FlumeSlackSocketMode({
+      appToken: "xapp-test",
+      onMessage: vi.fn(),
+      onConnected: vi.fn(),
+      onDisconnected,
+      deps,
+      idleTimeoutMs: 1_000,
+    })
+
+    const ready = mode.connect()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const socket = getSocket()
+    expect(socket).not.toBeNull()
+    socket!.simulateMessage(JSON.stringify({ type: "hello" }))
+    await ready
+
+    // parse できないフレームでも届いていれば pipe は生きている
+    nowMs += 5_000
+    socket!.simulateMessage("not-json{{{{")
+    intervalCallbacks[0]!()
+
+    expect(onDisconnected).not.toHaveBeenCalled()
   })
 })
