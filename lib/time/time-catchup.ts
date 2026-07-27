@@ -2,13 +2,11 @@ import type { FlumeCatchupPolicy, FlumeRuntimeDeps } from "@/types"
 import type { FlumeCron } from "@/time/parse-cron"
 import { FlumeParseError } from "@/errors/parse-error"
 import { flumeCronNext } from "@/time/cron-next"
+import { isDstDuplicateFire } from "@/time/is-dst-duplicate-fire"
 
 const DEFAULT_MISSED_WINDOW_MS = 24 * 60 * 60 * 1000
 const MAX_CATCHUP_MATCHES = 10_000
-
-// flumeCronNext と同じ趣旨の有限性ガード。lastOnly は件数無制限のためこの反復数で打ち切る
-// (分単位 cron の 30 日ギャップ ≒ 43,200 回でも余裕で now に到達する)
-const MAX_WALK_ITERATIONS = 500_000
+const MINUTE_MS = 60_000
 
 type Props = {
   cron: FlumeCron
@@ -60,44 +58,64 @@ type WalkProps = {
 }
 
 function collectLastOnly(props: WalkProps): FlumeCatchupMatches | FlumeParseError {
-  let latest: number | null = null
-  let cursor = props.windowStart
+  let lookbackMs = MINUTE_MS
 
-  for (let iteration = 0; iteration < MAX_WALK_ITERATIONS; iteration++) {
-    const next = flumeCronNext(props.cron, cursor)
-    if (next instanceof FlumeParseError) return next
-    if (next > props.now) {
-      return { matches: latest === null ? [] : [latest], truncated: false }
-    }
+  while (true) {
+    const recentStart = Math.max(props.windowStart, props.now - lookbackMs)
+    const walked = walkMatches({ ...props, windowStart: recentStart })
+    if (walked instanceof FlumeParseError) return walked
 
-    latest = next
-    cursor = next
+    const latest = walked[walked.length - 1]
+    if (latest !== undefined) return { matches: [latest], truncated: false }
+    if (recentStart === props.windowStart) return { matches: [], truncated: false }
+
+    lookbackMs *= 2
   }
-
-  return { matches: latest === null ? [] : [latest], truncated: true }
 }
 
 function collectMissed(props: WalkProps): FlumeCatchupMatches | FlumeParseError {
-  const collected: number[] = []
-  let cursor = props.windowStart
-  let hasReachedNow = false
+  let lookbackMs = MAX_CATCHUP_MATCHES * MINUTE_MS
 
-  for (let iteration = 0; iteration < MAX_WALK_ITERATIONS; iteration++) {
-    const next = flumeCronNext(props.cron, cursor)
-    if (next instanceof FlumeParseError) return next
-    if (next > props.now) {
-      hasReachedNow = true
-      break
+  while (true) {
+    const recentStart = Math.max(props.windowStart, props.now - lookbackMs)
+    const walked = walkMatches({ ...props, windowStart: recentStart })
+    if (walked instanceof FlumeParseError) return walked
+
+    if (walked.length >= MAX_CATCHUP_MATCHES || recentStart === props.windowStart) {
+      const matches = walked.slice(Math.max(0, walked.length - MAX_CATCHUP_MATCHES))
+      const older = hasMatchBefore(props.cron, props.windowStart, recentStart)
+      if (older instanceof FlumeParseError) return older
+      return { matches, truncated: walked.length > MAX_CATCHUP_MATCHES || older }
     }
 
-    collected.push(next)
+    lookbackMs *= 2
+  }
+}
+
+function walkMatches(props: WalkProps): number[] | FlumeParseError {
+  const matches: number[] = []
+  let cursor = props.windowStart
+
+  while (true) {
+    const next = flumeCronNext(props.cron, cursor)
+    if (next instanceof FlumeParseError) return next
+    if (next > props.now) return matches
+
+    if (!isDstDuplicateFire(matches, next)) matches.push(next)
     cursor = next
   }
+}
 
-  if (collected.length > MAX_CATCHUP_MATCHES) {
-    return { matches: collected.slice(collected.length - MAX_CATCHUP_MATCHES), truncated: true }
-  }
-  return { matches: collected, truncated: !hasReachedNow }
+function hasMatchBefore(
+  cron: FlumeCron,
+  windowStart: number,
+  recentStart: number,
+): boolean | FlumeParseError {
+  if (recentStart === windowStart) return false
+
+  const first = flumeCronNext(cron, windowStart)
+  if (first instanceof FlumeParseError) return first
+  return first <= recentStart
 }
 
 export type CatchupDeps = Pick<FlumeRuntimeDeps, "now">

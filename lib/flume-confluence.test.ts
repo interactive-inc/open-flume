@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest"
 import { waitFor } from "@/test-utils/wait-for"
 import type { FlumeEvent, FlumeStreamItem } from "@/types"
+import { createFlumeDefaultDeps } from "@/deps"
 import { FlumeConfluence } from "@/flume-confluence"
 import { FlumeSource } from "@/flume-source"
 
@@ -220,5 +221,97 @@ describe("FlumeConfluence", () => {
     const src = new MockSource()
     const result = await confluence.replace("missing", [src])
     expect(result).toBeInstanceOf(Error)
+  })
+
+  it("contains async onEvent rejection without an unhandled rejection", async () => {
+    const source = new MockSource()
+    const confluence = new FlumeConfluence({
+      onEvent: async (item) => {
+        if (item.kind === "event") throw new Error("sink failed")
+      },
+    })
+
+    expect(await confluence.add("async", [source])).toBeNull()
+    source.pushEvent?.(event("reject"))
+    await confluence.closeAll()
+
+    expect(source.stopCount).toBe(1)
+  })
+
+  it("aborts and waits for an add that is still connecting during closeAll", async () => {
+    const connectGate = Promise.withResolvers<void>()
+
+    class PendingSource extends FlumeSource {
+      readonly name = "discord"
+      startCount = 0
+      stopCount = 0
+
+      protected async connect(): Promise<Error | null> {
+        this.startCount += 1
+        await connectGate.promise
+        return null
+      }
+
+      protected disconnect(): void {
+        this.stopCount += 1
+        connectGate.resolve()
+      }
+    }
+
+    const source = new PendingSource()
+    const confluence = new FlumeConfluence()
+    const addPromise = confluence.add("pending", [source])
+    await waitFor(() => expect(source.startCount).toBe(1))
+
+    await confluence.closeAll()
+
+    expect(await addPromise).toBeInstanceOf(Error)
+    expect(source.stopCount).toBe(1)
+    expect(confluence.ids()).toEqual([])
+  })
+
+  it("returns an Error when a replace timeout cannot be scheduled", async () => {
+    const deps = {
+      ...createFlumeDefaultDeps(),
+      setTimeout: () => {
+        throw new Error("timer failed")
+      },
+    }
+    const confluence = new FlumeConfluence({ deps })
+    const previous = new MockSource()
+    const next = new MockSource()
+    expect(await confluence.add("replace", [previous])).toBeNull()
+
+    const result = await confluence.replace("replace", [next])
+
+    expect(result).toBeInstanceOf(Error)
+    expect(previous.stopCount).toBe(0)
+    expect(confluence.has("replace")).toBe(true)
+    await confluence.closeAll()
+  })
+
+  it("ignores a stale replace timeout when clearTimeout throws", async () => {
+    const timer = { callback: (): void => {} }
+    const deps = {
+      ...createFlumeDefaultDeps(),
+      setTimeout: (callback: () => void) => {
+        timer.callback = callback
+        return 1
+      },
+      clearTimeout: () => {
+        throw new Error("clear failed")
+      },
+    }
+    const confluence = new FlumeConfluence({ deps })
+    const previous = new MockSource()
+    const next = new MockSource()
+    expect(await confluence.add("replace", [previous])).toBeNull()
+    expect(await confluence.replace("replace", [next])).toBeNull()
+
+    timer.callback()
+
+    expect(next.stopCount).toBe(0)
+    expect(confluence.has("replace")).toBe(true)
+    await confluence.closeAll()
   })
 })

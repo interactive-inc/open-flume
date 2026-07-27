@@ -61,7 +61,5 @@ function matchesDay(cron: FlumeCron, date: Date): boolean {
   const dowMatch = cron.daysOfWeek.has(date.getDay())
 
   if (cron.domRestricted && cron.dowRestricted) return domMatch || dowMatch
-  if (cron.domRestricted) return domMatch
-  if (cron.dowRestricted) return dowMatch
-  return true
+  return domMatch && dowMatch
 }

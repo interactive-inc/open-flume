@@ -166,4 +166,52 @@ describe("FlumeTimeScheduler", () => {
       }
     }
   })
+
+  it("skips all repeated minutes for a multi-minute DST fall-back schedule", () => {
+    const originalTz = process.env.TZ
+    process.env.TZ = "America/New_York"
+
+    try {
+      const firstOne = Date.UTC(2021, 10, 7, 5, 0)
+      const test = createMockDeps(firstOne - 60_000)
+      const ticks: number[] = []
+      const scheduler = new FlumeTimeScheduler({
+        cron: cron("*/15 1 * * *"),
+        onTick: (firedAt) => ticks.push(firedAt),
+        deps: test.deps,
+      })
+      expect(scheduler.start(firstOne - 60_000)).toBeNull()
+
+      for (const minute of [0, 15, 30, 45]) {
+        test.setNow(Date.UTC(2021, 10, 7, 5, minute))
+        test.fire()
+      }
+
+      expect(ticks).toEqual([
+        Date.UTC(2021, 10, 7, 5, 0),
+        Date.UTC(2021, 10, 7, 5, 15),
+        Date.UTC(2021, 10, 7, 5, 30),
+        Date.UTC(2021, 10, 7, 5, 45),
+      ])
+      expect(test.delays[test.delays.length - 1]).toBe(24 * 60 * 60_000 + 15 * 60_000)
+    } finally {
+      if (originalTz === undefined) delete process.env.TZ
+      else process.env.TZ = originalTz
+    }
+  })
+
+  it("returns an error when the initial timer cannot be armed", () => {
+    const test = createMockDeps(0)
+    test.deps.setTimeout = () => {
+      throw new Error("timer denied")
+    }
+    const scheduler = new FlumeTimeScheduler({
+      cron: cron("* * * * *"),
+      onTick: vi.fn(),
+      deps: test.deps,
+    })
+
+    expect(scheduler.start(0)).toBeInstanceOf(Error)
+    expect(scheduler.isStopped).toBe(true)
+  })
 })

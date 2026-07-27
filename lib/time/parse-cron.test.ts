@@ -50,6 +50,13 @@ describe("parseCron", () => {
     expect(cron.dowRestricted).toBe(false)
   })
 
+  it("does not mark stepped wildcard day fields as restricted", () => {
+    const cron = unwrap(parseCron("0 0 */2 * */3"))
+
+    expect(cron.domRestricted).toBe(false)
+    expect(cron.dowRestricted).toBe(false)
+  })
+
   it("rejects wrong field count", () => {
     expect(parseCron("* * * *")).toBeInstanceOf(FlumeParseError)
     expect(parseCron("* * * * * *")).toBeInstanceOf(FlumeParseError)

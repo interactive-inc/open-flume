@@ -61,6 +61,12 @@ describe("flumeCronNext", () => {
     expect(next.getDay()).toBe(1)
   })
 
+  it("treats a stepped wildcard DOM as wildcard for DOM/DOW matching", () => {
+    const next = nextDate("0 0 */2 * 1", new Date(2026, 0, 5, 0, 0, 0))
+
+    expect(next.getTime()).toBe(new Date(2026, 0, 19, 0, 0, 0).getTime())
+  })
+
   it("returns an error for an unreachable date (Feb 30)", () => {
     const result = flumeCronNext(cron("0 0 30 2 *"), new Date(2026, 0, 1).getTime())
 

@@ -8,7 +8,8 @@ export function flumeExtractDiscordMeta(
 
   if (typeof eventData.channel_id === "string") meta.channel_id = eventData.channel_id
   if (typeof eventData.guild_id === "string") meta.guild_id = eventData.guild_id
-  if (isRecord(eventData.author) && typeof eventData.author.id === "string")
+  if (typeof eventData.user_id === "string") meta.user_id = eventData.user_id
+  else if (isRecord(eventData.author) && typeof eventData.author.id === "string")
     meta.user_id = eventData.author.id
 
   return meta

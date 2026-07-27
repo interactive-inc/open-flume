@@ -254,7 +254,7 @@ describe("throw isolation: public surface never throws", () => {
     ws?.simulateMessage(READY)
     const result = await startPromise
 
-    expect(result).toBeNull()
+    expect(result).toBeInstanceOf(Error)
   })
 
   it("source.start does not throw when onEvent rejects with poisoned object", async () => {

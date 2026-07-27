@@ -506,6 +506,25 @@ describe("FlumeDiscordGateway session and resume", () => {
 })
 
 describe("FlumeDiscordGateway handshake timeout", () => {
+  it("resolves connect with an error when the handshake timer cannot be scheduled", async () => {
+    const harness = createTimerDeps()
+    harness.deps.setTimeout = () => {
+      throw new Error("timer denied")
+    }
+    const gateway = new FlumeDiscordGateway({
+      token: "test-token",
+      intents: 513,
+      onDispatch: vi.fn(),
+      onStatus: vi.fn(),
+      deps: harness.deps,
+    })
+
+    const result = await gateway.connect()
+
+    expect(result).toBeInstanceOf(FlumeConnectionError)
+    if (result instanceof Error) expect(result.message).toContain("timer scheduling failed")
+  })
+
   it("resolves connect with FlumeConnectionError when READY never arrives", async () => {
     const ctx = createGatewayWithTimers()
 
@@ -599,6 +618,24 @@ describe("FlumeDiscordGateway malformed HELLO", () => {
 })
 
 describe("FlumeDiscordGateway zombie fallback", () => {
+  it("uses the close fallback for a server RECONNECT request", async () => {
+    const ctx = createGatewayWithTimers()
+    const connectPromise = ctx.gateway.connect()
+    const ws = MockWebSocket.latest!
+    ws.simulateMessage(HELLO_MSG)
+    ws.simulateMessage(READY_MSG)
+    await connectPromise
+    ws.emitCloseEvents = false
+
+    ws.simulateMessage(RECONNECT_MSG)
+
+    expect(ctx.harness.fireTimer((timer) => timer.kind === "timeout" && timer.ms === 5000)).toBe(
+      true,
+    )
+    expect(ctx.onStatus).toHaveBeenCalledWith("disconnected")
+    expect(ctx.gateway.isConnected()).toBe(false)
+  })
+
   it("zombie stops heartbeat and synthesizes teardown when the close event never arrives", async () => {
     const ctx = createGatewayWithTimers()
 

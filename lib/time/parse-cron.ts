@@ -8,7 +8,7 @@ export type FlumeCron = {
   daysOfMonth: ReadonlySet<number>
   months: ReadonlySet<number>
   daysOfWeek: ReadonlySet<number>
-  /** day-of-month フィールドが `*` 以外か。dow と両方制限時は OR マッチ (標準 cron 準拠) */
+  /** day-of-month フィールドが wildcard を含まないか。dow と両方制限時は OR マッチ */
   domRestricted: boolean
   dowRestricted: boolean
 }
@@ -48,7 +48,7 @@ export function parseCron(expression: string): FlumeCron | FlumeParseError {
     daysOfMonth,
     months,
     daysOfWeek,
-    domRestricted: fields[2] !== "*",
-    dowRestricted: fields[4] !== "*",
+    domRestricted: !fields[2]?.includes("*"),
+    dowRestricted: !fields[4]?.includes("*"),
   }
 }

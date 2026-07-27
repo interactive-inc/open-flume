@@ -243,6 +243,7 @@ export class FlumeSlackSocketMode {
           { cause: listenerResult },
         )
         this.log.error({ action: "ws.listener.error", message: safeErrorMessage({ error }), error })
+        this.closeSocket(socket)
         this.ws = null
         this.pendingResolved = true
         resolve(error)
@@ -273,11 +274,17 @@ export class FlumeSlackSocketMode {
     )
 
     if (handle instanceof Error) {
+      const error = new FlumeConnectionError(
+        `handshake timer scheduling failed: ${safeErrorMessage({ error: handle })}`,
+        { cause: handle },
+      )
       this.log.error({
         action: "handshake.timer.schedule.error",
-        message: safeErrorMessage({ error: handle }),
-        error: handle,
+        message: safeErrorMessage({ error }),
+        error,
       })
+      this.completeConnect(error)
+      this.forceClose()
       return
     }
 
@@ -344,6 +351,7 @@ export class FlumeSlackSocketMode {
         message: safeErrorMessage({ error: handle }),
         error: handle,
       })
+      this.onCloseFallback()
       return
     }
 

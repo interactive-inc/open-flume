@@ -60,6 +60,16 @@ describe("FlumeDiscordHeartbeat", () => {
     expect(ctx.mockSetInterval).not.toHaveBeenCalled()
   })
 
+  it("returns an error when the initial heartbeat timer cannot be scheduled", () => {
+    const ctx = createHeartbeat()
+    ctx.mockSetTimeout.mockImplementationOnce(() => {
+      throw new Error("timer denied")
+    })
+
+    expect(ctx.heartbeat.start(5000)).toBeInstanceOf(Error)
+    expect(ctx.heartbeat.isRunning()).toBe(false)
+  })
+
   it("the initial fire installs the recurring interval at the requested cadence", () => {
     const ctx = createHeartbeat(0.5)
 
@@ -101,6 +111,17 @@ describe("FlumeDiscordHeartbeat", () => {
 
     expect(ctx.onZombie).not.toHaveBeenCalled()
     expect(ctx.onSend).toHaveBeenCalledTimes(2)
+  })
+
+  it("marks a server-requested heartbeat as awaiting an ACK", () => {
+    const ctx = createHeartbeat(0)
+
+    ctx.heartbeat.start(5000)
+    ctx.heartbeat.request()
+    ctx.fireInitial()
+
+    expect(ctx.onSend).toHaveBeenCalledOnce()
+    expect(ctx.onZombie).toHaveBeenCalledOnce()
   })
 
   it("stop() clears the initial setTimeout when called before the first fire", () => {

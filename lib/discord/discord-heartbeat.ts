@@ -28,21 +28,28 @@ export class FlumeDiscordHeartbeat {
 
   private ackReceived = true
 
+  private generation = 0
+
   constructor(private readonly props: Props) {}
 
-  start(intervalMs: number): void {
+  start(intervalMs: number): Error | null {
     this.stop()
     this.ackReceived = true
+    const scheduledGeneration = ++this.generation
 
     const initialDelay = safeRandom({ deps: this.props.deps }) * intervalMs
 
     const initialResult = attempt(() =>
       this.props.deps.setTimeout(() => {
+        if (scheduledGeneration !== this.generation) return
         this.initialTimer = null
         this.safeFire()
+        if (scheduledGeneration !== this.generation) return
 
         const intervalResult = attempt(() =>
-          this.props.deps.setInterval(() => this.safeFire(), intervalMs),
+          this.props.deps.setInterval(() => {
+            if (scheduledGeneration === this.generation) this.safeFire()
+          }, intervalMs),
         )
         if (intervalResult instanceof Error) {
           this.props.log.error({
@@ -51,6 +58,7 @@ export class FlumeDiscordHeartbeat {
             error: intervalResult,
           })
           this.intervalTimer = null
+          this.safeZombie()
         } else {
           this.intervalTimer = intervalResult
         }
@@ -63,12 +71,17 @@ export class FlumeDiscordHeartbeat {
         error: initialResult,
       })
       this.initialTimer = null
+      return initialResult
     } else {
       this.initialTimer = initialResult
     }
+
+    return null
   }
 
   stop(): void {
+    this.generation++
+
     if (this.initialTimer !== null) {
       const handle = this.initialTimer
       const r = attempt(() => this.props.deps.clearTimeout(handle))
@@ -100,6 +113,10 @@ export class FlumeDiscordHeartbeat {
     this.ackReceived = true
   }
 
+  request(): void {
+    this.safeFire()
+  }
+
   isRunning(): boolean {
     return this.initialTimer !== null || this.intervalTimer !== null
   }
@@ -110,6 +127,19 @@ export class FlumeDiscordHeartbeat {
       onError: (error) => {
         this.props.log.error({
           action: "heartbeat.fire.error",
+          message: safeErrorMessage({ error }),
+          error,
+        })
+      },
+    })
+  }
+
+  private safeZombie(): void {
+    safeInvokeCallback({
+      fn: this.props.onZombie,
+      onError: (error) => {
+        this.props.log.error({
+          action: "heartbeat.zombie.error",
           message: safeErrorMessage({ error }),
           error,
         })

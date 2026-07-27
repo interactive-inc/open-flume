@@ -338,6 +338,34 @@ describe("FlumeGitHubPoller", () => {
     expect(mockSetTimeout).toHaveBeenCalledWith(expect.any(Function), 100_000)
   })
 
+  it("detects a body-only secondary rate limit and pauses for 60 seconds", async () => {
+    const mockSetTimeout = vi.fn((_fn: () => void, _ms: number) => timerHandle)
+    const test = createTestDeps({ setTimeout: mockSetTimeout })
+
+    test.mockFetch.mockResolvedValueOnce(makeJsonResponse([]))
+    test.mockFetch.mockResolvedValueOnce(
+      makeJsonResponse({ message: "You have exceeded a secondary rate limit." }, 403, {
+        "X-RateLimit-Remaining": "42",
+      }),
+    )
+
+    const poller = new FlumeGitHubPoller({
+      token: "ghp_test",
+      interval: 60,
+      onNotifications: vi.fn(),
+      onConnected: vi.fn(),
+      onDisconnected: vi.fn(),
+      deps: test.deps,
+    })
+
+    await poller.start()
+    test.getIntervalCallback()!()
+    await flushPromises()
+
+    expect(mockSetTimeout).toHaveBeenCalledWith(expect.any(Function), 60_000)
+    expect(test.mockClearInterval).toHaveBeenCalledWith(timerHandle)
+  })
+
   it("rate limit without usable headers defaults to 60s", async () => {
     const mockSetTimeout = vi.fn((_fn: () => void, _ms: number) => timerHandle)
     const test = createTestDeps({ setTimeout: mockSetTimeout })
@@ -443,6 +471,30 @@ describe("FlumeGitHubPoller", () => {
     expect(test.mockSetInterval).not.toHaveBeenCalled()
   })
 
+  it("does not start the interval when rate-limit timer scheduling fails", async () => {
+    const mockSetTimeout = vi.fn(() => {
+      throw new Error("timer unavailable")
+    })
+    const test = createTestDeps({ setTimeout: mockSetTimeout })
+    const onDisconnected = vi.fn()
+
+    test.mockFetch.mockResolvedValueOnce(new Response("", { status: 429 }))
+
+    const poller = new FlumeGitHubPoller({
+      token: "ghp_test",
+      interval: 60,
+      onNotifications: vi.fn(),
+      onConnected: vi.fn(),
+      onDisconnected,
+      deps: test.deps,
+    })
+
+    await poller.start()
+
+    expect(test.mockSetInterval).not.toHaveBeenCalled()
+    expect(onDisconnected).toHaveBeenCalledWith("rate-limit timer scheduling rejected by runtime")
+  })
+
   it("does not resume polling if stopped before the rate-limit timer fires", async () => {
     let rateTimerCallback: (() => void) | null = null
     const mockSetTimeout = vi.fn((fn: () => void, _ms: number) => {
@@ -518,17 +570,19 @@ describe("FlumeGitHubPoller", () => {
     expect(pageTwoHeaders).not.toHaveProperty("If-Modified-Since")
   })
 
-  it("caps pagination at 10 pages and warns poll.pages.truncated", async () => {
+  it("continues past 10 pages without committing a truncated result", async () => {
     const test = createTestDeps()
     const logs: FlumeLog[] = []
+    let page = 0
 
-    test.mockFetch.mockImplementation(() =>
-      Promise.resolve(
-        makeJsonResponse([], 200, {
-          Link: '<https://api.github.com/notifications?page=2>; rel="next"',
-        }),
-      ),
-    )
+    test.mockFetch.mockImplementation(() => {
+      page += 1
+      const headers: Record<string, string> =
+        page < 11
+          ? { Link: `<https://api.github.com/notifications?page=${page + 1}>; rel="next"` }
+          : {}
+      return Promise.resolve(makeJsonResponse([], 200, headers))
+    })
 
     const poller = new FlumeGitHubPoller({
       token: "ghp_test",
@@ -542,11 +596,10 @@ describe("FlumeGitHubPoller", () => {
 
     await poller.start()
 
-    expect(test.mockFetch).toHaveBeenCalledTimes(10)
+    expect(test.mockFetch).toHaveBeenCalledTimes(11)
 
     const truncatedWarns = logs.filter((log) => log.action === "poll.pages.truncated")
-    expect(truncatedWarns).toHaveLength(1)
-    expect(truncatedWarns[0]!.level).toBe("warn")
+    expect(truncatedWarns).toHaveLength(0)
   })
 
   it("does not commit validators when body read fails, next poll sends the previous ETag", async () => {

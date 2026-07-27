@@ -20,26 +20,26 @@ describe("isDstDuplicateFire", () => {
     const firstOneThirty = Date.UTC(2021, 10, 7, 5, 30)
     const secondOneThirty = Date.UTC(2021, 10, 7, 6, 30)
 
-    expect(isDstDuplicateFire(firstOneThirty, secondOneThirty)).toBe(true)
+    expect(isDstDuplicateFire([firstOneThirty], secondOneThirty)).toBe(true)
   })
 
   it("ignores a normal next-minute advance", () => {
     const firedAt = Date.UTC(2021, 10, 7, 5, 30)
 
-    expect(isDstDuplicateFire(firedAt, firedAt + 60_000)).toBe(false)
+    expect(isDstDuplicateFire([firedAt], firedAt + 60_000)).toBe(false)
   })
 
   it("ignores targets more than 2 hours ahead even on the same wall-clock minute", () => {
     const firedAt = Date.UTC(2021, 10, 7, 5, 30)
     const nextDay = Date.UTC(2021, 10, 8, 6, 30)
 
-    expect(isDstDuplicateFire(firedAt, nextDay)).toBe(false)
+    expect(isDstDuplicateFire([firedAt], nextDay)).toBe(false)
   })
 
   it("ignores non-forward targets", () => {
     const firedAt = Date.UTC(2021, 10, 7, 5, 30)
 
-    expect(isDstDuplicateFire(firedAt, firedAt)).toBe(false)
-    expect(isDstDuplicateFire(firedAt, firedAt - 60_000)).toBe(false)
+    expect(isDstDuplicateFire([firedAt], firedAt)).toBe(false)
+    expect(isDstDuplicateFire([firedAt], firedAt - 60_000)).toBe(false)
   })
 })

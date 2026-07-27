@@ -595,4 +595,58 @@ describe("FlumeSlackSocketMode", () => {
 
     expect(onDisconnected).not.toHaveBeenCalled()
   })
+
+  it("resolves connect with an error when the handshake timer cannot be scheduled", async () => {
+    const { deps } = createDeps()
+    deps.setTimeout = () => {
+      throw new Error("timer denied")
+    }
+    const mode = new FlumeSlackSocketMode({
+      appToken: "xapp-test",
+      onMessage: vi.fn(),
+      onConnected: vi.fn(),
+      onDisconnected: vi.fn(),
+      deps,
+    })
+
+    const result = await mode.connect()
+
+    expect(result).toBeInstanceOf(FlumeConnectionError)
+    if (result instanceof Error) expect(result.message).toContain("timer scheduling failed")
+  })
+
+  it("closes a constructed socket when listener registration fails", async () => {
+    class FailingListenerSocket {
+      static latest: FailingListenerSocket | null = null
+      closeCount = 0
+      readyState = 1
+
+      constructor(_url: string | URL) {
+        FailingListenerSocket.latest = this
+      }
+
+      addEventListener(): void {
+        throw new Error("listener failed")
+      }
+
+      send(): void {}
+
+      close(): void {
+        this.closeCount += 1
+      }
+    }
+
+    const { deps } = createDeps()
+    deps.WebSocket = FailingListenerSocket as unknown as typeof deps.WebSocket
+    const mode = new FlumeSlackSocketMode({
+      appToken: "xapp-test",
+      onMessage: vi.fn(),
+      onConnected: vi.fn(),
+      onDisconnected: vi.fn(),
+      deps,
+    })
+
+    expect(await mode.connect()).toBeInstanceOf(FlumeConnectionError)
+    expect(FailingListenerSocket.latest?.closeCount).toBe(1)
+  })
 })

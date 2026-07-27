@@ -12,6 +12,7 @@ import { safeNormalizeError } from "@/utils/safe-normalize-error"
 import { safeNow } from "@/utils/safe-now"
 
 const DEFAULT_POLL_INTERVAL_SEC = 60
+const MAX_POLL_INTERVAL_SEC = Math.floor(2_147_483_647 / 1000)
 
 export class FlumeGitHubSource extends FlumeSource {
   readonly name = "github" as const
@@ -63,7 +64,7 @@ export class FlumeGitHubSource extends FlumeSource {
     if (typeof requested !== "number") return DEFAULT_POLL_INTERVAL_SEC
     if (!Number.isFinite(requested)) return DEFAULT_POLL_INTERVAL_SEC
     if (requested <= 0) return DEFAULT_POLL_INTERVAL_SEC
-    return requested
+    return Math.min(requested, MAX_POLL_INTERVAL_SEC)
   }
 
   private handleNotifications(

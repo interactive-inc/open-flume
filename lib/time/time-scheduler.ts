@@ -13,13 +13,15 @@ import { safeNow } from "@/utils/safe-now"
 // 目標時刻まで何度も再武装する (長尺 cron / clock 補正にも強い)
 const MAX_TIMEOUT_MS = 2_000_000_000
 const FIRE_TOLERANCE_MS = 1_000
+const DST_HISTORY_WINDOW_MS = 2 * 60 * 60 * 1000
+const MAX_DST_SKIPS = 180
 
 type Deps = Pick<FlumeRuntimeDeps, "now" | "setTimeout" | "clearTimeout">
 
 type Props = {
   cron: FlumeCron
   onTick: (firedAt: number) => void
-  /** cron エラーでスケジューラが恒久停止したとき (dead-but-green 防止)。stop() 起因では呼ばれない */
+  /** cron / timer エラーで恒久停止したとき (dead-but-green 防止)。stop() 起因では呼ばれない */
   onHalt?: () => void
   onLog?: FlumeLogHandler
   deps: Deps
@@ -39,6 +41,8 @@ export class FlumeTimeScheduler {
   private timer: FlumeTimerHandle | null = null
 
   private target = 0
+
+  private readonly recentFires: number[] = []
 
   constructor(private readonly props: Props) {
     this.log = new FlumeLogger({
@@ -71,8 +75,7 @@ export class FlumeTimeScheduler {
       message: `next fire at ${new Date(next).toISOString()}`,
       detail: { target: next },
     })
-    this.arm()
-    return null
+    return this.arm()
   }
 
   stop(): void {
@@ -80,8 +83,8 @@ export class FlumeTimeScheduler {
     this.clearTimer()
   }
 
-  private arm(): void {
-    if (this.isStoppedFlag) return
+  private arm(): Error | null {
+    if (this.isStoppedFlag) return null
 
     this.clearTimer()
 
@@ -96,9 +99,11 @@ export class FlumeTimeScheduler {
         error: result,
       })
       this.timer = null
-      return
+      this.isStoppedFlag = true
+      return result
     }
     this.timer = result
+    return null
   }
 
   private onWake(): void {
@@ -107,11 +112,13 @@ export class FlumeTimeScheduler {
 
     const remaining = this.target - safeNow({ deps: this.props.deps })
     if (remaining > FIRE_TOLERANCE_MS) {
-      this.arm()
+      const error = this.arm()
+      if (error instanceof Error) this.halt(error)
       return
     }
 
     const firedAt = this.target
+    this.rememberFire(firedAt)
     safeInvokeCallback({
       fn: () => this.props.onTick(firedAt),
       onError: (error) => {
@@ -156,22 +163,22 @@ export class FlumeTimeScheduler {
       return
     }
 
-    // DST fall-back で同一壁時計分が 2 epoch に存在すると連続 2 回マッチするため 1 つ飛ばす
-    const deduped = isDstDuplicateFire(firedAt, next) ? flumeCronNext(this.props.cron, next) : next
+    const deduped = this.skipDstDuplicates(next)
     if (deduped instanceof FlumeParseError) {
       this.halt(deduped)
       return
     }
 
     this.target = deduped
-    this.arm()
+    const armError = this.arm()
+    if (armError instanceof Error) this.halt(armError)
   }
 
   /** cron エラーによる恒久停止。source が接続済みのまま沈黙しないよう onHalt で通知する */
-  private halt(error: FlumeParseError): void {
+  private halt(error: Error): void {
     this.isStoppedFlag = true
     this.clearTimer()
-    this.log.error({ action: "cron.no-next", message: error.message, error })
+    this.log.error({ action: "scheduler.halted", message: error.message, error })
 
     const onHalt = this.props.onHalt
     if (!onHalt) return
@@ -186,6 +193,27 @@ export class FlumeTimeScheduler {
         })
       },
     })
+  }
+
+  private rememberFire(firedAt: number): void {
+    this.recentFires.push(firedAt)
+    const cutoff = firedAt - DST_HISTORY_WINDOW_MS
+    while (this.recentFires[0] !== undefined && this.recentFires[0] < cutoff) {
+      this.recentFires.shift()
+    }
+  }
+
+  private skipDstDuplicates(initialTarget: number): number | FlumeParseError {
+    let target = initialTarget
+
+    for (let iteration = 0; iteration < MAX_DST_SKIPS; iteration++) {
+      if (!isDstDuplicateFire(this.recentFires, target)) return target
+      const next = flumeCronNext(this.props.cron, target)
+      if (next instanceof FlumeParseError) return next
+      target = next
+    }
+
+    return new FlumeParseError(`cron "${this.props.cron.source}" exceeded DST duplicate bound`)
   }
 
   private clearTimer(): void {

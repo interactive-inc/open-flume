@@ -28,6 +28,12 @@ type Props = {
   reconnect?: boolean | FlumeReconnectOptions
 }
 
+type PendingOpen = {
+  controller: AbortController
+  done: Promise<void>
+  finish: () => void
+}
+
 /**
  * 複数の `Flume` を束ねて動的に増減させる上位レイヤー。各 Flume は immutable のまま、
  * `add()` で新しいグループを起動し `remove()` で個別に停止する。全グループの firehose は
@@ -41,7 +47,7 @@ type Props = {
  * リトライには新しいインスタンスを構築する必要がある。
  *
  * `closeAll()` は終端操作。以後の `add()` / `replace()` は拒否され、closeAll と並行して
- * 起動中だったグループも commit 時点で破棄される (シャットダウン後に誰にも止められない
+ * 起動中だったグループも abort して完了を待つ (シャットダウン後に誰にも止められない
  * グループが残らない)。
  *
  * throw しない流儀に従い `add()` / `replace()` は `Error | null` を返す
@@ -53,6 +59,8 @@ export class FlumeConfluence {
   private readonly pendingIds = new Set<string>()
 
   private readonly removedWhilePending = new Set<string>()
+
+  private readonly pendingOpens = new Set<PendingOpen>()
 
   private isClosedFlag = false
 
@@ -77,9 +85,11 @@ export class FlumeConfluence {
     }
 
     this.pendingIds.add(id)
+    const pending = this.createPendingOpen()
+    this.pendingOpens.add(pending)
 
     try {
-      const running = await this.openGroup(id, sources, undefined)
+      const running = await this.openGroup(id, sources, pending.controller, undefined)
       if (running instanceof Error) return running
 
       // open() を await している間に closeAll / remove が走った可能性がある (TOCTOU)。
@@ -105,6 +115,8 @@ export class FlumeConfluence {
     } finally {
       this.pendingIds.delete(id)
       this.removedWhilePending.delete(id)
+      this.pendingOpens.delete(pending)
+      pending.finish()
     }
   }
 
@@ -127,24 +139,31 @@ export class FlumeConfluence {
       return new FlumeStartError(`FlumeConfluence: id not running: ${id}`)
     }
 
-    const timeoutMs = options?.replaceTimeoutMs ?? DEFAULT_REPLACE_TIMEOUT_MS
-    const next = await this.openGroup(id, sources, timeoutMs)
-    if (next instanceof Error) return next
+    const pending = this.createPendingOpen()
+    this.pendingOpens.add(pending)
 
-    if (this.isClosedFlag) {
-      await next.close()
-      return new FlumeStartError(`FlumeConfluence: closed during replace: ${id}`)
+    try {
+      const timeoutMs = options?.replaceTimeoutMs ?? DEFAULT_REPLACE_TIMEOUT_MS
+      const next = await this.openGroup(id, sources, pending.controller, timeoutMs)
+      if (next instanceof Error) return next
+
+      if (this.isClosedFlag) {
+        await next.close()
+        return new FlumeStartError(`FlumeConfluence: closed during replace: ${id}`)
+      }
+
+      if (this.running.get(id) !== previous) {
+        await next.close()
+        return new FlumeStartError(`FlumeConfluence: ${id} concurrently mutated during replace`)
+      }
+
+      this.running.set(id, next)
+      await previous.close()
+      return null
+    } finally {
+      this.pendingOpens.delete(pending)
+      pending.finish()
     }
-
-    // 起動完了までの間に他者が remove / replace を確定した場合は新グループを破棄して降りる
-    if (this.running.get(id) !== previous) {
-      await next.close()
-      return new FlumeStartError(`FlumeConfluence: ${id} concurrently mutated during replace`)
-    }
-
-    this.running.set(id, next)
-    await previous.close()
-    return null
   }
 
   /**
@@ -167,6 +186,10 @@ export class FlumeConfluence {
   async closeAll(): Promise<void> {
     this.isClosedFlag = true
 
+    const pending = [...this.pendingOpens]
+    for (const operation of pending) attempt(() => operation.controller.abort())
+    await Promise.allSettled(pending.map((operation) => operation.done))
+
     const ids = [...this.running.keys()]
     await Promise.all(ids.map((id) => this.remove(id)))
   }
@@ -188,13 +211,24 @@ export class FlumeConfluence {
   private async openGroup(
     id: string,
     sources: ReadonlyArray<FlumeSource>,
+    controller: AbortController,
     timeoutMs: number | undefined,
   ): Promise<FlumeRunning | Error> {
-    const controller = timeoutMs === undefined ? null : new AbortController()
-    const timeoutHandle =
-      controller === null
+    const timeoutState = { isArmed: timeoutMs !== undefined }
+    const timeoutResult =
+      timeoutMs === undefined
         ? null
-        : this.deps.setTimeout(() => controller.abort(), timeoutMs ?? DEFAULT_REPLACE_TIMEOUT_MS)
+        : attempt(() =>
+            this.deps.setTimeout(() => {
+              if (timeoutState.isArmed) controller.abort()
+            }, timeoutMs),
+          )
+    if (timeoutResult instanceof Error) {
+      attempt(() => controller.abort())
+      return new FlumeStartError(`FlumeConfluence: failed to schedule timeout for "${id}"`, {
+        cause: timeoutResult,
+      })
+    }
 
     const flume = new Flume({
       sources,
@@ -202,16 +236,17 @@ export class FlumeConfluence {
       onError: this.props.onError,
       deps: this.props.deps,
       reconnect: this.props.reconnect,
-      signal: controller?.signal,
+      signal: controller.signal,
     })
 
-    const result = await flume.open()
-    if (timeoutHandle !== null) {
-      attempt(() => this.deps.clearTimeout(timeoutHandle))
+    const result = await attempt(() => flume.open())
+    timeoutState.isArmed = false
+    if (timeoutResult !== null) {
+      attempt(() => this.deps.clearTimeout(timeoutResult))
     }
 
     if (result instanceof Error) {
-      if (controller !== null && controller.signal.aborted) {
+      if (controller.signal.aborted && timeoutMs !== undefined) {
         return new FlumeStartError(
           `FlumeConfluence: open of "${id}" timed out after ${timeoutMs}ms`,
           { cause: result },
@@ -223,13 +258,22 @@ export class FlumeConfluence {
     return result
   }
 
+  private createPendingOpen(): PendingOpen {
+    const completion = Promise.withResolvers<void>()
+    return {
+      controller: new AbortController(),
+      done: completion.promise,
+      finish: completion.resolve,
+    }
+  }
+
   private wrapOnEvent(id: string): FlumeStreamHandler | undefined {
     const onEvent = this.props.onEvent
     if (!onEvent) return undefined
 
     return (item: FlumeStreamItem) => {
       const stamped: FlumeConfluenceItem = { ...item, groupId: id }
-      onEvent(stamped)
+      return onEvent(stamped)
     }
   }
 }

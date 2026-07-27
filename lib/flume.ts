@@ -22,6 +22,7 @@ import { attempt } from "@/utils/attempt"
 import { safeErrorMessage } from "@/utils/safe-error-message"
 import { safeNormalizeError } from "@/utils/safe-normalize-error"
 import { safeNow } from "@/utils/safe-now"
+import { FlumeSerialQueue } from "@/utils/serial-queue"
 
 export type FlumeOptions = {
   /** 統合する Source 群 (必須) */
@@ -71,6 +72,8 @@ export class Flume {
 
   private readonly hub: FlumeStreamHub
 
+  private readonly callbackQueue = new FlumeSerialQueue()
+
   constructor(private readonly options: FlumeOptions) {
     // 呼び出し側の配列 mutate で start/stop/status の対象集合がズレないよう防御コピー
     this.sources = [...options.sources]
@@ -104,17 +107,13 @@ export class Flume {
       timestamp: safeNow({ deps: this.deps }),
     }
 
-    try {
-      Promise.resolve(onEvent({ kind: "log", log })).catch(() => {})
-    } catch {
-      // 溢れ通知はベストエフォート
-    }
+    void this.enqueueCallback({ kind: "log", log })
   }
 
   /** source が受信したログを firehose へ流す handler。error は onError にも分岐する */
   private buildLogHandler(): FlumeLogHandler {
     return (log: FlumeLog) => {
-      this.emitItem({ kind: "log", log })
+      void this.emitItem({ kind: "log", log })
 
       const onError = this.options.onError
       if (!onError || log.level !== "error") return
@@ -133,19 +132,20 @@ export class Flume {
    * onEvent への転送は this.log を経由しない (経由すると log item 経路で再帰する) ため
    * 例外をここで握り潰す
    */
-  private emitItem(item: FlumeStreamItem): void {
-    if (this.hub.isClosed) return
+  private emitItem(item: FlumeStreamItem): Promise<void> {
+    if (this.hub.isClosed) return Promise.resolve()
 
     this.hub.publish(item)
+    return this.enqueueCallback(item)
+  }
 
+  private enqueueCallback(item: FlumeStreamItem): Promise<void> {
     const onEvent = this.options.onEvent
-    if (!onEvent) return
+    if (!onEvent) return Promise.resolve()
 
-    try {
-      Promise.resolve(onEvent(item)).catch(() => {})
-    } catch {
-      // onEvent の throw は firehose ループに波及させない
-    }
+    return this.callbackQueue.add(async () => {
+      await attempt(() => Promise.resolve(onEvent(item)))
+    })
   }
 
   async open(): Promise<FlumeRunning | FlumeStartError> {
@@ -201,6 +201,7 @@ export class Flume {
         `Flume.open: ${failures.length} source(s) failed: ${detail}`,
       )
       this.log.error({ action: "flume.open.failed", message: safeErrorMessage({ error }), error })
+      await this.callbackQueue.drain()
       return error
     }
 
@@ -208,16 +209,36 @@ export class Flume {
       await this.rollback(this.sources)
       const error = new FlumeStartError("Flume.open: aborted during open")
       this.log.warn({ action: "flume.open.aborted", message: safeErrorMessage({ error }), error })
+      await this.callbackQueue.drain()
       return error
     }
 
     this.log.info({ action: "flume.open.complete", message: "all sources opened" })
-    return new FlumeRunning({
+    await this.callbackQueue.drain()
+
+    if (this.isSignalAborted()) {
+      await this.rollback(this.sources)
+      const error = new FlumeStartError("Flume.open: aborted during completion")
+      this.log.warn({ action: "flume.open.aborted", message: safeErrorMessage({ error }), error })
+      await this.callbackQueue.drain()
+      return error
+    }
+
+    const running = new FlumeRunning({
       sources: this.sources,
       signal: this.options.signal,
       log: this.log,
       hub: this.hub,
+      callbackQueue: this.callbackQueue,
     })
+
+    if (!this.isSignalAborted()) return running
+
+    await running.close()
+    const error = new FlumeStartError("Flume.open: aborted while entering running state")
+    this.log.warn({ action: "flume.open.aborted", message: safeErrorMessage({ error }), error })
+    await this.callbackQueue.drain()
+    return error
   }
 
   private guardOpen(): FlumeStartError | null {

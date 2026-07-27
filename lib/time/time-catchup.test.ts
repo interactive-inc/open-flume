@@ -103,4 +103,64 @@ describe("flumeCollectCatchupMatches", () => {
     expect(collected.matches).toEqual([])
     expect(collected.truncated).toBe(false)
   })
+
+  it("keeps the newest matches across a gap larger than the old walk bound", () => {
+    const now = 600_000 * MINUTE_MS
+    const collected = unwrap(
+      flumeCollectCatchupMatches({
+        cron: cron("* * * * *"),
+        lastFiredAt: 0,
+        now,
+        policy: { mode: "missed", maxWindowMs: now },
+      }),
+    )
+
+    expect(collected.matches).toHaveLength(10_000)
+    expect(collected.matches[0]).toBe(590_001 * MINUTE_MS)
+    expect(collected.matches[collected.matches.length - 1]).toBe(now)
+    expect(collected.truncated).toBe(true)
+  })
+
+  it("keeps the newest matches when a sparse cron needs an expanded search window", () => {
+    const now = 60_000 * MINUTE_MS
+    const collected = unwrap(
+      flumeCollectCatchupMatches({
+        cron: cron("*/3 * * * *"),
+        lastFiredAt: 0,
+        now,
+        policy: { mode: "missed", maxWindowMs: now },
+      }),
+    )
+
+    expect(collected.matches).toHaveLength(10_000)
+    expect(collected.matches[0]).toBe(30_003 * MINUTE_MS)
+    expect(collected.matches[collected.matches.length - 1]).toBe(now)
+    expect(collected.truncated).toBe(true)
+  })
+
+  it("deduplicates every repeated wall-clock minute during DST fall-back", () => {
+    const originalTz = process.env.TZ
+    process.env.TZ = "America/New_York"
+
+    try {
+      const collected = unwrap(
+        flumeCollectCatchupMatches({
+          cron: cron("*/15 1 * * *"),
+          lastFiredAt: Date.UTC(2021, 10, 7, 4, 59),
+          now: Date.UTC(2021, 10, 7, 6, 45),
+          policy: { mode: "missed", maxWindowMs: 2 * 60 * MINUTE_MS },
+        }),
+      )
+
+      expect(collected.matches).toEqual([
+        Date.UTC(2021, 10, 7, 5, 0),
+        Date.UTC(2021, 10, 7, 5, 15),
+        Date.UTC(2021, 10, 7, 5, 30),
+        Date.UTC(2021, 10, 7, 5, 45),
+      ])
+    } finally {
+      if (originalTz === undefined) delete process.env.TZ
+      else process.env.TZ = originalTz
+    }
+  })
 })

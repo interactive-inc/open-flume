@@ -43,6 +43,8 @@ export abstract class FlumeSource {
 
   private stopped = false
 
+  private stopPromise: Promise<Error | null> | null = null
+
   private ctx: FlumeSourceStartContext | null = null
 
   private statusEmitter: FlumeStatusEmitter | null = null
@@ -83,9 +85,13 @@ export abstract class FlumeSource {
    * `flume.rollback.failed` として firehose に流す
    */
   async stop(): Promise<Error | null> {
-    if (this.stopped) return null
+    if (this.stopPromise !== null) return this.stopPromise
     this.stopped = true
+    this.stopPromise = this.runStop()
+    return this.stopPromise
+  }
 
+  private async runStop(): Promise<Error | null> {
     const disconnectResult = await attempt(async () => {
       await this.disconnect()
     })

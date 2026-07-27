@@ -4,7 +4,7 @@ import { FlumeStream } from "@/flume-stream"
 const DEFAULT_BUFFER = 1000
 
 type Props = {
-  /** stream の buffer 溢れ通知 (stream ごとに初回 1 回)。Flume が warn ログへ橋渡しする */
+  /** buffer 溢れ通知。Flume が warn ログへ橋渡しする */
   onDrop?: (input: { dropped: number }) => void
 }
 
@@ -25,6 +25,12 @@ function sanitizeBufferSize(value: number | undefined): number {
 export class FlumeStreamHub {
   private readonly streams = new Set<FlumeStream>()
 
+  private readonly startupItems: FlumeStreamItem[] = []
+
+  private startupDropNotified = false
+
+  private hasSubscribed = false
+
   private closed = false
 
   constructor(private readonly props: Props = {}) {}
@@ -35,6 +41,19 @@ export class FlumeStreamHub {
 
   publish(item: FlumeStreamItem): void {
     if (this.closed) return
+
+    if (!this.hasSubscribed) {
+      if (this.startupItems.length >= DEFAULT_BUFFER) {
+        this.startupItems.shift()
+        if (!this.startupDropNotified) {
+          this.startupDropNotified = true
+          this.props.onDrop?.({ dropped: 1 })
+        }
+      }
+      this.startupItems.push(item)
+      return
+    }
+
     for (const stream of this.streams) stream.push(item)
   }
 
@@ -51,6 +70,12 @@ export class FlumeStreamHub {
       return stream
     }
 
+    if (!this.hasSubscribed) {
+      this.hasSubscribed = true
+      for (const item of this.startupItems) stream.push(item)
+      this.startupItems.splice(0)
+    }
+
     this.streams.add(stream)
     return stream
   }
@@ -61,5 +86,6 @@ export class FlumeStreamHub {
 
     for (const stream of this.streams) stream.close()
     this.streams.clear()
+    this.startupItems.splice(0)
   }
 }

@@ -168,9 +168,10 @@ class MyWebhookSource extends FlumeSource {
     const res = await ctx.deps.fetch(this.options.url)
     const payload = await res.json()
     this.emit({
-      source: this.name as "discord", // declare your own discriminant via FlumeEvent extension
+      source: "custom",
+      sourceName: this.name,
       type: "webhook",
-      data: payload,
+      data: { payload },
       meta: { event_type: "webhook" },
       receivedAt: ctx.deps.now(),
     })

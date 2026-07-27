@@ -7,12 +7,14 @@ import { attempt } from "@/utils/attempt"
 import { safeErrorMessage } from "@/utils/safe-error-message"
 import { safeInvokeCallback } from "@/utils/safe-invoke-callback"
 import { safeNormalizeError } from "@/utils/safe-normalize-error"
+import { FlumeSerialQueue } from "@/utils/serial-queue"
 
 type Props = {
   sources: ReadonlyArray<FlumeSource>
   signal?: AbortSignal
   log: FlumeLogger
   hub: FlumeStreamHub
+  callbackQueue: FlumeSerialQueue
 }
 
 /**
@@ -133,7 +135,9 @@ export class FlumeRunning {
           })
         }
       }
+      await this.props.callbackQueue.drain()
       this.props.log.info({ action: "flume.close.complete", message: "all sources closed" })
+      await this.props.callbackQueue.drain()
 
       this.props.hub.close()
       return new FlumeClosed({ finalStatuses: this.snapshotStatuses(), closeErrors })

@@ -370,6 +370,15 @@ describe("flumeExtractDiscordMeta", () => {
     expect(meta.user_id).toBe("u-1")
   })
 
+  it("extracts top-level user_id from reaction and typing events", () => {
+    const meta = flumeExtractDiscordMeta("MESSAGE_REACTION_ADD", {
+      channel_id: "ch-1",
+      user_id: "u-top",
+    })
+
+    expect(meta.user_id).toBe("u-top")
+  })
+
   it("ignores non-string fields", () => {
     const meta = flumeExtractDiscordMeta("MESSAGE_CREATE", {
       channel_id: 123,

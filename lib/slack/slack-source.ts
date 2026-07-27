@@ -24,6 +24,9 @@ const TERMINAL_SLACK_ERROR_CODES = new Set([
   "account_inactive",
   "token_revoked",
   "not_authed",
+  "not_allowed_token_type",
+  "token_expired",
+  "missing_scope",
 ])
 
 export class FlumeSlackSource extends FlumeSource {

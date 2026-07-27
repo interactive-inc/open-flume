@@ -258,12 +258,18 @@ export class FlumeDiscordGateway {
       }, timeoutMs),
     )
     if (timerResult instanceof Error) {
+      const error = new FlumeConnectionError(
+        `handshake timer scheduling failed: ${safeErrorMessage({ error: timerResult })}`,
+        { cause: timerResult },
+      )
       this.log.error({
         action: "handshake.timer.schedule.error",
-        message: safeErrorMessage({ error: timerResult }),
-        error: timerResult,
+        message: safeErrorMessage({ error }),
+        error,
       })
       this.handshakeTimer = null
+      this.completeConnect(error)
+      this.forceClose({ code: 4000, reason: "handshake timer failure" })
       return
     }
     this.handshakeTimer = timerResult
@@ -306,9 +312,9 @@ export class FlumeDiscordGateway {
    * 即座に止めて onZombie が interval ごとに再発火するのを防ぐ。close code は resume 可能な
    * 4000 を使う (4009 は session 無効化コードと衝突する)
    */
-  private forceClose(input: { code: number; reason: string }): void {
+  private forceClose(input: { ws?: WebSocket; code: number; reason: string }): void {
     this.heartbeat?.stop()
-    this.closeSocket({ ws: this.ws, code: input.code, reason: input.reason })
+    this.closeSocket({ ws: input.ws ?? this.ws, code: input.code, reason: input.reason })
     this.armForcedCloseFallback()
   }
 
@@ -329,6 +335,7 @@ export class FlumeDiscordGateway {
         error: timerResult,
       })
       this.forcedCloseFallbackTimer = null
+      this.synthesizeTeardown()
       return
     }
     this.forcedCloseFallbackTimer = timerResult
@@ -500,7 +507,16 @@ export class FlumeDiscordGateway {
       },
     })
 
-    this.heartbeat.start(interval)
+    const heartbeatError = this.heartbeat.start(interval)
+    if (heartbeatError instanceof Error) {
+      const error = new FlumeConnectionError(
+        `heartbeat timer scheduling failed: ${safeErrorMessage({ error: heartbeatError })}`,
+        { cause: heartbeatError },
+      )
+      this.completeConnect(error)
+      this.forceClose({ code: 4000, reason: "heartbeat timer failure" })
+      return
+    }
 
     if (this.currentSession.canResume()) {
       this.sendResume()
@@ -516,12 +532,12 @@ export class FlumeDiscordGateway {
 
   private onHeartbeatRequest(): void {
     this.log.debug({ action: "heartbeat.requested", message: "server requested heartbeat" })
-    this.send({ op: OP_HEARTBEAT, d: this.currentSession.seq })
+    this.heartbeat?.request()
   }
 
   private onReconnectRequest(socket: WebSocket): void {
     this.log.info({ action: "ws.reconnect.requested", message: "server requested reconnect" })
-    this.closeSocket({ ws: socket, code: 4000, reason: "reconnect requested" })
+    this.forceClose({ ws: socket, code: 4000, reason: "reconnect requested" })
   }
 
   private onInvalidSession(msg: FlumeGatewayMessage, socket: WebSocket): void {
@@ -542,7 +558,7 @@ export class FlumeDiscordGateway {
     const timerResult = attempt(() =>
       this.props.deps.setTimeout(() => {
         this.invalidSessionTimer = null
-        this.closeSocket({ ws: socket, code: 4000, reason: "invalid session" })
+        this.forceClose({ ws: socket, code: 4000, reason: "invalid session" })
       }, delay),
     )
     if (timerResult instanceof Error) {
@@ -552,6 +568,7 @@ export class FlumeDiscordGateway {
         error: timerResult,
       })
       this.invalidSessionTimer = null
+      this.forceClose({ ws: socket, code: 4000, reason: "invalid session timer failure" })
     } else {
       this.invalidSessionTimer = timerResult
     }

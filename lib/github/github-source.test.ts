@@ -139,6 +139,19 @@ describe("FlumeGitHubSource", () => {
 
     expect(test.deps.setInterval).toHaveBeenCalledWith(expect.any(Function), 60_000)
   })
+
+  it("clamps intervals above the runtime timer limit instead of scheduling 1ms", async () => {
+    const test = createMockDeps()
+    test.mockFetch.mockResolvedValue(makeJsonResponse([]))
+    const source = new FlumeGitHubSource({
+      token: "ghp_test",
+      pollInterval: 30 * 24 * 60 * 60,
+    })
+
+    await source.start(createCtx({ deps: test.deps }))
+
+    expect(test.deps.setInterval).toHaveBeenCalledWith(expect.any(Function), 2_147_483_000)
+  })
 })
 
 describe("flumeExtractGitHubMeta", () => {

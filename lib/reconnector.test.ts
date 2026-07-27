@@ -247,4 +247,31 @@ describe("FlumeReconnector", () => {
     expect(staleFn).not.toHaveBeenCalled()
     expect(freshFn).toHaveBeenCalled()
   })
+
+  it("invalidates the last pending timer when attempts become exhausted", () => {
+    let captured = (): void => {}
+    const retry = vi.fn()
+    const reconnector = new FlumeReconnector({
+      maxAttempts: 1,
+      baseDelay: 100,
+      maxDelay: 1000,
+      log: createLog(),
+      deps: {
+        setTimeout: (fn) => {
+          captured = fn
+          return 1
+        },
+        clearTimeout: () => {
+          throw new Error("clear rejected")
+        },
+        random: () => 0.5,
+      },
+    })
+
+    expect(reconnector.schedule(retry).kind).toBe("scheduled")
+    expect(reconnector.schedule(vi.fn()).kind).toBe("exhausted")
+    captured()
+
+    expect(retry).not.toHaveBeenCalled()
+  })
 })

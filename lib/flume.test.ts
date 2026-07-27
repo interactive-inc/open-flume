@@ -58,6 +58,38 @@ describe("Flume", () => {
     expect(a.startCount).toBe(1)
   })
 
+  it("accepts a custom source event without disguising it as a built-in source", async () => {
+    class CustomSource extends FlumeSource {
+      readonly name = "my-webhook"
+
+      protected async connect(): Promise<Error | null> {
+        this.emit({
+          source: "custom",
+          sourceName: this.name,
+          type: "webhook",
+          data: { value: 1 },
+          meta: { event_type: "webhook" },
+          receivedAt: 0,
+        })
+        return null
+      }
+
+      protected disconnect(): void {}
+    }
+
+    const received: FlumeEvent[] = []
+    const running = await new Flume({
+      sources: [new CustomSource()],
+      onEvent: (item) => {
+        if (item.kind === "event") received.push(item.event)
+      },
+    }).open()
+
+    expect(running).toBeInstanceOf(FlumeRunning)
+    expect(received[0]?.source).toBe("custom")
+    if (received[0]?.source === "custom") expect(received[0].sourceName).toBe("my-webhook")
+  })
+
   it("drops events silently when onEvent is omitted", async () => {
     const a = new MockSource({ name: "discord" })
     const flume = new Flume({ sources: [a] })
@@ -245,6 +277,23 @@ describe("Flume", () => {
     expect(result).toBeInstanceOf(Error)
     expect(a.startCount).toBe(0)
   })
+
+  it("returns an error and rolls back when onEvent aborts during open.complete", async () => {
+    const source = new MockSource({ name: "discord" })
+    const controller = new AbortController()
+    const flume = new Flume({
+      sources: [source],
+      signal: controller.signal,
+      onEvent: (item) => {
+        if (item.kind === "log" && item.log.action === "flume.open.complete") controller.abort()
+      },
+    })
+
+    const result = await flume.open()
+
+    expect(result).toBeInstanceOf(Error)
+    expect(source.stopCount).toBe(1)
+  })
 })
 
 describe("FlumeRunning", () => {
@@ -381,6 +430,89 @@ describe("FlumeRunning", () => {
     const closed = await running.close()
     expect(closed.errors()).toEqual([])
   })
+
+  it("serializes async onEvent calls and drains them before close resolves", async () => {
+    const source = new MockSource({ name: "discord" })
+    const gate = Promise.withResolvers<void>()
+    const order: string[] = []
+    const flume = new Flume({
+      sources: [source],
+      onEvent: async (item) => {
+        if (item.kind !== "event") return
+        order.push(`start:${item.event.type}`)
+        if (item.event.type === "first") await gate.promise
+        order.push(`end:${item.event.type}`)
+      },
+    })
+    const running = await flume.open()
+    if (running instanceof Error) throw running
+
+    source.pushEvent?.({
+      source: "discord",
+      type: "first",
+      data: {},
+      meta: {},
+      receivedAt: 0,
+    })
+    source.pushEvent?.({
+      source: "discord",
+      type: "second",
+      data: {},
+      meta: {},
+      receivedAt: 0,
+    })
+
+    await waitFor(() => expect(order).toEqual(["start:first"]))
+    const closeState = { settled: false }
+    const closePromise = running.close().then((closed) => {
+      closeState.settled = true
+      return closed
+    })
+    await Promise.resolve()
+    expect(closeState.settled).toBe(false)
+
+    gate.resolve()
+    await closePromise
+    expect(order).toEqual(["start:first", "end:first", "start:second", "end:second"])
+  })
+
+  it("waits for an in-flight async source stop during abort rollback", async () => {
+    const connectGate = Promise.withResolvers<void>()
+    const cleanupGate = Promise.withResolvers<void>()
+
+    class SlowStopSource extends FlumeSource {
+      readonly name = "discord"
+      cleaned = false
+
+      protected async connect(): Promise<Error | null> {
+        await connectGate.promise
+        return null
+      }
+
+      protected async disconnect(): Promise<void> {
+        connectGate.resolve()
+        await cleanupGate.promise
+        this.cleaned = true
+      }
+    }
+
+    const source = new SlowStopSource()
+    const controller = new AbortController()
+    const openPromise = new Flume({ sources: [source], signal: controller.signal }).open()
+    await Promise.resolve()
+    controller.abort()
+
+    const state = { settled: false }
+    void openPromise.then(() => {
+      state.settled = true
+    })
+    await Promise.resolve()
+    expect(state.settled).toBe(false)
+
+    cleanupGate.resolve()
+    expect(await openPromise).toBeInstanceOf(Error)
+    expect(source.cleaned).toBe(true)
+  })
 })
 
 describe("FlumeClosed", () => {
@@ -394,6 +526,17 @@ describe("FlumeClosed", () => {
     const closed = await running.close()
 
     expect(closed.statuses()).toEqual([{ source: "discord", status: "disconnected" }])
+  })
+
+  it("freezes the returned status and error snapshots", () => {
+    const status = { source: "discord", status: "disconnected" as const }
+    const closeError = { source: "discord", error: new Error("closed") }
+    const closed = new FlumeClosed({ finalStatuses: [status], closeErrors: [closeError] })
+
+    expect(Object.isFrozen(closed.statuses())).toBe(true)
+    expect(Object.isFrozen(closed.statuses()[0])).toBe(true)
+    expect(Object.isFrozen(closed.errors())).toBe(true)
+    expect(Object.isFrozen(closed.errors()[0])).toBe(true)
   })
 })
 
@@ -440,6 +583,41 @@ describe("Flume onError", () => {
 })
 
 describe("FlumeRunning.stream", () => {
+  it("replays events emitted during source startup to the first pull subscriber", async () => {
+    class StartupSource extends FlumeSource {
+      readonly name = "discord"
+
+      protected async connect(): Promise<Error | null> {
+        this.emit({
+          source: "discord",
+          type: "startup",
+          data: {},
+          meta: {},
+          receivedAt: 0,
+        })
+        return null
+      }
+
+      protected disconnect(): void {}
+    }
+
+    const running = await new Flume({ sources: [new StartupSource()] }).open()
+    if (running instanceof Error) throw running
+
+    const stream = running.stream()
+    const received: FlumeEvent[] = []
+    for (let count = 0; count < 10; count++) {
+      const item = await stream.next()
+      if (item.value?.kind !== "event") continue
+      received.push(item.value.event)
+      break
+    }
+
+    expect(received.map((event) => event.type)).toEqual(["startup"])
+    await stream.return?.()
+    await running.close()
+  })
+
   it("yields event items to a for-await consumer", async () => {
     const a = new MockSource({ name: "discord" })
     const flume = new Flume({ sources: [a] })

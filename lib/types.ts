@@ -58,7 +58,21 @@ export type FlumeTimeEvent = {
   receivedAt: number
 }
 
-export type FlumeEvent = FlumeDiscordEvent | FlumeSlackEvent | FlumeGitHubEvent | FlumeTimeEvent
+export type FlumeCustomEvent = {
+  source: "custom"
+  sourceName: string
+  type: string
+  data: Record<string, unknown>
+  meta: Record<string, string>
+  receivedAt: number
+}
+
+export type FlumeEvent =
+  | FlumeDiscordEvent
+  | FlumeSlackEvent
+  | FlumeGitHubEvent
+  | FlumeTimeEvent
+  | FlumeCustomEvent
 
 export type FlumeEventHandler = (event: FlumeEvent) => void | Promise<void>
 
@@ -66,7 +80,7 @@ export type FlumeEventHandler = (event: FlumeEvent) => void | Promise<void>
 
 export type FlumeStreamItem = { kind: "event"; event: FlumeEvent } | { kind: "log"; log: FlumeLog }
 
-export type FlumeStreamHandler = (item: FlumeStreamItem) => void
+export type FlumeStreamHandler = (item: FlumeStreamItem) => unknown | Promise<unknown>
 
 /**
  * `FlumeConfluence` が onEvent に渡す item。Flume 単体の `FlumeStreamItem` に
@@ -75,7 +89,7 @@ export type FlumeStreamHandler = (item: FlumeStreamItem) => void
  */
 export type FlumeConfluenceItem = FlumeStreamItem & { readonly groupId: string }
 
-export type FlumeConfluenceItemHandler = (item: FlumeConfluenceItem) => void
+export type FlumeConfluenceItemHandler = (item: FlumeConfluenceItem) => unknown | Promise<unknown>
 
 // Pull stream (FlumeRunning.stream() の async iterator オプション)
 

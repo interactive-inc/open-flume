@@ -18,12 +18,22 @@ type Props = {
 export class FlumeClosed {
   readonly kind = "closed" as const
 
-  constructor(private readonly props: Props) {
+  private readonly finalStatuses: ReadonlyArray<FlumeSourceStatus>
+
+  private readonly closeErrors: ReadonlyArray<FlumeCloseError>
+
+  constructor(props: Props) {
+    this.finalStatuses = Object.freeze(
+      props.finalStatuses.map((status) => Object.freeze({ ...status })),
+    )
+    this.closeErrors = Object.freeze(
+      props.closeErrors.map((closeError) => Object.freeze({ ...closeError })),
+    )
     Object.freeze(this)
   }
 
   statuses(): ReadonlyArray<FlumeSourceStatus> {
-    return this.props.finalStatuses
+    return this.finalStatuses
   }
 
   /**
@@ -32,6 +42,6 @@ export class FlumeClosed {
    * 全 source が clean close した場合は空配列。
    */
   errors(): ReadonlyArray<FlumeCloseError> {
-    return this.props.closeErrors
+    return this.closeErrors
   }
 }

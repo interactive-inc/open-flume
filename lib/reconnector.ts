@@ -59,7 +59,11 @@ export class FlumeReconnector {
 
   schedule(fn: () => void, options?: ScheduleOptions): FlumeReconnectSchedule {
     if (this.isAborted) return { kind: "refused" }
-    if (this.currentAttempt >= this.props.maxAttempts) return { kind: "exhausted" }
+    if (this.currentAttempt >= this.props.maxAttempts) {
+      this.generation++
+      this.clearTimer()
+      return { kind: "exhausted" }
+    }
 
     this.clearTimer()
     const delay = this.computeDelay(options?.minDelayMs ?? 0)

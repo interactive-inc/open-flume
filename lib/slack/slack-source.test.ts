@@ -237,37 +237,40 @@ describe("FlumeSlackSource", () => {
     expect(statuses).toContain("reconnecting")
   })
 
-  it("treats invalid_auth as terminal: start() fails and no reconnect is scheduled", async () => {
-    TrackingMockWebSocket.latest = null
-    const statuses: Array<FlumeStatus> = []
-    const logs: Array<FlumeLog> = []
-    const bundle = createDeps()
-    bundle.deps.fetch = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      text: () => Promise.resolve(JSON.stringify({ ok: false, error: "invalid_auth" })),
-    })
+  it.each(["invalid_auth", "not_allowed_token_type", "token_expired", "missing_scope"])(
+    "treats %s as terminal: start() fails and no reconnect is scheduled",
+    async (errorCode) => {
+      TrackingMockWebSocket.latest = null
+      const statuses: Array<FlumeStatus> = []
+      const logs: Array<FlumeLog> = []
+      const bundle = createDeps()
+      bundle.deps.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        text: () => Promise.resolve(JSON.stringify({ ok: false, error: errorCode })),
+      })
 
-    const source = new FlumeSlackSource({ appToken: "xapp-bad", botToken: "xoxb-test" })
-    const result = await source.start(
-      createCtx({
-        deps: bundle.deps,
-        onStatus: (status) => statuses.push(status),
-        onLog: (log) => logs.push(log),
-        reconnect: { maxAttempts: 5, baseDelay: 10, maxDelay: 100 },
-      }),
-    )
+      const source = new FlumeSlackSource({ appToken: "xapp-bad", botToken: "xoxb-test" })
+      const result = await source.start(
+        createCtx({
+          deps: bundle.deps,
+          onStatus: (status) => statuses.push(status),
+          onLog: (log) => logs.push(log),
+          reconnect: { maxAttempts: 5, baseDelay: 10, maxDelay: 100 },
+        }),
+      )
 
-    expect(result).toBeInstanceOf(FlumeHttpError)
-    if (result instanceof FlumeHttpError) {
-      expect(result.code).toBe("invalid_auth")
-    }
-    expect(statuses).toContain("disconnected")
-    expect(statuses).not.toContain("reconnecting")
-    expect(logs.some((log) => log.action === "reconnect.terminal")).toBe(true)
-    expect(logs.some((log) => log.action === "reconnect.scheduled")).toBe(false)
-    expect(bundle.timeouts).toHaveLength(0)
-  })
+      expect(result).toBeInstanceOf(FlumeHttpError)
+      if (result instanceof FlumeHttpError) {
+        expect(result.code).toBe(errorCode)
+      }
+      expect(statuses).toContain("disconnected")
+      expect(statuses).not.toContain("reconnecting")
+      expect(logs.some((log) => log.action === "reconnect.terminal")).toBe(true)
+      expect(logs.some((log) => log.action === "reconnect.scheduled")).toBe(false)
+      expect(bundle.timeouts).toHaveLength(0)
+    },
+  )
 
   it("respects 429 Retry-After as the reconnect backoff floor", async () => {
     TrackingMockWebSocket.latest = null
@@ -408,13 +411,14 @@ describe("flumeExtractSlackMeta", () => {
     expect(meta.slack_event_type).toBe("message")
   })
 
-  it("handles missing event payload", () => {
+  it("extracts top-level slash command metadata without an event payload", () => {
     const meta = flumeExtractSlackMeta({
       envelope_id: "e1",
       type: "slash_commands",
-      payload: {},
+      payload: { channel_id: "C123", user_id: "U456" },
     })
     expect(meta.event_type).toBe("slash_commands")
-    expect(meta.channel_id).toBeUndefined()
+    expect(meta.channel_id).toBe("C123")
+    expect(meta.user_id).toBe("U456")
   })
 })

@@ -34,7 +34,8 @@ type Props = {
 const NOTIFICATIONS_URL = "https://api.github.com/notifications"
 const CONSECUTIVE_ERRORS_TO_DISCONNECT = 3
 const SEEN_CACHE_MAX = 5000
-const MAX_PAGES = 10
+const MAX_PAGES = 1000
+const MAX_TIMER_DELAY_MS = 2_147_483_647
 
 /**
  * GitHub /notifications を条件付きポーリングする (ETag / Last-Modified)。
@@ -49,6 +50,8 @@ export class FlumeGitHubPoller {
   private timer: FlumeTimerHandle | null = null
 
   private rateLimitTimer: FlumeTimerHandle | null = null
+
+  private rateLimitPauseActive = false
 
   private since: string | null = null
 
@@ -105,7 +108,7 @@ export class FlumeGitHubPoller {
 
     // 初回 poll が rate-limit された場合は handleRateLimit が再開タイマーを握っている。
     // ここで interval を張ると一時停止を打ち消すのでスキップする
-    if (this.rateLimitTimer !== null) return null
+    if (this.rateLimitPauseActive) return null
 
     this.scheduleInterval()
     return null
@@ -119,23 +122,27 @@ export class FlumeGitHubPoller {
 
     this.clearTimer()
     this.clearRateLimitTimer()
+    this.rateLimitPauseActive = false
   }
 
   private scheduleInterval(): void {
     this.clearTimer()
 
     const intervalResult = attempt(() =>
-      this.props.deps.setInterval(() => {
-        // poll() は内部で try/catch 済みで reject しない。将来 throw する変更への保険として log + 握り潰す
-        this.poll().catch((err) => {
-          const error = safeNormalizeError({ value: err })
-          this.log.error({
-            action: "poll.unhandled",
-            message: safeErrorMessage({ error }),
-            error,
+      this.props.deps.setInterval(
+        () => {
+          // poll() は内部で try/catch 済みで reject しない。将来 throw する変更への保険として log + 握り潰す
+          this.poll().catch((err) => {
+            const error = safeNormalizeError({ value: err })
+            this.log.error({
+              action: "poll.unhandled",
+              message: safeErrorMessage({ error }),
+              error,
+            })
           })
-        })
-      }, this.effectiveIntervalSec * 1000),
+        },
+        Math.min(this.effectiveIntervalSec * 1000, MAX_TIMER_DELAY_MS),
+      ),
     )
     if (intervalResult instanceof Error) {
       this.log.error({
@@ -198,7 +205,7 @@ export class FlumeGitHubPoller {
       return null
     }
 
-    if (this.isRateLimited(response)) {
+    if (await this.isRateLimited(response)) {
       this.handleRateLimit(response)
       return null
     }
@@ -256,12 +263,11 @@ export class FlumeGitHubPoller {
       if (nextUrl === null) return rawNotifications
 
       if (pageCount >= MAX_PAGES) {
-        this.log.warn({
-          action: "poll.pages.truncated",
-          message: `stopped after ${MAX_PAGES} pages, next page remains`,
-          detail: { pageCount, nextUrl },
+        const error = new FlumeHttpError({
+          message: `pagination exceeded the safety limit of ${MAX_PAGES} pages`,
+          status: 0,
         })
-        return rawNotifications
+        return this.recordFailure({ kind: "http", message: error.message, error })
       }
 
       const nextResponse = await this.fetchPage(nextUrl, false)
@@ -273,7 +279,7 @@ export class FlumeGitHubPoller {
           cause: nextResponse,
         })
       }
-      if (this.isRateLimited(nextResponse)) {
+      if (await this.isRateLimited(nextResponse)) {
         this.handleRateLimit(nextResponse)
         return null
       }
@@ -414,15 +420,22 @@ export class FlumeGitHubPoller {
   }
 
   /**
-   * 429 は常に rate limit。403 は Retry-After 付き (secondary rate limit、
-   * X-RateLimit-Remaining が 0 でないことがある) か X-RateLimit-Remaining が 0 の場合
+   * 429 は常に rate limit。403 は Retry-After 付き、X-RateLimit-Remaining が 0、
+   * または本文が secondary rate limit / abuse detection を示す場合
    */
-  private isRateLimited(response: Response): boolean {
+  private async isRateLimited(response: Response): Promise<boolean> {
     if (response.status === 429) return true
     if (response.status !== 403) return false
     if (response.headers.get("Retry-After") !== null) return true
     if (response.headers.get("X-RateLimit-Remaining") === "0") return true
-    return false
+
+    const cloned = attempt(() => response.clone())
+    if (cloned instanceof Error) return false
+    const body = await safeReadText({ response: cloned, context: "rate limit response" })
+    if (body instanceof Error) return false
+
+    const normalized = body.toLowerCase()
+    return normalized.includes("secondary rate limit") || normalized.includes("abuse detection")
   }
 
   private handleRateLimit(response: Response): void {
@@ -448,23 +461,28 @@ export class FlumeGitHubPoller {
 
     this.clearTimer()
     this.clearRateLimitTimer()
+    this.rateLimitPauseActive = true
 
     const timerResult = attempt(() =>
-      this.props.deps.setTimeout(() => {
-        this.rateLimitTimer = null
-        if (this.isStoppedFlag) return
+      this.props.deps.setTimeout(
+        () => {
+          this.rateLimitTimer = null
+          this.rateLimitPauseActive = false
+          if (this.isStoppedFlag) return
 
-        // 一時停止明けは interval 1 周分をさらに待たず、すぐ 1 回 poll する
-        this.scheduleInterval()
-        this.poll().catch((err) => {
-          const error = safeNormalizeError({ value: err })
-          this.log.error({
-            action: "poll.unhandled",
-            message: safeErrorMessage({ error }),
-            error,
+          // 一時停止明けは interval 1 周分をさらに待たず、すぐ 1 回 poll する
+          this.scheduleInterval()
+          this.poll().catch((err) => {
+            const error = safeNormalizeError({ value: err })
+            this.log.error({
+              action: "poll.unhandled",
+              message: safeErrorMessage({ error }),
+              error,
+            })
           })
-        })
-      }, delaySec * 1000),
+        },
+        Math.min(delaySec * 1000, MAX_TIMER_DELAY_MS),
+      ),
     )
     if (timerResult instanceof Error) {
       this.log.error({
@@ -473,6 +491,9 @@ export class FlumeGitHubPoller {
         error: timerResult,
       })
       this.rateLimitTimer = null
+      if (!this.isStoppedFlag) {
+        this.props.onDisconnected("rate-limit timer scheduling rejected by runtime")
+      }
     } else {
       this.rateLimitTimer = timerResult
     }
@@ -516,7 +537,10 @@ export class FlumeGitHubPoller {
     const headerSec = Number.parseInt(headerValue, 10)
     if (!Number.isFinite(headerSec)) return
 
-    const nextSec = Math.max(this.props.interval, headerSec)
+    const nextSec = Math.min(
+      Math.max(this.props.interval, headerSec),
+      Math.floor(MAX_TIMER_DELAY_MS / 1000),
+    )
     if (nextSec === this.effectiveIntervalSec) return
 
     this.log.info({

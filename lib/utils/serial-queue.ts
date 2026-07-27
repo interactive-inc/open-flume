@@ -24,16 +24,16 @@ export class FlumeSerialQueue {
 
   constructor(private readonly props: Props = {}) {}
 
-  add(task: () => Promise<void>): void {
-    if (this.cancelled) return
+  add(task: () => Promise<void>): Promise<void> {
+    if (this.cancelled) return Promise.resolve()
 
     if (this.props.maxDepth !== undefined && this.depth >= this.props.maxDepth) {
       this.props.onOverflow?.({ dropped: 1, depth: this.depth })
-      return
+      return Promise.resolve()
     }
 
     this.depth++
-    this.chain = this.chain.then(async () => {
+    const completion = this.chain.then(async () => {
       try {
         if (!this.cancelled) await task()
       } catch {
@@ -42,6 +42,8 @@ export class FlumeSerialQueue {
         this.depth--
       }
     })
+    this.chain = completion
+    return completion
   }
 
   async drain(): Promise<void> {
