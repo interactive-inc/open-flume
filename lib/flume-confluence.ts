@@ -233,7 +233,7 @@ export class FlumeConfluence {
     const flume = new Flume({
       sources,
       onEvent: this.wrapOnEvent(id),
-      onError: this.props.onError,
+      onError: this.wrapOnError(id),
       deps: this.props.deps,
       reconnect: this.props.reconnect,
       signal: controller.signal,
@@ -275,5 +275,12 @@ export class FlumeConfluence {
       const stamped: FlumeConfluenceItem = { ...item, groupId: id }
       return onEvent(stamped)
     }
+  }
+
+  private wrapOnError(id: string): FlumeErrorHandler | undefined {
+    const onError = this.props.onError
+    if (!onError) return undefined
+
+    return (log) => onError({ ...log, detail: { ...log.detail, groupId: id } })
   }
 }

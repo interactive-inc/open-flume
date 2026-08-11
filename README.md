@@ -100,7 +100,7 @@ import { FlumeConfluence } from "@interactive-inc/flume"
 
 const confluence = new FlumeConfluence({
   onEvent: (item) => {
-    if (item.kind === "event") feedToAgent(item.event)
+    if (item.kind === "event") feedToAgent(item.groupId, item.event)
     if (item.kind === "log" && item.log.action === "status") noticeDisconnect(item.log)
   },
   reconnect: { maxAttempts: 10 },
@@ -112,7 +112,7 @@ await confluence.remove("team-a") // stops only team-a
 await confluence.closeAll()
 ```
 
-`add(id, sources)` starts a fresh `Flume` for that group and returns `Error | null` (a duplicate id or a failed start is returned, never thrown). The `id` is just a management handle — the merged stream itself is untagged; identify the origin via the `source` field inside each item. Each group is an independent `Flume`, so a failure in one group never rolls back another. Reconstructing a group (rather than mutating one in place) loses only its reconnect counters, dedup caches, and Discord session resume — acceptable on a deliberate add/remove.
+`add(id, sources)` starts a fresh `Flume` for that group and returns `Error | null` (a duplicate id or a failed start is returned, never thrown). Every merged item is stamped with that id as `groupId`, while `item.event.source` / `item.log.source` identifies the protocol source inside the group. Each group is an independent `Flume`, so a failure in one group never rolls back another. `replace(id, sources)` opens a replacement first and closes the previous group only after the new one is ready; a failed replacement leaves the previous group running.
 
 ## Sub-entries
 
@@ -126,24 +126,32 @@ import { FlumeGitHubSource } from "@interactive-inc/flume/github"
 import { FlumeTimeSource } from "@interactive-inc/flume/time"
 ```
 
-- `@interactive-inc/flume` — `Flume`, `FlumeConfluence`, `FlumeRunning`, `FlumeClosed`, `FlumeSource` (abstract base for third-party sources), `createFlumeDefaultDeps`, errors, types
+- `@interactive-inc/flume` — `Flume`, `FlumeConfluence`, `FlumeRunning`, `FlumeClosed`, `FlumeSource` (abstract base for third-party sources), `createFlumeDefaultDeps`, errors, types, and the common `attempt` / `safe*` utilities used by custom sources
 - `@interactive-inc/flume/discord` — `FlumeDiscordSource`, `FlumeDiscordGatewayIntents`, `flumeExtractDiscordMeta`
 - `@interactive-inc/flume/slack` — `FlumeSlackSource`, `flumeExtractSlackMeta`
 - `@interactive-inc/flume/github` — `FlumeGitHubSource`, `flumeExtractGitHubMeta`
-- `@interactive-inc/flume/time` — `FlumeTimeSource`, `parseCron`, `flumeCronNext`
+- `@interactive-inc/flume/time` — `FlumeTimeSource`, `parseCron`, `flumeCronNext`, `flumeCollectCatchupMatches`
 
 ## Custom sources
 
 Extend `FlumeSource` to plug in any protocol. The base class owns `start`/`stop`/`status`, the per-source event queue, status emission (logged on every transition), and consumed/stopped guards. You implement `connect` (open the protocol, emit events, set status) and `disconnect` (tear it down).
 
 ```ts
-import { FlumeSource } from "@interactive-inc/flume"
-import type { FlumeSourceStartContext } from "@interactive-inc/flume"
+import {
+  attempt,
+  FlumeSource,
+  safeErrorMessage,
+  safeInvokeCallback,
+  safeJsonParse,
+  safeNow,
+  safeReadText,
+} from "@interactive-inc/flume"
+import type { FlumeSourceStartContext, FlumeTimerHandle } from "@interactive-inc/flume"
 
 class MyWebhookSource extends FlumeSource {
   readonly name = "my-webhook"
 
-  private timer: ReturnType<typeof setInterval> | null = null
+  private timer: FlumeTimerHandle | null = null
 
   constructor(private readonly options: { url: string; pollInterval?: number }) {
     super()
@@ -152,34 +160,73 @@ class MyWebhookSource extends FlumeSource {
   protected async connect(ctx: FlumeSourceStartContext): Promise<Error | null> {
     this.setStatus("connecting")
     const interval = (this.options.pollInterval ?? 30) * 1000
-    this.timer = ctx.deps.setInterval(() => this.poll(ctx), interval) as ReturnType<
-      typeof setInterval
-    >
+    const timer = attempt(() => ctx.deps.setInterval(() => this.runPoll(ctx), interval))
+    if (timer instanceof Error) return timer
+    this.timer = timer
     this.setStatus("connected")
     return null
   }
 
   protected disconnect(): void {
-    if (this.timer) clearInterval(this.timer)
+    const timer = this.timer
     this.timer = null
+    const ctx = this.context
+    if (timer === null || ctx === null) return
+
+    const result = attempt(() => ctx.deps.clearInterval(timer))
+    if (result instanceof Error) {
+      ctx.log.error({
+        action: "timer.clear.error",
+        message: safeErrorMessage({ error: result }),
+        error: result,
+      })
+    }
   }
 
-  private async poll(ctx: FlumeSourceStartContext): Promise<void> {
-    const res = await ctx.deps.fetch(this.options.url)
-    const payload = await res.json()
+  private runPoll(ctx: FlumeSourceStartContext): void {
+    safeInvokeCallback({
+      fn: async () => {
+        const result = await this.poll(ctx)
+        if (result instanceof Error) {
+          ctx.log.error({
+            action: "poll.error",
+            message: safeErrorMessage({ error: result }),
+            error: result,
+          })
+        }
+      },
+      onError: (error) => {
+        ctx.log.error({
+          action: "poll.unhandled",
+          message: safeErrorMessage({ error }),
+          error,
+        })
+      },
+    })
+  }
+
+  private async poll(ctx: FlumeSourceStartContext): Promise<Error | null> {
+    const response = await attempt(() => ctx.deps.fetch(this.options.url))
+    if (response instanceof Error) return response
+    const raw = await safeReadText({ response, context: this.name })
+    if (raw instanceof Error) return raw
+    const payload = safeJsonParse(raw)
+    if (payload instanceof Error) return payload
+
     this.emit({
       source: "custom",
       sourceName: this.name,
       type: "webhook",
       data: { payload },
       meta: { event_type: "webhook" },
-      receivedAt: ctx.deps.now(),
+      receivedAt: safeNow({ deps: ctx.deps }),
     })
+    return null
   }
 }
 ```
 
-`this.emit({...})` queues events through the base's serial queue and routes them to `ctx.onEvent` with `attempt()` isolation. `this.setStatus(...)` deduplicates idempotent transitions and logs the change (which is how status surfaces to consumers). Subclasses never need to write try/catch.
+`this.emit({...})` queues events through the base's serial queue and routes them to `ctx.onEvent` with `attempt()` isolation. `this.setStatus(...)` deduplicates idempotent transitions and logs the change. IO started after `connect()` returns, such as timer callbacks, must use `attempt()` or `safeInvokeCallback()` as shown above; both are exported from the root entry so custom sources do not need raw try/catch.
 
 ## Time source
 
@@ -284,7 +331,7 @@ type FlumeEvent = FlumeDiscordEvent | FlumeSlackEvent | FlumeGitHubEvent | Flume
 
 ## Observability
 
-Flume never calls a third-party service. Every internal action is reported through the firehose (`onEvent` push / `stream()` pull) as `{ kind: "log", log }` items — there are no silent paths. Each `FlumeLog` is tagged with `source: "flume"`, `source: "discord"`, `source: "slack"`, `source: "github"`, `source: "time"`, or your custom source's `name`. `onError` is a convenience filter that additionally receives only the `level: "error"` subset (route it straight to Sentry).
+Flume never calls a third-party service. Every internal action is reported through the firehose (`onEvent` push / `stream()` pull) as `{ kind: "log", log }` items — there are no silent internal paths. Each `FlumeLog` is tagged with `source: "flume"`, `source: "discord"`, `source: "slack"`, `source: "github"`, `source: "time"`, or your custom source's `name`. `onError` is a convenience filter that additionally receives only the `level: "error"` subset (route it straight to Sentry).
 
 ```ts
 type FlumeLog = {
@@ -307,6 +354,9 @@ What gets logged:
 - Reconnect — `reconnect.scheduled` (with delay in ms), `reconnect.exhausted` (with attempt count), `reconnect.reset` (on successful connect after retries), `reconnect.cancel` (on stop).
 - Status transitions — `status` action with `previous → next`.
 - Errors — `level: "error"` carries the `error` field; use `onError` for a pre-filtered error sink.
+- Observation sink failures — a failed `onEvent` emits `onEvent.error` to `onError` and the pull stream; a failed `onError` emits `onError.error` to `onEvent` and the pull stream. `detail` identifies the callback plus the failed item's kind, source, and event type or log action. `FlumeConfluence` also stamps `groupId` onto logs sent to its `onError`. The peer notification is attempted once, without recursive reporting.
+
+For maximum diagnostics, configure both callbacks or keep a pull stream consumer. If both push callbacks fail, both failure logs remain available to the pull stream; startup logs are replayed to its first subscriber. `FlumeConfluence` has no pull iterator, so configure its `onError` as the independent diagnostic sink.
 
 Route it anywhere — Sentry, Datadog, `console`, a file — your choice. Filter the log items out of the firehose:
 
@@ -396,7 +446,7 @@ new Flume({
 
 ## Safety
 
-- Ordering — each source has its own `FlumeSerialQueue` and per-source events are delivered FIFO. Cross-source ordering between events from different sources is undefined (no global serialization). `onEvent` invocations are awaited and run one at a time per source, so async callbacks don't race and `close()` drains in-flight events before transitioning state.
+- Ordering — each source has its own `FlumeSerialQueue` and per-source events are delivered FIFO. The public `onEvent` and `onError` callbacks share one global queue, so callback invocations never race across sources and `close()` drains in-flight callbacks and their failure diagnostics before transitioning state. Pull subscribers receive items when they are published and have independent bounded buffers.
 - Duplicate suppression — Slack envelopes are deduped by `envelope_id` (`FlumeSlackSeenCache`) to absorb ack retries. GitHub notifications are deduped by `id + updated_at` (`FlumeGitHubSeenCache`). Discord uses session resume so the Gateway does not re-emit dispatches.
 - Partial-failure rollback — if any source fails during `Flume.open()`, the already-started sources are stopped and a `FlumeStartError` is returned with per-source detail.
 - Idempotent close — `FlumeRunning.close()` is safe to call concurrently; the first call wins and subsequent callers receive the same `FlumeClosed` snapshot. The same guard exists at source level: a double-`close()` (e.g. via signal abort racing a manual close) does not re-invoke `disconnect()`.
@@ -410,9 +460,9 @@ Flume does not throw on protocol/network failures. Every entry point returns `T 
 - `FlumeHttpError` — HTTP call returned an error payload (e.g. Slack `ok: false`)
 - `FlumeParseError` — Unparseable WebSocket frame
 
-Exceptions thrown from `onEvent` are caught and logged (never rethrown into the protocol loop).
+Exceptions thrown or rejected from `onEvent` / `onError` are isolated and emitted as `onEvent.error` / `onError.error` diagnostics; they are never rethrown into the protocol loop.
 
-The library guarantees that no exception escapes any public surface — constructors, `open()`, `close()`, the `onEvent` invocation path, the `stream()` iterator, the abort-signal path, and the `onError` callback all route IO and user-supplied callbacks through internal `safe*` wrappers and the generic `attempt()` helper. A misbehaving `onEvent` / `onError` will be logged and isolated rather than crashing the protocol loop.
+With type-valid constructor input, the library guarantees that protocol IO and user callback failures do not escape `open()`, `close()`, the `onEvent` invocation path, the `stream()` iterator, the abort-signal path, or the `onError` callback. These boundaries route work through internal `safe*` wrappers and the generic `attempt()` helper.
 
 ## Supported sources
 
@@ -442,11 +492,11 @@ const github = new FlumeGitHubSource({ token })
 
 ```bash
 bun install
-bunx vp pack       # build dist/
-bunx tsc --noEmit  # typecheck
-bunx vitest run    # tests
-bunx vp lint       # lint
-bunx vp fmt        # format
+vp pack            # build dist/
+vp run typecheck   # typecheck
+vp test            # tests
+vp lint            # lint
+vp fmt             # format
 ```
 
 The library itself is runtime-agnostic. The dev toolchain (build / test / lint) uses Bun + `vite-plus` + `vitest`, but the published `dist/` is plain ESM with TypeScript declarations and runs on Node 22+, Bun, Deno, Cloudflare Workers, or modern browsers. Runtimes without a global `WebSocket` (e.g. fetch-only edge functions) can still use `FlumeGitHubSource`; `FlumeDiscordSource` / `FlumeSlackSource` will return `FlumeStartError` at `open()` time if `deps.WebSocket` is `null`.

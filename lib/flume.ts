@@ -50,6 +50,8 @@ type Failure = {
   error: Error
 }
 
+type FlumeCallbackName = "onEvent" | "onError"
+
 /**
  * 起動前の Flume。`open()` で `FlumeRunning` へ遷移する。
  * コンストラクタは単一オブジェクト `{ sources, ...options }` を受け取る (`sources` のみ必須)。
@@ -95,9 +97,6 @@ export class Flume {
    * さらに追い出す自己破壊になるため、push の `onEvent` にだけ warn log として届ける
    */
   private notifyStreamOverflow(): void {
-    const onEvent = this.options.onEvent
-    if (!onEvent) return
-
     const log: FlumeLog = {
       level: "warn",
       source: "flume",
@@ -115,22 +114,15 @@ export class Flume {
     return (log: FlumeLog) => {
       void this.emitItem({ kind: "log", log })
 
-      const onError = this.options.onError
-      if (!onError || log.level !== "error") return
-
-      try {
-        Promise.resolve(onError(log)).catch(() => {})
-      } catch {
-        // onError の throw はロギングループに波及させない
-      }
+      if (log.level === "error") void this.invokeOnError(log)
     }
   }
 
   /**
    * firehose の単一 sink: pull の hub と push の onEvent の両方へ item を配る。
    * close 後の遅延 emit (stop 中の straggler) は push 側にも流さない (pull 側と対称にする)。
-   * onEvent への転送は this.log を経由しない (経由すると log item 経路で再帰する) ため
-   * 例外をここで握り潰す
+   * onEvent への転送は this.log を経由しない (経由すると log item 経路で再帰する)。
+   * callback failure は reportCallbackFailure が pull hub と peer callback へ直接診断する。
    */
   private emitItem(item: FlumeStreamItem): Promise<void> {
     if (this.hub.isClosed) return Promise.resolve()
@@ -139,13 +131,88 @@ export class Flume {
     return this.enqueueCallback(item)
   }
 
-  private enqueueCallback(item: FlumeStreamItem): Promise<void> {
-    const onEvent = this.options.onEvent
-    if (!onEvent) return Promise.resolve()
+  private enqueueCallback(item: FlumeStreamItem, notifyPeerOnFailure = true): Promise<void> {
+    const onEventResult = attempt(() => this.options.onEvent)
+    if (onEventResult instanceof Error) {
+      this.reportCallbackFailure("onEvent", onEventResult, notifyPeerOnFailure, item)
+      return Promise.resolve()
+    }
+    if (!onEventResult) return Promise.resolve()
 
     return this.callbackQueue.add(async () => {
-      await attempt(() => Promise.resolve(onEvent(item)))
+      const result = await attempt(() => Promise.resolve(onEventResult(item)))
+      if (result instanceof Error) {
+        this.reportCallbackFailure("onEvent", result, notifyPeerOnFailure, item)
+      }
     })
+  }
+
+  /**
+   * error log 専用 sink も callbackQueue に載せ、close() が in-flight callback と
+   * その失敗診断まで drain できるようにする
+   */
+  private invokeOnError(log: FlumeLog, notifyPeerOnFailure = true): Promise<void> {
+    const onErrorResult = attempt(() => this.options.onError)
+    if (onErrorResult instanceof Error) {
+      this.reportCallbackFailure("onError", onErrorResult, notifyPeerOnFailure, {
+        kind: "log",
+        log,
+      })
+      return Promise.resolve()
+    }
+    if (!onErrorResult) return Promise.resolve()
+
+    return this.callbackQueue.add(async () => {
+      const result = await attempt(() => Promise.resolve(onErrorResult(log)))
+      if (result instanceof Error) {
+        this.reportCallbackFailure("onError", result, notifyPeerOnFailure, { kind: "log", log })
+      }
+    })
+  }
+
+  /**
+   * 観測 sink 自身の失敗は同じ sink へ戻すと再帰するため、まず pull stream へ直接 publish し、
+   * もう一方の callback にだけ転送する。peer も失敗した場合は hub-only の診断を残して終端する
+   */
+  private reportCallbackFailure(
+    callback: FlumeCallbackName,
+    error: Error,
+    notifyPeer: boolean,
+    failedItem?: FlumeStreamItem,
+  ): void {
+    const itemDetail =
+      failedItem?.kind === "event"
+        ? {
+            itemKind: failedItem.kind,
+            itemSource: failedItem.event.source,
+            itemType: failedItem.event.type,
+          }
+        : failedItem?.kind === "log"
+          ? {
+              itemKind: failedItem.kind,
+              itemSource: failedItem.log.source,
+              itemAction: failedItem.log.action,
+              itemDetail: failedItem.log.detail,
+            }
+          : {}
+    const log: FlumeLog = {
+      level: "error",
+      source: "flume",
+      action: `${callback}.error`,
+      message: `${callback} callback failed: ${safeErrorMessage({ error })}`,
+      error,
+      detail: { callback, ...itemDetail },
+      timestamp: safeNow({ deps: this.deps }),
+    }
+
+    this.hub.publish({ kind: "log", log })
+    if (!notifyPeer) return
+
+    if (callback === "onEvent") {
+      void this.invokeOnError(log, false)
+      return
+    }
+    void this.enqueueCallback({ kind: "log", log }, false)
   }
 
   async open(): Promise<FlumeRunning | FlumeStartError> {

@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.10.1
+
+### Added
+
+- Publicly export the common `attempt`, `safe*`, and `isRecord` utilities from the root entry so third-party `FlumeSource` implementations can use the same throw-isolation boundaries as built-in sources.
+- Emit `onEvent.error` and `onError.error` diagnostics when an observation callback throws or rejects. The failure is published to the pull stream and forwarded once to the peer callback without recursive reporting.
+
+### Changed
+
+- Serialize both `onEvent` and `onError` through the callback queue so `close()` drains callback work and callback-failure diagnostics deterministically.
+- Correct the README contracts for `FlumeConfluence.groupId`, global callback ordering, custom-source IO isolation, and callback-failure observability.
+
+### Removed
+
+- Remove unused internal `FlumeSerialQueue` capacity, cancellation, and size APIs, plus the inaccessible `FlumeStream.dropped` getter.
+
+## 0.10.0
+
+### Added
+
+- `FlumeConfluence` stamps every merged item with its originating `groupId` and supports failure-safe `replace(id, sources)` with an open timeout.
+- `FlumeTimeSource` supports host-provided state persistence and `off`, `lastOnly`, or bounded `missed` catch-up policies.
+- Export `flumeCollectCatchupMatches` for hosts that need the same catch-up calculation without constructing a source.
+
 ## 0.9.4
 
 ### Fixed

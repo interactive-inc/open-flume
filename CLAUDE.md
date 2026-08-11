@@ -9,7 +9,7 @@ bun install
 ## ビルド
 
 ```sh
-vp build
+vp pack
 ```
 
 ## テスト

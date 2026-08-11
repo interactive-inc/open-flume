@@ -5,6 +5,7 @@ import type {
   FlumeLogLevel,
   FlumeRuntimeDeps,
 } from "@/types"
+import { safeInvokeCallback } from "@/utils/safe-invoke-callback"
 import { safeNow } from "@/utils/safe-now"
 
 type Props = {
@@ -60,10 +61,6 @@ export class FlumeLogger {
       detail: input.detail,
     }
 
-    try {
-      Promise.resolve(handler(log)).catch(() => {})
-    } catch {
-      // handler が同期 throw してもロギングループは止めない
-    }
+    safeInvokeCallback({ fn: () => handler(log), onError: () => {} })
   }
 }

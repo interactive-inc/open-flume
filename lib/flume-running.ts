@@ -20,7 +20,7 @@ type Props = {
 /**
  * 稼働中の Flume。close() で FlumeClosed へ遷移する。signal が abort されると自動 close。
  * 全ての source 呼び出し・signal 操作・status 読み取りを `attempt` 経由で扱い、
- * `runClose` の最外殻 try/catch で想定外の throw も `FlumeClosed` の resolve に変換する
+ * `runClose` の最外殻でも `attempt` を通して想定外の throw を `FlumeClosed` の resolve に変換する
  */
 export class FlumeRunning {
   readonly kind = "running" as const
@@ -91,66 +91,67 @@ export class FlumeRunning {
 
   private async runClose(): Promise<FlumeClosed> {
     const closeErrors: FlumeCloseError[] = []
+    const result = await attempt(() => this.closeSources(closeErrors))
 
-    try {
-      this.props.log.info({
-        action: "flume.close",
-        message: `closing ${this.props.sources.length} source(s)`,
-      })
-
-      const settled = await Promise.allSettled(
-        this.props.sources.map((source) => Promise.resolve().then(() => source.stop())),
-      )
-
-      for (const [index, result] of settled.entries()) {
-        const source = this.props.sources[index]
-        const name = source ? this.sourceName(source) : "?"
-
-        const error =
-          result.status === "rejected"
-            ? safeNormalizeError({ value: result.reason })
-            : result.value instanceof Error
-              ? result.value
-              : null
-        if (error === null) continue
-
-        closeErrors.push({ source: name, error })
-        this.props.log.error({
-          action: "flume.close.failed",
-          message: `${name}: ${safeErrorMessage({ error })}`,
-          error,
-          detail: { source: name },
-        })
-      }
-
-      const signal = this.props.signal
-      if (signal) {
-        const result = attempt(() => signal.removeEventListener("abort", this.onAbort))
-        if (result instanceof Error) {
-          const error = safeNormalizeError({ value: result })
-          this.props.log.error({
-            action: "signal.removeListener.failed",
-            message: safeErrorMessage({ error }),
-            error,
-          })
-        }
-      }
-      await this.props.callbackQueue.drain()
-      this.props.log.info({ action: "flume.close.complete", message: "all sources closed" })
-      await this.props.callbackQueue.drain()
-
-      this.props.hub.close()
-      return new FlumeClosed({ finalStatuses: this.snapshotStatuses(), closeErrors })
-    } catch (err) {
-      const error = safeNormalizeError({ value: err })
+    if (result instanceof Error) {
+      const error = safeNormalizeError({ value: result })
       this.props.log.error({
         action: "flume.close.unhandled",
         message: safeErrorMessage({ error }),
         error,
       })
-      this.props.hub.close()
-      return new FlumeClosed({ finalStatuses: this.snapshotStatuses(), closeErrors })
     }
+
+    this.props.hub.close()
+    return new FlumeClosed({ finalStatuses: this.snapshotStatuses(), closeErrors })
+  }
+
+  private async closeSources(closeErrors: FlumeCloseError[]): Promise<void> {
+    this.props.log.info({
+      action: "flume.close",
+      message: `closing ${this.props.sources.length} source(s)`,
+    })
+
+    const settled = await Promise.allSettled(
+      this.props.sources.map((source) => Promise.resolve().then(() => source.stop())),
+    )
+
+    for (const [index, result] of settled.entries()) {
+      const source = this.props.sources[index]
+      const name = source ? this.sourceName(source) : "?"
+
+      const error =
+        result.status === "rejected"
+          ? safeNormalizeError({ value: result.reason })
+          : result.value instanceof Error
+            ? result.value
+            : null
+      if (error === null) continue
+
+      closeErrors.push({ source: name, error })
+      this.props.log.error({
+        action: "flume.close.failed",
+        message: `${name}: ${safeErrorMessage({ error })}`,
+        error,
+        detail: { source: name },
+      })
+    }
+
+    const signal = this.props.signal
+    if (signal) {
+      const result = attempt(() => signal.removeEventListener("abort", this.onAbort))
+      if (result instanceof Error) {
+        const error = safeNormalizeError({ value: result })
+        this.props.log.error({
+          action: "signal.removeListener.failed",
+          message: safeErrorMessage({ error }),
+          error,
+        })
+      }
+    }
+    await this.props.callbackQueue.drain()
+    this.props.log.info({ action: "flume.close.complete", message: "all sources closed" })
+    await this.props.callbackQueue.drain()
   }
 
   private snapshotStatuses(): ReadonlyArray<FlumeSourceStatus> {

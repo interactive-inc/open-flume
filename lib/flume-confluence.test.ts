@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest"
 import { waitFor } from "@/test-utils/wait-for"
-import type { FlumeEvent, FlumeStreamItem } from "@/types"
+import type { FlumeEvent, FlumeLog, FlumeStreamItem } from "@/types"
 import { createFlumeDefaultDeps } from "@/deps"
 import { FlumeConfluence } from "@/flume-confluence"
 import { FlumeSource } from "@/flume-source"
@@ -225,10 +225,12 @@ describe("FlumeConfluence", () => {
 
   it("contains async onEvent rejection without an unhandled rejection", async () => {
     const source = new MockSource()
+    const errors: FlumeLog[] = []
     const confluence = new FlumeConfluence({
       onEvent: async (item) => {
         if (item.kind === "event") throw new Error("sink failed")
       },
+      onError: (log) => errors.push(log),
     })
 
     expect(await confluence.add("async", [source])).toBeNull()
@@ -236,6 +238,12 @@ describe("FlumeConfluence", () => {
     await confluence.closeAll()
 
     expect(source.stopCount).toBe(1)
+    expect(errors).toContainEqual(
+      expect.objectContaining({
+        action: "onEvent.error",
+        detail: expect.objectContaining({ groupId: "async", itemType: "reject" }),
+      }),
+    )
   })
 
   it("aborts and waits for an add that is still connecting during closeAll", async () => {

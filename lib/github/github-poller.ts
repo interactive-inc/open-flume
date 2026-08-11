@@ -131,7 +131,7 @@ export class FlumeGitHubPoller {
     const intervalResult = attempt(() =>
       this.props.deps.setInterval(
         () => {
-          // poll() は内部で try/catch 済みで reject しない。将来 throw する変更への保険として log + 握り潰す
+          // poll() は内部で attempt 済みで reject しない。将来の変更への保険として log + 握り潰す
           this.poll().catch((err) => {
             const error = safeNormalizeError({ value: err })
             this.log.error({
@@ -163,10 +163,12 @@ export class FlumeGitHubPoller {
     if (this.inFlight || this.isStoppedFlag) return null
     this.inFlight = true
 
-    try {
-      return await this.pollOnce()
-    } catch (err) {
-      const cause = safeNormalizeError({ value: err })
+    // 正常な Error 戻り値と unexpected throw を区別できるよう成功値を object で包む
+    const attempted = await attempt(async () => ({ result: await this.pollOnce() }))
+    this.inFlight = false
+
+    if (attempted instanceof Error) {
+      const cause = safeNormalizeError({ value: attempted })
       const error = new FlumeHttpError({
         message: `poll loop threw: ${safeErrorMessage({ error: cause })}`,
         status: 0,
@@ -179,9 +181,9 @@ export class FlumeGitHubPoller {
       })
       if (!this.bootstrapped) return error
       return null
-    } finally {
-      this.inFlight = false
     }
+
+    return attempted.result
   }
 
   private async pollOnce(): Promise<Error | null> {

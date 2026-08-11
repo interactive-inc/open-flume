@@ -59,10 +59,6 @@ export class FlumeStream implements AsyncIterableIterator<FlumeStreamItem> {
     }
   }
 
-  get dropped(): number {
-    return this.droppedCount
-  }
-
   next(): Promise<IteratorResult<FlumeStreamItem>> {
     const item = this.items.shift()
     if (item !== undefined) return Promise.resolve({ value: item, done: false })

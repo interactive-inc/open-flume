@@ -431,12 +431,13 @@ describe("FlumeRunning", () => {
     expect(closed.errors()).toEqual([])
   })
 
-  it("serializes async onEvent calls and drains them before close resolves", async () => {
-    const source = new MockSource({ name: "discord" })
+  it("serializes async onEvent calls globally and drains them before close resolves", async () => {
+    const firstSource = new MockSource({ name: "discord" })
+    const secondSource = new MockSource({ name: "slack" })
     const gate = Promise.withResolvers<void>()
     const order: string[] = []
     const flume = new Flume({
-      sources: [source],
+      sources: [firstSource, secondSource],
       onEvent: async (item) => {
         if (item.kind !== "event") return
         order.push(`start:${item.event.type}`)
@@ -447,15 +448,15 @@ describe("FlumeRunning", () => {
     const running = await flume.open()
     if (running instanceof Error) throw running
 
-    source.pushEvent?.({
+    firstSource.pushEvent?.({
       source: "discord",
       type: "first",
       data: {},
       meta: {},
       receivedAt: 0,
     })
-    source.pushEvent?.({
-      source: "discord",
+    secondSource.pushEvent?.({
+      source: "slack",
       type: "second",
       data: {},
       meta: {},
@@ -579,6 +580,107 @@ describe("Flume onError", () => {
     expect(logs.some((log) => log.level !== "error")).toBe(true)
     expect(errors.length).toBeLessThan(logs.length)
     expect(errors.every((log) => log.level === "error")).toBe(true)
+  })
+
+  it("reports an onEvent failure to onError and the pull stream", async () => {
+    const source = new MockSource({ name: "discord" })
+    const errors: FlumeLog[] = []
+    const flume = new Flume({
+      sources: [source],
+      onEvent: async (item) => {
+        if (item.kind === "event") throw new Error("event sink failed")
+      },
+      onError: (log) => errors.push(log),
+    })
+    const running = await flume.open()
+    if (running instanceof Error) throw running
+    const stream = running.stream()
+
+    source.pushEvent?.({
+      source: "discord",
+      type: "MESSAGE_CREATE",
+      data: {},
+      meta: {},
+      receivedAt: 0,
+    })
+
+    await waitFor(() => expect(errors.some((log) => log.action === "onEvent.error")).toBe(true))
+
+    let diagnostic: FlumeLog | null = null
+    for (let count = 0; count < 20; count++) {
+      const item = await stream.next()
+      if (item.value?.kind === "log" && item.value.log.action === "onEvent.error") {
+        diagnostic = item.value.log
+        break
+      }
+    }
+
+    expect(diagnostic?.message).toContain("event sink failed")
+    expect(diagnostic?.detail).toEqual({
+      callback: "onEvent",
+      itemKind: "event",
+      itemSource: "discord",
+      itemType: "MESSAGE_CREATE",
+    })
+    await stream.return?.()
+    await running.close()
+  })
+
+  it("reports an onError failure back through onEvent before close resolves", async () => {
+    const source = new MockSource({
+      name: "discord",
+      failOnDisconnect: new Error("disconnect failed"),
+    })
+    const logs: FlumeLog[] = []
+    const flume = new Flume({
+      sources: [source],
+      onEvent: (item) => {
+        if (item.kind === "log") logs.push(item.log)
+      },
+      onError: async () => {
+        throw new Error("error sink failed")
+      },
+    })
+    const running = await flume.open()
+    if (running instanceof Error) throw running
+
+    await running.close()
+
+    const diagnostic = logs.find((log) => log.action === "onError.error")
+    expect(diagnostic?.message).toContain("error sink failed")
+    expect(diagnostic?.detail).toEqual({
+      callback: "onError",
+      itemKind: "log",
+      itemSource: "flume",
+      itemAction: "flume.close.failed",
+      itemDetail: { source: "discord" },
+    })
+  })
+
+  it("keeps both callback failures observable in the pull stream without recursion", async () => {
+    const running = await new Flume({
+      sources: [new MockSource({ name: "discord" })],
+      onEvent: () => {
+        throw new Error("event sink failed")
+      },
+      onError: () => {
+        throw new Error("error sink failed")
+      },
+    }).open()
+    if (running instanceof Error) throw running
+
+    const actions = new Set<string>()
+    const stream = running.stream()
+    for (let count = 0; count < 20; count++) {
+      const item = await stream.next()
+      if (item.value?.kind === "log") actions.add(item.value.log.action)
+      if (actions.has("onEvent.error") && actions.has("onError.error")) break
+    }
+
+    expect(actions).toContain("onEvent.error")
+    expect(actions).toContain("onError.error")
+    await stream.return?.()
+    await running.close()
   })
 })
 
