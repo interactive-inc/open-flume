@@ -14,6 +14,7 @@ import type {
 import type { FlumeSource } from "@/flume-source"
 import { createFlumeDefaultDeps } from "@/deps"
 import { FlumeStartError } from "@/errors/start-error"
+import { FlumeSourceReuseError } from "@/errors/source-reuse-error"
 import { FlumeStreamHub } from "@/flume-stream-hub"
 import { FlumeLogger } from "@/logger"
 import { FlumeRunning } from "@/flume-running"
@@ -56,13 +57,15 @@ type FlumeCallbackName = "onEvent" | "onError"
  * 起動前の Flume。`open()` で `FlumeRunning` へ遷移する。
  * コンストラクタは単一オブジェクト `{ sources, ...options }` を受け取る (`sources` のみ必須)。
  * events も全ログも 1 本の firehose (`onEvent` push / `stream()` pull) に流れ、購読側が filter する。
- * いずれかの source 失敗時は全 source を `stop()` してロールバックし `FlumeStartError` を返す
- * (失敗した source も半接続状態のリソースを持ち得るため、成功分だけでなく全数を stop する)。
+ * 起動失敗時はこの open が取得した source を `stop()` してロールバックする。
+ * 半接続状態で失敗した source も含むが、再利用を拒否した source は他の所有者のため停止しない。
  * `source.start()` / `source.stop()` の sync throw も `Promise.resolve().then` 経由で
  * Promise rejection に正規化して `allSettled` で捕捉する (`open()` は決して reject しない)
  */
 export class Flume {
   private consumed = false
+
+  private isAcceptingItems = true
 
   private readonly log: FlumeLogger
 
@@ -88,7 +91,10 @@ export class Flume {
       handler: this.buildLogHandler(),
       deps: this.deps,
     })
-    this.sourceEventHandler = (event: FlumeEvent) => this.emitItem({ kind: "event", event })
+    this.sourceEventHandler = (event: FlumeEvent) => {
+      // Source の queue は配送までを待つ。ユーザー callback を待つと callback 内の close と循環する。
+      void this.emitItem({ kind: "event", event })
+    }
   }
 
   /**
@@ -112,6 +118,7 @@ export class Flume {
   /** source が受信したログを firehose へ流す handler。error は onError にも分岐する */
   private buildLogHandler(): FlumeLogHandler {
     return (log: FlumeLog) => {
+      if (!this.isAcceptingItems) return
       void this.emitItem({ kind: "log", log })
 
       if (log.level === "error") void this.invokeOnError(log)
@@ -125,7 +132,7 @@ export class Flume {
    * callback failure は reportCallbackFailure が pull hub と peer callback へ直接診断する。
    */
   private emitItem(item: FlumeStreamItem): Promise<void> {
-    if (this.hub.isClosed) return Promise.resolve()
+    if (!this.isAcceptingItems || this.hub.isClosed) return Promise.resolve()
 
     this.hub.publish(item)
     return this.enqueueCallback(item)
@@ -148,7 +155,7 @@ export class Flume {
   }
 
   /**
-   * error log 専用 sink も callbackQueue に載せ、close() が in-flight callback と
+   * error log 専用 sink も callbackQueue に載せ、drain() が in-flight callback と
    * その失敗診断まで drain できるようにする
    */
   private invokeOnError(log: FlumeLog, notifyPeerOnFailure = true): Promise<void> {
@@ -233,11 +240,15 @@ export class Flume {
     )
 
     const failures: Failure[] = []
+    const ownedSources = new Set<FlumeSource>()
 
     for (const [index, result] of settled.entries()) {
       const source = this.sources[index]
       if (source === undefined) continue
       const name = this.sourceName(source)
+
+      const outcome = result.status === "rejected" ? result.reason : result.value
+      if (!(outcome instanceof FlumeSourceReuseError)) ownedSources.add(source)
 
       if (result.status === "rejected") {
         failures.push({ name, error: safeNormalizeError({ value: result.reason }) })
@@ -259,7 +270,7 @@ export class Flume {
         })
       }
 
-      await this.rollback(this.sources)
+      await this.rollback([...ownedSources])
 
       const detail = failures
         .map((f) => `${f.name}: ${safeErrorMessage({ error: f.error })}`)
@@ -268,28 +279,19 @@ export class Flume {
         `Flume.open: ${failures.length} source(s) failed: ${detail}`,
       )
       this.log.error({ action: "flume.open.failed", message: safeErrorMessage({ error }), error })
-      await this.callbackQueue.drain()
+      this.finishFailedOpen()
       return error
     }
 
     if (this.isSignalAborted()) {
-      await this.rollback(this.sources)
+      await this.rollback([...ownedSources])
       const error = new FlumeStartError("Flume.open: aborted during open")
       this.log.warn({ action: "flume.open.aborted", message: safeErrorMessage({ error }), error })
-      await this.callbackQueue.drain()
+      this.finishFailedOpen()
       return error
     }
 
     this.log.info({ action: "flume.open.complete", message: "all sources opened" })
-    await this.callbackQueue.drain()
-
-    if (this.isSignalAborted()) {
-      await this.rollback(this.sources)
-      const error = new FlumeStartError("Flume.open: aborted during completion")
-      this.log.warn({ action: "flume.open.aborted", message: safeErrorMessage({ error }), error })
-      await this.callbackQueue.drain()
-      return error
-    }
 
     const running = new FlumeRunning({
       sources: this.sources,
@@ -297,6 +299,9 @@ export class Flume {
       log: this.log,
       hub: this.hub,
       callbackQueue: this.callbackQueue,
+      seal: () => {
+        this.isAcceptingItems = false
+      },
     })
 
     if (!this.isSignalAborted()) return running
@@ -304,8 +309,13 @@ export class Flume {
     await running.close()
     const error = new FlumeStartError("Flume.open: aborted while entering running state")
     this.log.warn({ action: "flume.open.aborted", message: safeErrorMessage({ error }), error })
-    await this.callbackQueue.drain()
     return error
+  }
+
+  /** 起動失敗の戻り値は callback を待たず、配送済み診断の完了後に hub を閉じる。 */
+  private finishFailedOpen(): void {
+    this.isAcceptingItems = false
+    void this.callbackQueue.drain().then(() => this.hub.close())
   }
 
   private guardOpen(): FlumeStartError | null {

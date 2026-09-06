@@ -244,7 +244,9 @@ describe("Flume", () => {
 
     await flume.open()
 
-    expect(captured.some((c) => c.action === "flume.rollback.failed")).toBe(true)
+    await waitFor(() =>
+      expect(captured.some((c) => c.action === "flume.rollback.failed")).toBe(true),
+    )
   })
 
   it("threads the host signal into source ctx so sources can listen for abort natively", async () => {
@@ -278,7 +280,7 @@ describe("Flume", () => {
     expect(a.startCount).toBe(0)
   })
 
-  it("returns an error and rolls back when onEvent aborts during open.complete", async () => {
+  it("automatically closes when onEvent aborts on the queued open.complete log", async () => {
     const source = new MockSource({ name: "discord" })
     const controller = new AbortController()
     const flume = new Flume({
@@ -291,7 +293,11 @@ describe("Flume", () => {
 
     const result = await flume.open()
 
-    expect(result).toBeInstanceOf(Error)
+    expect(result).toBeInstanceOf(FlumeRunning)
+    if (result instanceof Error) return
+    await waitFor(() => expect(controller.signal.aborted).toBe(true))
+    await result.close()
+    await result.drain()
     expect(source.stopCount).toBe(1)
   })
 })
@@ -396,6 +402,7 @@ describe("FlumeRunning", () => {
 
     const closed = await running.close()
     expect(closed).toBeInstanceOf(FlumeClosed)
+    await running.drain()
 
     const failures = logs.filter((l) => l.action === "flume.close.failed")
     expect(failures).toHaveLength(1)
@@ -431,7 +438,7 @@ describe("FlumeRunning", () => {
     expect(closed.errors()).toEqual([])
   })
 
-  it("serializes async onEvent calls globally and drains them before close resolves", async () => {
+  it("closes sources independently and explicitly drains globally serialized callbacks", async () => {
     const firstSource = new MockSource({ name: "discord" })
     const secondSource = new MockSource({ name: "slack" })
     const gate = Promise.withResolvers<void>()
@@ -464,16 +471,19 @@ describe("FlumeRunning", () => {
     })
 
     await waitFor(() => expect(order).toEqual(["start:first"]))
-    const closeState = { settled: false }
-    const closePromise = running.close().then((closed) => {
-      closeState.settled = true
-      return closed
+    await running.close()
+    expect(firstSource.stopCount).toBe(1)
+    expect(secondSource.stopCount).toBe(1)
+    expect(order).toEqual(["start:first"])
+    const drainState = { settled: false }
+    const drainPromise = running.drain().then(() => {
+      drainState.settled = true
     })
     await Promise.resolve()
-    expect(closeState.settled).toBe(false)
+    expect(drainState.settled).toBe(false)
 
     gate.resolve()
-    await closePromise
+    await drainPromise
     expect(order).toEqual(["start:first", "end:first", "start:second", "end:second"])
   })
 
@@ -626,7 +636,7 @@ describe("Flume onError", () => {
     await running.close()
   })
 
-  it("reports an onError failure back through onEvent before close resolves", async () => {
+  it("reports an onError failure back through onEvent before drain resolves", async () => {
     const source = new MockSource({
       name: "discord",
       failOnDisconnect: new Error("disconnect failed"),
@@ -645,6 +655,7 @@ describe("Flume onError", () => {
     if (running instanceof Error) throw running
 
     await running.close()
+    await running.drain()
 
     const diagnostic = logs.find((log) => log.action === "onError.error")
     expect(diagnostic?.message).toContain("error sink failed")

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.11.0
+
+### Changed
+
+- `open()` and `close()` complete independently of observation callbacks. `close()` waits for source shutdown and may be awaited from `onEvent` / `onError`; call the new `running.drain()` outside callbacks after closing to wait for accepted callbacks and failure diagnostics. This changes the callback-draining behavior introduced in 0.10.1. Pull streams retain late callback diagnostics before finishing.
+- Time-source state writes run serially, and stopping waits for queued writes to finish. Write failures remain isolated and logged.
+
+### Fixed
+
+- Prevent callback-triggered shutdown from waiting on itself, and prevent slow observation callbacks from blocking `open()`.
+- Release time-source startup when stopping during state loading, and prevent a late load result from starting an orphan scheduler.
+- Preserve existing connections when a source is reused by another Flume or a failed confluence replacement; still clean up newly acquired, partially connected sources.
+- Prevent out-of-order completion of time-source state writes from replacing the latest `lastFiredAt` with an older value.
+
 ## 0.10.1
 
 ### Added

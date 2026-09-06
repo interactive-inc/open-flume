@@ -15,6 +15,7 @@ type Props = {
   log: FlumeLogger
   hub: FlumeStreamHub
   callbackQueue: FlumeSerialQueue
+  seal: () => void
 }
 
 /**
@@ -58,11 +59,21 @@ export class FlumeRunning {
     }
   }
 
+  /** Source の停止まで待つ。callback の完了は callback 外から drain() で待つ。 */
   close(): Promise<FlumeClosed> {
     if (this.closePromise) return this.closePromise
 
     this.closePromise = this.runClose()
     return this.closePromise
+  }
+
+  /**
+   * 配送済み callback とその失敗診断が完了するまで待つ。通常は close() の後に呼ぶ。
+   * onEvent / onError 内では自身の完了待ちになるため呼ばない。
+   */
+  async drain(): Promise<void> {
+    if (this.closePromise) await this.closePromise
+    await this.props.callbackQueue.drain()
   }
 
   statuses(): ReadonlyArray<FlumeSourceStatus> {
@@ -72,7 +83,8 @@ export class FlumeRunning {
   /**
    * 統合 firehose を pull で受け取る async iterator。`for await (const item of running.stream())`。
    * item は events + 全ログの union (`FlumeStreamItem`)。`item.kind` で判別する。
-   * close() / signal abort で iterator は自然に終了し、`break` すると hub から自動 unsubscribe する。
+   * close() / signal abort 後、callback の失敗診断まで配送して終了する。
+   * `break` すると hub から自動 unsubscribe する。
    * consumer が遅れて buffer を超えたら `onOverflow` (既定 drop-oldest) に従う
    */
   stream(options?: FlumeStreamOptions): AsyncIterableIterator<FlumeStreamItem> {
@@ -102,7 +114,15 @@ export class FlumeRunning {
       })
     }
 
-    this.props.hub.close()
+    const sealed = attempt(() => this.props.seal())
+    if (sealed instanceof Error) {
+      this.props.log.error({
+        action: "flume.close.seal.failed",
+        message: safeErrorMessage({ error: sealed }),
+        error: sealed,
+      })
+    }
+    void this.props.callbackQueue.drain().then(() => this.props.hub.close())
     return new FlumeClosed({ finalStatuses: this.snapshotStatuses(), closeErrors })
   }
 
@@ -149,9 +169,7 @@ export class FlumeRunning {
         })
       }
     }
-    await this.props.callbackQueue.drain()
     this.props.log.info({ action: "flume.close.complete", message: "all sources closed" })
-    await this.props.callbackQueue.drain()
   }
 
   private snapshotStatuses(): ReadonlyArray<FlumeSourceStatus> {

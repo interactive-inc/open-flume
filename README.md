@@ -48,6 +48,7 @@ if (running instanceof Error) throw running
 
 // later
 await running.close()
+await running.drain() // outside callbacks: finish accepted callback work and diagnostics
 ```
 
 `new Flume({ sources, ...options })` — a single options object; `sources` is the only required field, everything else is optional. There is one unified firehose: `onEvent` (push) and `FlumeRunning.stream()` (pull) both deliver the same `FlumeStreamItem` — received events **and** every log (status transitions, errors, debug) merged into one stream. The consumer filters by `item.kind` (`"event"` / `"log"`) and `item.log.level`. This is built for piping the whole picture into an agent (Claude / Codex) so it notices disconnects on its own. `onError` is a convenience filter that additionally receives only the `level: "error"` logs (route it straight to Sentry).
@@ -70,8 +71,10 @@ Flume  ──open()──▶  FlumeRunning  ──close()──▶  FlumeClosed
 ```
 
 - `Flume.open()` returns `FlumeRunning | FlumeStartError`. Branch with `instanceof Error`. On partial failure (one source fails while another succeeds), the already-opened sources are rolled back and a `FlumeStartError` is returned with per-source detail in `.message`. Calling `open()` a second time on the same `Flume` instance returns `FlumeStartError` at runtime — the type system also rejects calling `open()` on the returned `FlumeRunning`/`FlumeClosed` handles.
-- `FlumeRunning.close()` returns a `FlumeClosed` snapshot. `close()` is idempotent and concurrent-safe.
-- `FlumeClosed` exposes only `statuses()` — a frozen snapshot of each source's final state. No `open`, no `close`, no leaking source references.
+- `FlumeRunning.close()` waits for sources to stop and returns a `FlumeClosed` snapshot. It is idempotent and concurrent-safe, and can be awaited inside `onEvent` or `onError`.
+- `FlumeRunning.drain()` waits for accepted callbacks and their failure diagnostics. Call it **outside callbacks**, normally after `close()`, when shutdown must also finish callback work. Calling it inside a callback would wait for that callback itself.
+- `open()` and `close()` do not wait for observation callbacks. A slow callback cannot hold startup or source shutdown open. Callback delivery remains serial; accepted callbacks may finish after `close()` returns.
+- `FlumeClosed` exposes `statuses()` and `errors()` — frozen snapshots of final source states and disconnect failures. No `open`, no `close`, no leaking source references.
 - An `AbortSignal` on `Flume` drives an automatic transition to `FlumeClosed`.
 - `FlumeRunning.kind === "running"` and `FlumeClosed.kind === "closed"` provide a runtime discriminator when generic code holds the union.
 
@@ -89,7 +92,10 @@ const closed = await running.close()
 closed.close() // type error
 closed.open() // type error
 closed.statuses() // [{ source: "discord", status: "disconnected" }, ...]
+await running.drain() // finish callback delivery before exiting the host process
 ```
+
+Migration from 0.10.1: shutdown code that relied on `close()` waiting for `onEvent` / `onError` should now use `await running.close(); await running.drain()` outside those callbacks. A callback may use `await running.close()` on its own. Pull streams finish after the accepted callbacks and their failure diagnostics have drained. A callback that never settles can therefore keep `drain()` and stream completion pending, while source shutdown still completes.
 
 ## Dynamic groups
 
@@ -113,6 +119,8 @@ await confluence.closeAll()
 ```
 
 `add(id, sources)` starts a fresh `Flume` for that group and returns `Error | null` (a duplicate id or a failed start is returned, never thrown). Every merged item is stamped with that id as `groupId`, while `item.event.source` / `item.log.source` identifies the protocol source inside the group. Each group is an independent `Flume`, so a failure in one group never rolls back another. `replace(id, sources)` opens a replacement first and closes the previous group only after the new one is ready; a failed replacement leaves the previous group running.
+
+Source instances are single-use. Reusing an existing instance returns a `FlumeStartError` and preserves its current owner's connection. `remove()` / `closeAll()` wait for source shutdown; callbacks already accepted by those groups may finish afterward.
 
 ## Sub-entries
 
@@ -258,6 +266,8 @@ new FlumeTimeSource({
 
 `tick.firedAt` is the scheduled wall-clock time (epoch ms), not the exact `setTimeout` firing instant. A throwing `message()` is isolated and falls back to the defaults. Parse the cron up front with `parseCron(expr)` (returns `FlumeCron | FlumeParseError`) or compute the next fire with `flumeCronNext(cron, afterMs)`.
 
+With `statePersister`, state writes are serialized in tick order and source shutdown waits for queued writes to settle. A failed write is logged and later writes still run. Keep the persister's IO bounded and avoid waiting for Flume lifecycle completion inside it. Stopping during `load()` releases startup immediately and ignores a late result; cancellation of the host's underlying read remains the persister's responsibility. Use `catchupPolicy` (`off`, `lastOnly`, or `missed`) to control replay on the next start. When multiple sources share a persistence key, the host must also serialize or atomically order their writes.
+
 ## Pull stream
 
 `FlumeRunning.stream()` is the pull form of the same firehose as `onEvent` — an async iterator over `FlumeStreamItem`, handy for feeding an agent (Claude / Codex) with `for await`, where backpressure falls out naturally from how fast you pull.
@@ -272,10 +282,10 @@ for await (const item of running.stream()) {
   if (item.kind === "event") await handleWithAgent(item.event)
   if (item.kind === "log" && item.log.action === "status") noticeDisconnect(item.log)
 }
-// loop ends when the flume stops (running.close() or signal abort)
+// after close / signal abort, the loop ends once accepted callback diagnostics are delivered
 ```
 
-The iterator ends cleanly when the flume stops; `break`ing out unsubscribes automatically. When a slow consumer lets the buffer overflow, the oldest items are dropped by default:
+The iterator ends cleanly after source shutdown and accepted callback work; `break`ing out unsubscribes automatically. When a slow consumer lets the buffer overflow, the oldest items are dropped by default:
 
 ```ts
 running.stream({ buffer: 5000, onOverflow: "drop-newest" })
@@ -446,9 +456,9 @@ new Flume({
 
 ## Safety
 
-- Ordering — each source has its own `FlumeSerialQueue` and per-source events are delivered FIFO. The public `onEvent` and `onError` callbacks share one global queue, so callback invocations never race across sources and `close()` drains in-flight callbacks and their failure diagnostics before transitioning state. Pull subscribers receive items when they are published and have independent bounded buffers.
+- Ordering — each source has its own `FlumeSerialQueue` and per-source events are published FIFO. The public `onEvent` and `onError` callbacks share one global queue, so callback invocations never race across sources. `close()` stops the sources; a subsequent `drain()` waits for callbacks and their failure diagnostics. Pull subscribers receive items when they are published and have independent bounded buffers. The push callback queue is unbounded; use pull-only consumption for a bounded slow consumer.
 - Duplicate suppression — Slack envelopes are deduped by `envelope_id` (`FlumeSlackSeenCache`) to absorb ack retries. GitHub notifications are deduped by `id + updated_at` (`FlumeGitHubSeenCache`). Discord uses session resume so the Gateway does not re-emit dispatches.
-- Partial-failure rollback — if any source fails during `Flume.open()`, the already-started sources are stopped and a `FlumeStartError` is returned with per-source detail.
+- Partial-failure rollback — if any source fails during `Flume.open()`, sources acquired by that open are stopped, including partially connected failures. A source that refused reuse remains with its existing owner. A `FlumeStartError` is returned with per-source detail.
 - Idempotent close — `FlumeRunning.close()` is safe to call concurrently; the first call wins and subsequent callers receive the same `FlumeClosed` snapshot. The same guard exists at source level: a double-`close()` (e.g. via signal abort racing a manual close) does not re-invoke `disconnect()`.
 
 ## Errors

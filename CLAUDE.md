@@ -68,6 +68,8 @@ throw しない。`T | Error` を返し `instanceof` で判別する。カスタ
 - `FlumeRunning` → `close()` → `FlumeClosed`
 - `FlumeClosed` は観測のみ (statuses)
 
+`open()` と `close()` は `onEvent` / `onError` の完了を待たない。`close()` は Source の停止まで待ち、コールバック内からも await できる。終了時のコールバック・失敗診断の配送まで待つ場合は、コールバック外で `await running.close(); await running.drain()` とする。pull stream は配送済みコールバックの診断まで流して終了する。
+
 これにより「close 済みインスタンスへの再 open」「running 中の再 open」が型エラーになる。signal abort で `FlumeRunning` は自動的に `FlumeClosed` へ遷移する。
 
 コンストラクタは `new Flume({ sources, ...options })` の単一オブジェクト。`sources` だけ必須で他は全て optional。cross-cutting (`onEvent` / `onError` / `signal` / `deps` / `reconnect`) も同じオブジェクトで受け取り、各 Source へ `FlumeSourceStartContext` として注入する。`reconnect` は `boolean | FlumeReconnectOptions` — 未指定 / `false` は再接続無効 (接続断で source は disconnected のまま)、`true` で既定値、オブジェクトはフィールドごとに検証され不正値 (NaN / 0 以下 / 非有限) は既定値へフォールバックする。常駐リスナー用途では明示的な有効化を推奨。観測は 1 本の firehose に統合: `onEvent(item)` (push) と `FlumeRunning.stream()` (pull) が同じ `FlumeStreamItem` (`{ kind: "event" } | { kind: "log" }` の union) を流し、events も全ログ (status 遷移・error・debug) も含む。使う側が `item.kind` / `item.log.level` で filter する。`onError` は error レベル log だけの便利フィルタ (Sentry 等)。公開 status callback は持たない (接続断は status log として firehose に出る)。Source コンストラクタは protocol 固有の config のみ。

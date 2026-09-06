@@ -240,7 +240,9 @@ export type FlumeTimeMessage = {
 /**
  * 起動 / 終了をまたいだ状態を 1 つ載せる純粋な DI ポート。flume 内部で fs / db / network を
  * 触らないように、I/O の場所と方式は host が決める。load の失敗は null 復帰扱い、save の
- * 失敗は best-effort (source 側で log するが throw しない)
+ * 失敗は best-effort (source 側で log するが throw しない)。Time source は save を直列実行し、
+ * stop 時に queued save の完了を待つ。persister 内から Flume の終了を await しない。
+ * stop は load の待機を解除するが、host 側で開始した read IO 自体は中断しない。
  */
 export type FlumeStatePersister<S> = {
   load(): Promise<S | null>

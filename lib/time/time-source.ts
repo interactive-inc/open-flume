@@ -16,9 +16,9 @@ import { FlumeSource } from "@/flume-source"
 import { attempt } from "@/utils/attempt"
 import { isRecord } from "@/utils/is-record"
 import { safeErrorMessage } from "@/utils/safe-error-message"
-import { safeInvokeCallback } from "@/utils/safe-invoke-callback"
 import { safeNormalizeError } from "@/utils/safe-normalize-error"
 import { safeNow } from "@/utils/safe-now"
+import { FlumeSerialQueue } from "@/utils/serial-queue"
 
 /**
  * cron スケジュールで tick を emit する Source。外部接続を持たないため
@@ -27,7 +27,7 @@ import { safeNow } from "@/utils/safe-now"
  * options.statePersister + options.catchupPolicy を渡すと:
  *  1. 起動時に lastFiredAt を読み出す
  *  2. lastFiredAt から now までの過ぎ去った cron マッチを policy に従って再発火する
- *  3. 各 tick 後に lastFiredAt を保存する (best-effort, ブロックしない)
+ *  3. 各 tick 後に lastFiredAt を順番に保存する (tick をブロックせず、停止時に完了を待つ)
  *
  * 保存先や形式は flume の関知ではなく statePersister の実装が決める (純粋 DI)。
  *
@@ -39,6 +39,10 @@ export class FlumeTimeSource extends FlumeSource {
   readonly name = "time" as const
 
   private scheduler: FlumeTimeScheduler | null = null
+
+  private readonly loadCancelled = Promise.withResolvers<null>()
+
+  private readonly saveQueue = new FlumeSerialQueue()
 
   constructor(private readonly options: FlumeTimeSourceOptions) {
     super()
@@ -59,6 +63,8 @@ export class FlumeTimeSource extends FlumeSource {
 
     const persister = this.options.statePersister ?? null
     const lastFiredAt = persister === null ? null : await this.loadLastFiredAt(ctx, persister)
+
+    if (this.isStopped) return new FlumeStartError("Time source: stopped during state load")
 
     this.scheduler = new FlumeTimeScheduler({
       cron,
@@ -88,9 +94,11 @@ export class FlumeTimeSource extends FlumeSource {
     return null
   }
 
-  protected disconnect(): void {
+  protected async disconnect(): Promise<void> {
+    this.loadCancelled.resolve(null)
     this.scheduler?.stop()
     this.scheduler = null
+    await this.saveQueue.drain()
   }
 
   private handleTick(
@@ -179,7 +187,7 @@ export class FlumeTimeSource extends FlumeSource {
     ctx: FlumeSourceStartContext,
     persister: FlumeStatePersister<FlumeTimeSourceState>,
   ): Promise<number | null> {
-    const result = await attempt(() => persister.load())
+    const result = await Promise.race([attempt(() => persister.load()), this.loadCancelled.promise])
     if (result instanceof Error) {
       ctx.log.warn({
         action: "time.state.load.error",
@@ -198,15 +206,14 @@ export class FlumeTimeSource extends FlumeSource {
     persister: FlumeStatePersister<FlumeTimeSourceState>,
     lastFiredAt: number,
   ): void {
-    safeInvokeCallback({
-      fn: () => persister.save({ lastFiredAt }),
-      onError: (error) => {
-        ctx.log.warn({
-          action: "time.state.save.error",
-          message: safeErrorMessage({ error: safeNormalizeError({ value: error }) }),
-          error,
-        })
-      },
+    void this.saveQueue.add(async () => {
+      const error = await attempt(() => persister.save({ lastFiredAt }))
+      if (!(error instanceof Error)) return
+      ctx.log.warn({
+        action: "time.state.save.error",
+        message: safeErrorMessage({ error }),
+        error,
+      })
     })
   }
 

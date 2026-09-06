@@ -1,5 +1,6 @@
 import type { FlumeEvent, FlumeSourceStartContext, FlumeStatus } from "@/types"
 import { FlumeStartError } from "@/errors/start-error"
+import { FlumeSourceReuseError } from "@/errors/source-reuse-error"
 import { FlumeStatusEmitter } from "@/source-helpers/flume-status-emitter"
 import { attempt } from "@/utils/attempt"
 import { safeErrorMessage } from "@/utils/safe-error-message"
@@ -55,11 +56,11 @@ export abstract class FlumeSource {
 
   async start(ctx: FlumeSourceStartContext): Promise<Error | null> {
     if (this.consumed) {
-      return new FlumeStartError(`${this.name}: already started`)
+      return new FlumeSourceReuseError("Source already started")
     }
     if (this.stopped) {
       // stop() 済みの source を start すると「二度と stop できない接続」が生まれるため拒否する
-      return new FlumeStartError(`${this.name}: already stopped`)
+      return new FlumeSourceReuseError("Source already stopped")
     }
     this.consumed = true
 
@@ -113,7 +114,7 @@ export abstract class FlumeSource {
    */
   protected emit(event: FlumeEvent): void {
     const ctx = this.ctx
-    if (!ctx) return
+    if (!ctx || this.stopped) return
 
     this.queue.add(async () => {
       const result = await attempt(() => Promise.resolve(ctx.onEvent(event)))
@@ -131,7 +132,13 @@ export abstract class FlumeSource {
    * subclass が protocol 状態遷移をユーザーに通知する。同一 (status, detail) の連続は冪等
    */
   protected setStatus(status: FlumeStatus, detail?: string): void {
+    if (this.stopped) return
     this.statusEmitter?.set(status, detail)
+  }
+
+  /** await をまたぐ接続処理が、停止後に新しいリソースを作らないための guard。 */
+  protected get isStopped(): boolean {
+    return this.stopped
   }
 
   /** subclass が現在の status を読みたい場合 */

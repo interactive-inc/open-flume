@@ -2,12 +2,15 @@ import { describe, it, expect, vi } from "vitest"
 import { FlumeLogger } from "@/logger"
 import { FlumeStartError } from "@/errors/start-error"
 import { FlumeTimeSource } from "@/time/time-source"
+import { Flume } from "@/flume"
+import { waitFor } from "@/test-utils/wait-for"
 import type {
   FlumeEvent,
   FlumeLog,
   FlumeRuntimeDeps,
   FlumeSourceStartContext,
   FlumeStatus,
+  FlumeTimeSourceState,
 } from "@/types"
 
 const timerHandle = globalThis.setTimeout(() => {}, 0)
@@ -65,6 +68,103 @@ function tickFiredAt(event: FlumeEvent): unknown {
 }
 
 describe("FlumeTimeSource", () => {
+  it("cancels a pending state load and never starts a scheduler after abort", async () => {
+    const test = createMockDeps(0)
+    const loaded = Promise.withResolvers<FlumeTimeSourceState | null>()
+    const entered = Promise.withResolvers<void>()
+    const controller = new AbortController()
+    const save = vi.fn(async () => {})
+    const source = new FlumeTimeSource({
+      cron: "* * * * *",
+      statePersister: {
+        load: () => {
+          entered.resolve()
+          return loaded.promise
+        },
+        save,
+      },
+    })
+    const completion = { settled: false }
+    const opening = new Flume({ sources: [source], deps: test.deps, signal: controller.signal })
+      .open()
+      .then((running) => {
+        completion.settled = true
+        return running
+      })
+
+    await entered.promise
+    controller.abort()
+    try {
+      await waitFor(() => expect(completion.settled).toBe(true))
+      expect(await opening).toBeInstanceOf(Error)
+    } finally {
+      loaded.resolve(null)
+    }
+    await opening
+    await flushPromises()
+    expect(source.status()).toBe("disconnected")
+    expect(test.deps.setTimeout).not.toHaveBeenCalled()
+    test.setNow(60_000)
+    test.fire()
+    expect(save).not.toHaveBeenCalled()
+  })
+
+  it("serializes state writes and finishes them before stop resolves", async () => {
+    const test = createMockDeps(0)
+    const firstWrite = Promise.withResolvers<void>()
+    const persisted = { lastFiredAt: 0 }
+    const save = vi.fn(async (state: FlumeTimeSourceState) => {
+      if (state.lastFiredAt === 60_000) await firstWrite.promise
+      persisted.lastFiredAt = state.lastFiredAt
+    })
+    const source = new FlumeTimeSource({
+      cron: "* * * * *",
+      statePersister: { load: async () => null, save },
+    })
+    await source.start(createCtx({ deps: test.deps }))
+    test.setNow(60_000)
+    test.fire()
+    await flushPromises()
+    test.setNow(120_000)
+    test.fire()
+    await flushPromises()
+
+    const stopping = { finished: false }
+    const stopped = source.stop().then(() => {
+      stopping.finished = true
+    })
+    try {
+      expect(save).toHaveBeenCalledTimes(1)
+      await flushPromises()
+      expect(stopping.finished).toBe(false)
+    } finally {
+      firstWrite.resolve()
+    }
+    await stopped
+    expect(save).toHaveBeenCalledTimes(2)
+    expect(persisted.lastFiredAt).toBe(120_000)
+  })
+
+  it("continues saving later ticks after a queued write rejects", async () => {
+    const test = createMockDeps(0)
+    const logs: FlumeLog[] = []
+    const save = vi.fn(async (state: FlumeTimeSourceState) => {
+      if (state.lastFiredAt === 60_000) return Promise.reject(new Error("write failed"))
+    })
+    const source = new FlumeTimeSource({
+      cron: "* * * * *",
+      statePersister: { load: async () => null, save },
+    })
+    await source.start(createCtx({ deps: test.deps, onLog: (log) => logs.push(log) }))
+    test.setNow(60_000)
+    test.fire()
+    test.setNow(120_000)
+    test.fire()
+    await source.stop()
+    expect(save).toHaveBeenLastCalledWith({ lastFiredAt: 120_000 })
+    expect(logs.filter((log) => log.action === "time.state.save.error")).toHaveLength(1)
+  })
+
   it("connects and schedules the first tick", async () => {
     const test = createMockDeps(0)
     const statuses: FlumeStatus[] = []
