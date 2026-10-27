@@ -32,14 +32,14 @@ export class FlumeStatusEmitter {
     const prev = this.currentStatus
     const suffix = detail ? ` (${detail})` : ""
 
+    this.currentStatus = next
+    this.currentDetail = normalizedDetail
+
     this.props.log.info({
       action: "status",
       message: `${prev} → ${next}${suffix}`,
       detail: { from: prev, to: next, reason: normalizedDetail },
     })
-
-    this.currentStatus = next
-    this.currentDetail = normalizedDetail
 
     const onStatus = this.props.onStatus
     if (!onStatus) return

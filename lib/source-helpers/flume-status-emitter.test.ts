@@ -10,6 +10,20 @@ const createLogger = () =>
   })
 
 describe("FlumeStatusEmitter", () => {
+  it("commits status before publishing its log to observers", () => {
+    const observed: string[] = []
+    const emitter = new FlumeStatusEmitter({
+      log: new FlumeLogger({
+        source: "test",
+        deps: { now: () => 0 },
+        handler: () => observed.push(emitter.value),
+      }),
+    })
+    emitter.set("connected")
+    emitter.set("reconnecting", "network drop")
+    expect(observed).toEqual(["connected", "reconnecting"])
+  })
+
   it("starts at 'disconnected'", () => {
     const emitter = new FlumeStatusEmitter({ log: createLogger() })
     expect(emitter.value).toBe("disconnected")
