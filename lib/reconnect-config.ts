@@ -44,13 +44,13 @@ export function resolveFlumeReconnectConfig(
 ): FlumeReconnectConfig | null {
   if (input === false || input === undefined) return null
 
-  if (input === true) return { ...DEFAULTS }
+  if (input === true) return Object.freeze({ ...DEFAULTS })
 
   const baseDelay = sanitizeBaseDelay(input.baseDelay)
 
-  return {
+  return Object.freeze({
     maxAttempts: sanitizeMaxAttempts(input.maxAttempts),
     baseDelay,
     maxDelay: sanitizeMaxDelay(input.maxDelay, baseDelay),
-  }
+  })
 }

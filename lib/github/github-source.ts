@@ -1,3 +1,5 @@
+import { FlumeStartError } from "@/errors/start-error"
+import { captureConfiguration } from "@/utils/capture-configuration"
 import type {
   FlumeGitHubNotification,
   FlumeGitHubSourceOptions,
@@ -19,17 +21,25 @@ export class FlumeGitHubSource extends FlumeSource {
 
   private poller: FlumeGitHubPoller | null = null
 
-  constructor(private readonly options: FlumeGitHubSourceOptions) {
+  private readonly options: FlumeGitHubSourceOptions | FlumeStartError
+
+  constructor(options: FlumeGitHubSourceOptions) {
     super()
+    this.options = captureConfiguration("github source", () => ({
+      token: options.token,
+      requestTimeoutMs: options.requestTimeoutMs,
+      pollInterval: options.pollInterval,
+    }))
   }
 
   protected async connect(ctx: FlumeSourceStartContext): Promise<Error | null> {
+    if (this.options instanceof Error) return this.options
     this.setStatus("connecting")
 
     this.poller = new FlumeGitHubPoller({
       token: this.options.token,
       requestTimeoutMs: this.options.requestTimeoutMs,
-      interval: this.getPollIntervalSec(),
+      interval: this.getPollIntervalSec(this.options.pollInterval),
       onLog: ctx.log.handler,
       deps: ctx.deps,
       onNotifications: (notifications) => this.handleNotifications(ctx, notifications),
@@ -60,8 +70,7 @@ export class FlumeGitHubSource extends FlumeSource {
   /**
    * pollInterval が非数値・非有限・0 以下の場合は既定値へフォールバックする
    */
-  private getPollIntervalSec(): number {
-    const requested = this.options.pollInterval
+  private getPollIntervalSec(requested: number | undefined): number {
     if (typeof requested !== "number") return DEFAULT_POLL_INTERVAL_SEC
     if (!Number.isFinite(requested)) return DEFAULT_POLL_INTERVAL_SEC
     if (requested <= 0) return DEFAULT_POLL_INTERVAL_SEC

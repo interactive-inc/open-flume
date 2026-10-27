@@ -48,6 +48,22 @@ class MockSource extends FlumeSource {
 }
 
 describe("Flume", () => {
+  it("keeps its configured delivery sink when the original options object is mutated", async () => {
+    const source = new MockSource()
+    const original = vi.fn()
+    const replacement = vi.fn()
+    const options = { sources: [source], onEvent: original }
+    const flume = new Flume(options)
+    options.onEvent = replacement
+    const running = await flume.open()
+    if (running instanceof Error) throw running
+    source.pushEvent!({ source: "discord", type: "received", data: {}, meta: {}, receivedAt: 1 })
+    await running.close()
+    await running.drain()
+    expect(original).toHaveBeenCalledWith(expect.objectContaining({ kind: "event" }))
+    expect(replacement).not.toHaveBeenCalled()
+  })
+
   it("constructs with only sources (no options)", async () => {
     const a = new MockSource({ name: "discord" })
     const flume = new Flume({ sources: [a] })

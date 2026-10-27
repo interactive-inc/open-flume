@@ -1,3 +1,4 @@
+import { captureConfiguration } from "@/utils/capture-configuration"
 import type { FlumeDiscordSourceOptions, FlumeSourceStartContext } from "@/types"
 import type { FlumeDiscordGatewaySession } from "@/discord/discord-gateway-session"
 import { FlumeConnectionError } from "@/errors/connection-error"
@@ -28,11 +29,19 @@ export class FlumeDiscordSource extends FlumeSource {
 
   private reconnector: FlumeReconnector | null = null
 
-  constructor(private readonly options: FlumeDiscordSourceOptions) {
+  private readonly options: FlumeDiscordSourceOptions | FlumeStartError
+
+  constructor(options: FlumeDiscordSourceOptions) {
     super()
+    this.options = captureConfiguration("discord source", () => ({
+      token: options.token,
+      intents: options.intents,
+      handshakeTimeoutMs: options.handshakeTimeoutMs,
+    }))
   }
 
   protected async connect(ctx: FlumeSourceStartContext): Promise<Error | null> {
+    if (this.options instanceof Error) return this.options
     if (!this.hasWebSocket(ctx)) {
       return new FlumeStartError(
         "Discord source: deps.WebSocket is null (no WebSocket runtime available)",
@@ -78,6 +87,7 @@ export class FlumeDiscordSource extends FlumeSource {
     ctx: FlumeSourceStartContext,
     session?: FlumeDiscordGatewaySession,
   ): Promise<Error | null> {
+    if (this.options instanceof Error) return this.options
     if (this.isStopped) return new FlumeStartError("Source stopped before reconnect")
     this.gateway?.disconnect()
     this.setStatus("connecting")

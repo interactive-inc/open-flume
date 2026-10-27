@@ -80,7 +80,7 @@ import { FlumeDiscordSource } from "@interactive-inc/flume/discord"
 import { FlumeSlackSource } from "@interactive-inc/flume/slack"
 
 const flume = new Flume({
-  sources: [new FlumeDiscordSource({ token }), new FlumeSlackSource({ appToken, botToken })],
+  sources: [new FlumeDiscordSource({ token }), new FlumeSlackSource({ appToken })],
   onEvent: (item) => {
     if (item.kind === "event") console.log(item.event)
     if (item.kind === "log" && item.log.action === "status") console.log(item.log.message)
@@ -158,4 +158,6 @@ Time の状態保存は実行中一件と最新の待機値一件に制限する
 
 Time の writer は idle / saving / halted、lifecycle は open / closing / closed の不変状態で表す。状態ごとの必要データを union 型で定義し、状態フラグを追加しない。withDeadline は対象に依存しない FlumeOperationError を返し、保存側は FlumeStateError に原因を保持する。通信の公開境界で包み直す場合も errorCode と context を保持する。
 
-起動期限は Flume.open の所有物とし、openTimeoutMs で指定する。Confluence の交換期限もこれを使い、別のタイマーや診断経路を持たない。ホスト signal の購読は open から close まで一度だけ保持する。取消し失敗も Flume の診断履歴に残し、runtime の失敗と明示的な中断を区別する。
+起動期限は Flume.open の所有物とし、openTimeoutMs で指定する。Confluence の交換期限もこれを使い、別のタイマーや診断経路を持たない。ホスト signal は生成時に選び、購読は open から close まで一度だけ保持する。取消し失敗も Flume の診断履歴に残し、runtime の失敗と明示的な中断を区別する。
+
+公開コンストラクタの設定は captureConfiguration で一度だけ取り込み、再接続や通知時に呼出し側の options を読み直さない。nested の catchup / reconnect も値として固定する。deps・signal・statePersister は同じポート参照を保持し、呼出し側のオブジェクト自体を凍結しない。設定取得の例外は FLUME_RUNTIME_FAILED と cause を持つ起動エラーにする。callback の戻り値検証も例外隔離の範囲に含める。

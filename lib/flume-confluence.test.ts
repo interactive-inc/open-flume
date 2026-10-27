@@ -45,6 +45,23 @@ const event = (type: string): FlumeEvent => ({
 })
 
 describe("FlumeConfluence", () => {
+  it("keeps one configured sink across groups and replacements", async () => {
+    const original: FlumeStreamItem[] = []
+    const replacement: FlumeStreamItem[] = []
+    const options = { onEvent: (item: FlumeStreamItem) => original.push(item) }
+    const confluence = new FlumeConfluence(options)
+    options.onEvent = (item) => replacement.push(item)
+    const source = new MockSource()
+    expect(await confluence.add("group", [source])).toBeNull()
+    source.pushEvent!(event("first"))
+    const next = new MockSource()
+    expect(await confluence.replace("group", [next])).toBeNull()
+    next.pushEvent!(event("second"))
+    await confluence.closeAll()
+    await waitFor(() => expect(original.filter((item) => item.kind === "event")).toHaveLength(2))
+    expect(replacement).toEqual([])
+  })
+
   it("retains an observation handle across removal while callbacks are blocked", async () => {
     const gate = Promise.withResolvers<void>()
     const source = new MockSource()

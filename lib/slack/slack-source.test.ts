@@ -131,12 +131,59 @@ const createCtx = (props: CtxProps): FlumeSourceStartContext => ({
 })
 
 describe("FlumeSlackSource", () => {
+  it("does not read an unrelated bot credential when receiving through Socket Mode", async () => {
+    TrackingMockWebSocket.latest = null
+    const bundle = createDeps()
+    const source = new FlumeSlackSource({
+      appToken: "example-token",
+      get botToken(): never {
+        throw new Error("unused credential must not be read")
+      },
+    })
+    const opening = source.start(createCtx({ deps: bundle.deps }))
+    await waitFor(() => expect(TrackingMockWebSocket.latest).not.toBeNull())
+    TrackingMockWebSocket.latest!.simulateMessage(JSON.stringify({ type: "hello" }))
+    expect(await opening).toBeNull()
+    await source.stop()
+  })
+
+  it("retains its credentials across reconnect instead of reading a mutated options object", async () => {
+    TrackingMockWebSocket.latest = null
+    const bundle = createDeps()
+    const options = { appToken: "example-token", botToken: "unused-token" }
+    const source = new FlumeSlackSource(options)
+    const opening = source.start(
+      createCtx({
+        deps: bundle.deps,
+        reconnect: { maxAttempts: 2, baseDelay: 100, maxDelay: 100 },
+      }),
+    )
+    await waitFor(() => expect(TrackingMockWebSocket.latest).not.toBeNull())
+    const first = TrackingMockWebSocket.latest!
+    first.simulateMessage(JSON.stringify({ type: "hello" }))
+    expect(await opening).toBeNull()
+    options.appToken = "replacement-token"
+    first.simulateClose(1006, "network lost")
+    const retry = bundle.timeouts.find((timer) => !timer.cleared && timer.ms === 75)
+    expect(retry).toBeDefined()
+    retry!.fn()
+    await waitFor(() => expect(TrackingMockWebSocket.latest).not.toBe(first))
+    TrackingMockWebSocket.latest!.simulateMessage(JSON.stringify({ type: "hello" }))
+    await source.stop()
+    expect(bundle.deps.fetch).toHaveBeenLastCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: "Bearer example-token" }),
+      }),
+    )
+  })
+
   it("start() connects and forwards events to onEvent", async () => {
     TrackingMockWebSocket.latest = null
     const receivedEvents: Array<FlumeEvent> = []
     const bundle = createDeps()
 
-    const source = new FlumeSlackSource({ appToken: "xapp-test", botToken: "xoxb-test" })
+    const source = new FlumeSlackSource({ appToken: "xapp-test" })
 
     const startPromise = source.start(
       createCtx({ deps: bundle.deps, onEvent: (event) => receivedEvents.push(event) }),

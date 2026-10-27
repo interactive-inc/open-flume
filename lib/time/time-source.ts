@@ -1,7 +1,9 @@
+import { captureConfiguration } from "@/utils/capture-configuration"
 import type {
   FlumeCatchupPolicy,
   FlumeSourceStartContext,
   FlumeTimeSourceOptions,
+  FlumeTimeMessage,
   FlumeTimeStateStatus,
   FlumeTimeTick,
 } from "@/types"
@@ -15,7 +17,6 @@ import { FlumeSource } from "@/flume-source"
 import { attempt } from "@/utils/attempt"
 import { isRecord } from "@/utils/is-record"
 import { safeErrorMessage } from "@/utils/safe-error-message"
-import { safeNormalizeError } from "@/utils/safe-normalize-error"
 import { safeNow } from "@/utils/safe-now"
 import { FlumeTimeState } from "@/time/time-state"
 
@@ -41,17 +42,31 @@ export class FlumeTimeSource extends FlumeSource {
 
   private persistence: FlumeTimeState | null = null
 
-  constructor(private readonly options: FlumeTimeSourceOptions) {
+  private readonly options: FlumeTimeSourceOptions | FlumeStartError
+
+  constructor(options: FlumeTimeSourceOptions) {
     super()
+    this.options = captureConfiguration("time source", () => {
+      const policy = options.catchupPolicy
+      return {
+        cron: options.cron,
+        message: options.message,
+        statePersister: options.statePersister,
+        stateTimeoutMs: options.stateTimeoutMs,
+        catchupPolicy: policy === undefined ? undefined : Object.freeze({ ...policy }),
+      }
+    })
   }
 
   protected async connect(ctx: FlumeSourceStartContext): Promise<Error | null> {
+    const options = this.options
+    if (options instanceof Error) return options
     this.setStatus("connecting")
 
-    const cron = parseCron(this.options.cron)
+    const cron = parseCron(options.cron)
     if (cron instanceof FlumeParseError) {
       const error = new FlumeStartError(
-        `Time source: invalid cron "${this.options.cron}": ${cron.message}`,
+        `Time source: invalid cron "${options.cron}": ${cron.message}`,
         { errorCode: "FLUME_CRON_INVALID", cause: cron },
       )
       ctx.log.error({ action: "source.start.failed", message: safeErrorMessage({ error }), error })
@@ -59,14 +74,14 @@ export class FlumeTimeSource extends FlumeSource {
       return error
     }
 
-    const persister = this.options.statePersister ?? null
+    const persister = options.statePersister ?? null
     this.persistence =
       persister === null
         ? null
         : new FlumeTimeState({
             ctx,
             persister,
-            timeoutMs: this.options.stateTimeoutMs,
+            timeoutMs: options.stateTimeoutMs,
           })
     const lastFiredAt = (await this.persistence?.load()) ?? null
 
@@ -76,7 +91,10 @@ export class FlumeTimeSource extends FlumeSource {
       cron,
       onLog: ctx.log.handler,
       deps: ctx.deps,
-      onTick: (firedAt) => this.handleTick(ctx, firedAt),
+      onTick: (firedAt) => {
+        this.emitTick(ctx, options, firedAt)
+        this.persistence?.save(firedAt)
+      },
       onHalt: (error) => this.handleSchedulerHalt(ctx, error),
     })
 
@@ -97,7 +115,7 @@ export class FlumeTimeSource extends FlumeSource {
     this.setStatus("connected")
 
     if (lastFiredAt !== null && persister !== null) {
-      this.runCatchup({ ctx, cron, lastFiredAt, now: startedAt })
+      this.runCatchup({ ctx, cron, lastFiredAt, now: startedAt, options })
     }
 
     return null
@@ -115,20 +133,17 @@ export class FlumeTimeSource extends FlumeSource {
     return this.persistence?.status() ?? null
   }
 
-  private handleTick(ctx: FlumeSourceStartContext, firedAt: number): void {
-    this.emitTick(ctx, firedAt)
-    this.persistence?.save(firedAt)
-  }
-
-  private emitTick(ctx: FlumeSourceStartContext, firedAt: number): void {
-    const tick: FlumeTimeTick = { firedAt, cron: this.options.cron }
-    const custom = this.safeMessage(ctx, tick)
+  private emitTick(
+    ctx: FlumeSourceStartContext,
+    options: FlumeTimeSourceOptions,
+    firedAt: number,
+  ): void {
+    const tick: FlumeTimeTick = Object.freeze({ firedAt, cron: options.cron })
+    const custom = this.safeMessage(ctx, tick, options.message)
 
     this.emit({
       source: "time",
-      type: typeof custom.type === "string" ? custom.type : "tick",
-      data: isRecord(custom.data) ? custom.data : { firedAt, cron: this.options.cron },
-      meta: this.normalizeMeta(custom.meta, this.options.cron),
+      ...custom,
       receivedAt: safeNow({ deps: ctx.deps }),
     })
   }
@@ -138,8 +153,9 @@ export class FlumeTimeSource extends FlumeSource {
     cron: FlumeCron
     lastFiredAt: number
     now: number
+    options: FlumeTimeSourceOptions
   }): void {
-    const policy: FlumeCatchupPolicy = this.options.catchupPolicy ?? { mode: "off" }
+    const policy: FlumeCatchupPolicy = props.options.catchupPolicy ?? { mode: "off" }
     if (policy.mode === "off") return
 
     const collected = flumeCollectCatchupMatches({
@@ -176,7 +192,7 @@ export class FlumeTimeSource extends FlumeSource {
     })
 
     for (const firedAt of matches) {
-      this.emitTick(props.ctx, firedAt)
+      this.emitTick(props.ctx, props.options, firedAt)
     }
 
     const last = matches[matches.length - 1]
@@ -194,22 +210,50 @@ export class FlumeTimeSource extends FlumeSource {
     this.setStatus("disconnected", `scheduler halted: ${safeErrorMessage({ error })}`)
   }
 
-  private safeMessage(ctx: FlumeSourceStartContext, tick: FlumeTimeTick): Record<string, unknown> {
-    const message = this.options.message
-    if (!message) return {}
-
-    const result = attempt(() => message(tick))
-    if (result instanceof Error) {
-      const error = safeNormalizeError({ value: result })
+  private safeMessage(
+    ctx: FlumeSourceStartContext,
+    tick: FlumeTimeTick,
+    message: FlumeTimeSourceOptions["message"],
+  ): Required<FlumeTimeMessage> {
+    const fallback = {
+      type: "tick",
+      data: { firedAt: tick.firedAt, cron: tick.cron },
+      meta: { cron: tick.cron },
+    }
+    if (!message) return fallback
+    const report = (error: Error) =>
       ctx.log.warn({
         action: "message.error",
         message: safeErrorMessage({ error }),
         error,
         detail: { firedAt: tick.firedAt },
       })
-      return {}
+    const result = attempt(() => message(tick))
+    if (result instanceof Promise) {
+      report(new Error("Time source: message must return synchronously"))
+      void result.then((value) => {
+        if (value instanceof Error) report(value)
+      })
+      return fallback
     }
-    return isRecord(result) ? result : {}
+    if (result instanceof Error) {
+      report(result)
+      return fallback
+    }
+    const normalized = attempt(() => {
+      if (!isRecord(result)) return fallback
+      const { type, data, meta } = result
+      return {
+        type: typeof type === "string" ? type : fallback.type,
+        data: isRecord(data) ? data : fallback.data,
+        meta: this.normalizeMeta(meta, tick.cron),
+      }
+    })
+    if (normalized instanceof Error) {
+      report(normalized)
+      return fallback
+    }
+    return normalized
   }
 
   private normalizeMeta(meta: unknown, cron: string): Record<string, string> {

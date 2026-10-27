@@ -1,3 +1,5 @@
+import { resolveFlumeReconnectConfig } from "@/reconnect-config"
+import { captureConfiguration } from "@/utils/capture-configuration"
 import type {
   FlumeConfluenceItem,
   FlumeConfluenceItemHandler,
@@ -51,8 +53,20 @@ export class FlumeConfluence {
   private closePromise: Promise<void> | null = null
   private readonly deps: FlumeRuntimeDeps
 
-  constructor(private readonly props: Props = {}) {
-    this.deps = props.deps ?? createFlumeDefaultDeps()
+  private readonly props: Readonly<Props> | FlumeStartError
+
+  constructor(props: Props = {}) {
+    this.props = captureConfiguration("FlumeConfluence", () => {
+      return {
+        onEvent: props.onEvent,
+        onError: props.onError,
+        callbackBuffer: props.callbackBuffer,
+        deps: props.deps,
+        reconnect: resolveFlumeReconnectConfig(props.reconnect) ?? false,
+      }
+    })
+    this.deps =
+      (this.props instanceof Error ? undefined : this.props.deps) ?? createFlumeDefaultDeps()
   }
 
   get isClosed(): boolean {
@@ -60,6 +74,7 @@ export class FlumeConfluence {
   }
 
   async add(id: string, sources: ReadonlyArray<FlumeSource>): Promise<Error | null> {
+    if (this.props instanceof Error) return this.props
     if (this.isClosed) return new FlumeStartError(`FlumeConfluence: already closed: ${id}`)
     if (this.groups.has(id)) return new FlumeStartError(`FlumeConfluence: id already added: ${id}`)
 
@@ -76,6 +91,7 @@ export class FlumeConfluence {
     sources: ReadonlyArray<FlumeSource>,
     options?: { readonly replaceTimeoutMs?: number },
   ): Promise<Error | null> {
+    if (this.props instanceof Error) return this.props
     if (this.isClosed) return new FlumeStartError(`FlumeConfluence: already closed: ${id}`)
     const group = this.groups.get(id)
     if (!group?.running || group.closing)
@@ -83,7 +99,11 @@ export class FlumeConfluence {
     if (group.opening)
       return new FlumeStartError(`FlumeConfluence: replacement already pending: ${id}`)
 
-    const requested = options?.replaceTimeoutMs
+    const selected = captureConfiguration("FlumeConfluence.replace", () => ({
+      timeoutMs: options?.replaceTimeoutMs,
+    }))
+    if (selected instanceof Error) return selected
+    const requested = selected.timeoutMs
     const timeoutMs =
       typeof requested === "number" && Number.isFinite(requested) && requested > 0
         ? Math.min(requested, 2_147_483_647)
@@ -140,6 +160,8 @@ export class FlumeConfluence {
     sources: ReadonlyArray<FlumeSource>,
     timeoutMs?: number,
   ): Promise<Error | null> {
+    const props = this.props
+    if (props instanceof Error) return props
     const completion = Promise.withResolvers<void>()
     const opening: Opening = {
       controller: new AbortController(),
@@ -150,11 +172,11 @@ export class FlumeConfluence {
     const result = await attempt(async () => {
       const next = await new Flume({
         sources,
-        onEvent: this.wrapOnEvent(id),
-        onError: this.wrapOnError(id),
-        callbackBuffer: this.props.callbackBuffer,
+        onEvent: this.wrapOnEvent(id, props.onEvent),
+        onError: this.wrapOnError(id, props.onError),
+        callbackBuffer: props.callbackBuffer,
         deps: this.deps,
-        reconnect: this.props.reconnect,
+        reconnect: props.reconnect,
         signal: opening.controller.signal,
         openTimeoutMs: timeoutMs,
       }).open()
@@ -173,8 +195,10 @@ export class FlumeConfluence {
     return result
   }
 
-  private wrapOnEvent(id: string): FlumeStreamHandler | undefined {
-    const onEvent = this.props.onEvent
+  private wrapOnEvent(
+    id: string,
+    onEvent: FlumeConfluenceItemHandler | undefined,
+  ): FlumeStreamHandler | undefined {
     if (!onEvent) return undefined
 
     return (item: FlumeStreamItem) => {
@@ -183,8 +207,10 @@ export class FlumeConfluence {
     }
   }
 
-  private wrapOnError(id: string): FlumeErrorHandler | undefined {
-    const onError = this.props.onError
+  private wrapOnError(
+    id: string,
+    onError: FlumeErrorHandler | undefined,
+  ): FlumeErrorHandler | undefined {
     if (!onError) return undefined
 
     return (log) => onError({ ...log, detail: { ...log.detail, groupId: id } })

@@ -126,12 +126,12 @@ export type FlumeObservation = Readonly<{
   diagnostics(): FlumeDiagnosticSnapshot
 }>
 
-export type FlumeStreamOptions = {
+export type FlumeStreamOptions = Readonly<{
   /** バッファ上限 (既定 1000)。consumer が遅れて溢れたら onOverflow に従う */
   buffer?: number
   /** バッファ溢れ時の方針 (既定 "drop-oldest") */
   onOverflow?: FlumeStreamOverflow
-}
+}>
 
 // Status
 
@@ -176,17 +176,17 @@ export type FlumeLogInput = {
 
 // Reconnect
 
-export type FlumeReconnectOptions = {
+export type FlumeReconnectOptions = Readonly<{
   maxAttempts?: number
   baseDelay?: number
   maxDelay?: number
-}
+}>
 
-export type FlumeReconnectConfig = {
+export type FlumeReconnectConfig = Readonly<{
   maxAttempts: number
   baseDelay: number
   maxDelay: number
-}
+}>
 
 // Source start context (Flume → Source 内部 API)
 
@@ -218,7 +218,7 @@ export type FlumeSourceDeliveryStatus = Readonly<{
 // Source 構築 options — domain config のみ。
 // cross-cutting (onEvent firehose / onError / signal / deps / reconnect) は Flume 側で受け取る
 
-export type FlumeDiscordSourceOptions = {
+export type FlumeDiscordSourceOptions = Readonly<{
   token: string
   /**
    * Gateway intent ビットフラグ。既定は Guilds | GuildMessages | DirectMessages。
@@ -232,15 +232,12 @@ export type FlumeDiscordSourceOptions = {
    * 永久にハングするのを防ぐ
    */
   handshakeTimeoutMs?: number
-}
+}>
 
-export type FlumeSlackSourceOptions = {
+export type FlumeSlackSourceOptions = Readonly<{
   appToken: string
-  /**
-   * Bot token (`xoxb-`). Slack Socket Mode (受信) には不要だが、ホスト側 (返信や
-   * `auth.test` での self 検出) が必ず使うため型で保持を強制する
-   */
-  botToken: string
+  /** @deprecated Socket Mode の受信には不要。互換性のため受理するが読取・保持・送信しない。 */
+  botToken?: string
   /**
    * Optional frame-silence watchdog. When set, the Slack WebSocket is closed
    * and handed to the reconnect path after this many milliseconds without any
@@ -253,20 +250,20 @@ export type FlumeSlackSourceOptions = {
    * 永久にハングするのを防ぐ
    */
   handshakeTimeoutMs?: number
-}
+}>
 
-export type FlumeGitHubSourceOptions = {
+export type FlumeGitHubSourceOptions = Readonly<{
   token: string
   /** 全ページの fetch と body 読取を含む期限。既定 30 秒 */
   requestTimeoutMs?: number
   pollInterval?: number
-}
+}>
 
-export type FlumeTimeTick = {
+export type FlumeTimeTick = Readonly<{
   /** cron がマッチした壁時計時刻 (epoch ms)。setTimeout の発火実時刻ではなく予定時刻 */
   firedAt: number
   cron: string
-}
+}>
 
 /**
  * tick ごとに emit するイベントの上書き内容。全フィールド optional。
@@ -319,7 +316,7 @@ export type FlumeCatchupPolicy =
   | { readonly mode: "lastOnly" }
   | { readonly mode: "missed"; readonly maxWindowMs?: number }
 
-export type FlumeTimeSourceOptions = {
+export type FlumeTimeSourceOptions = Readonly<{
   /** 5 フィールド cron 式 (minute hour day-of-month month day-of-week)。壁時計 (local time) 基準 */
   cron: string
   message?: (tick: FlumeTimeTick) => FlumeTimeMessage
@@ -332,7 +329,7 @@ export type FlumeTimeSourceOptions = {
   stateTimeoutMs?: number
   /** statePersister が読めた lastFiredAt を元に過去 tick を再発火する方針 (既定 "off") */
   catchupPolicy?: FlumeCatchupPolicy
-}
+}>
 
 // Zod inferred types
 

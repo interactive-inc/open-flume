@@ -1,3 +1,4 @@
+import { captureConfiguration } from "@/utils/capture-configuration"
 import type {
   FlumeDeliveryStatus,
   FlumeDiagnosticSnapshot,
@@ -21,7 +22,7 @@ import { FlumeTimeout } from "@/utils/timeout"
 import { safeErrorMessage } from "@/utils/safe-error-message"
 import { safeNormalizeError } from "@/utils/safe-normalize-error"
 
-export type FlumeOptions = {
+export type FlumeOptions = Readonly<{
   /** 統合する Source 群 (必須) */
   sources: ReadonlyArray<FlumeSource>
   /**
@@ -44,7 +45,11 @@ export type FlumeOptions = {
    * 常駐リスナー用途では明示的に有効化を推奨
    */
   reconnect?: boolean | FlumeReconnectOptions
-}
+}>
+
+type Configuration = Readonly<
+  Omit<FlumeOptions, "reconnect"> & { reconnect: FlumeReconnectConfig | null }
+>
 
 type Failure = {
   name: string
@@ -71,10 +76,26 @@ export class Flume {
 
   private readonly delivery: FlumeDelivery
 
-  constructor(private readonly options: FlumeOptions) {
-    this.sources = [...options.sources]
-    this.deps = options.deps ?? createFlumeDefaultDeps()
-    this.delivery = new FlumeDelivery(options, this.deps)
+  private readonly options: Configuration | FlumeStartError
+
+  constructor(options: FlumeOptions) {
+    this.options = captureConfiguration("Flume", () => {
+      return {
+        sources: Object.freeze([...options.sources]),
+        onEvent: options.onEvent,
+        onError: options.onError,
+        callbackBuffer: options.callbackBuffer,
+        signal: options.signal,
+        openTimeoutMs: options.openTimeoutMs,
+        deps: options.deps,
+        reconnect: resolveFlumeReconnectConfig(options.reconnect),
+      }
+    })
+    const captured: Configuration =
+      this.options instanceof Error ? { sources: [], reconnect: null } : this.options
+    this.sources = captured.sources
+    this.deps = captured.deps ?? createFlumeDefaultDeps()
+    this.delivery = new FlumeDelivery(captured, this.deps)
     this.log = new FlumeLogger({
       source: "flume",
       handler: (log) => this.delivery.publish({ kind: "log", log }),
@@ -92,19 +113,16 @@ export class Flume {
   }
 
   async open(): Promise<FlumeRunning | FlumeStartError> {
-    const selected = attempt(() => ({
-      signal: this.options.signal,
-      timeoutMs: this.options.openTimeoutMs,
-    }))
-    if (selected instanceof Error) {
-      const error = new FlumeStartError("Flume.open: cannot read startup options", {
-        cause: selected,
-        errorCode: "FLUME_RUNTIME_FAILED",
+    if (this.options instanceof Error) {
+      this.log.error({
+        action: "flume.open.refused",
+        message: this.options.message,
+        error: this.options,
       })
-      this.log.error({ action: "flume.open.refused", message: error.message, error })
-      return error
+      this.finishFailedOpen()
+      return this.options
     }
-    const { signal, timeoutMs: requestedTimeout } = selected
+    const { signal, openTimeoutMs: requestedTimeout } = this.options
     const guard = this.guardOpen(signal)
     if (guard) return guard
     if (
@@ -129,7 +147,7 @@ export class Flume {
       detail: { count: this.sources.length },
     })
 
-    const reconnect = this.resolveReconnect()
+    const reconnect = this.options.reconnect
 
     const controller = new AbortController()
     let subscribed = true
@@ -308,20 +326,6 @@ export class Flume {
     }
 
     return null
-  }
-
-  /** reconnect オプションの解決。throwing getter を持つ hostile 入力でも open() を reject させない */
-  private resolveReconnect(): FlumeReconnectConfig | null {
-    const result = attempt(() => resolveFlumeReconnectConfig(this.options.reconnect))
-    if (result instanceof Error) {
-      this.log.warn({
-        action: "reconnect.config.invalid",
-        message: safeErrorMessage({ error: result }),
-        error: result,
-      })
-      return null
-    }
-    return result
   }
 
   private signalError(signal: AbortSignal | undefined): FlumeStartError | null {

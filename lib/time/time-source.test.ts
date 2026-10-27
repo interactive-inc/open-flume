@@ -11,6 +11,7 @@ import type {
   FlumeSourceStartContext,
   FlumeStatus,
   FlumeTimeSourceState,
+  FlumeTimeSourceOptions,
 } from "@/types"
 
 const timerHandle = globalThis.setTimeout(() => {}, 0)
@@ -86,6 +87,138 @@ function tickFiredAt(event: FlumeEvent): unknown {
 }
 
 describe("FlumeTimeSource", () => {
+  it("reports an unsupported asynchronous message and its rejection without losing the default tick", async () => {
+    const test = createMockDeps(0)
+    const logs: FlumeLog[] = []
+    const events: FlumeEvent[] = []
+    const failure = new Error("async message failed")
+    const message = (() => Promise.reject(failure)) as unknown as FlumeTimeSourceOptions["message"]
+    const source = new FlumeTimeSource({ cron: "* * * * *", message })
+    await source.start(
+      createCtx({
+        deps: test.deps,
+        onEvent: (event) => events.push(event),
+        onLog: (log) => logs.push(log),
+      }),
+    )
+    test.setNow(60_000)
+    test.fire()
+    await source.stop()
+    expect(events).toHaveLength(1)
+    expect(logs).toContainEqual(
+      expect.objectContaining({ action: "message.error", error: failure }),
+    )
+    expect(logs).toContainEqual(
+      expect.objectContaining({
+        action: "message.error",
+        message: "Time source: message must return synchronously",
+        errorCode: "FLUME_CALLBACK_FAILED",
+      }),
+    )
+  })
+
+  it.each(["type", "data", "meta"])(
+    "isolates a failing message result %s getter without losing the tick or checkpoint",
+    async (field) => {
+      const test = createMockDeps(0)
+      const events: FlumeEvent[] = []
+      const logs: FlumeLog[] = []
+      const failure = new Error("message result unavailable")
+      const save = vi.fn(async () => {})
+      const source = new FlumeTimeSource({
+        cron: "* * * * *",
+        message: () =>
+          Object.defineProperty({}, field, {
+            get: () => {
+              throw failure
+            },
+          }),
+        statePersister: { load: async () => null, save },
+      })
+      expect(
+        await source.start(
+          createCtx({
+            deps: test.deps,
+            onEvent: (event) => events.push(event),
+            onLog: (log) => logs.push(log),
+          }),
+        ),
+      ).toBeNull()
+      test.setNow(60_000)
+      test.fire()
+      await source.stop()
+      expect(events).toHaveLength(1)
+      expect(events[0]).toMatchObject({
+        type: "tick",
+        data: { firedAt: 60_000, cron: "* * * * *" },
+      })
+      expect(logs).toContainEqual(
+        expect.objectContaining({
+          action: "message.error",
+          errorCode: "FLUME_CALLBACK_FAILED",
+          error: failure,
+        }),
+      )
+      expect(save).toHaveBeenCalledWith(
+        { lastFiredAt: 60_000 },
+        { signal: expect.any(AbortSignal) },
+      )
+    },
+  )
+
+  it("keeps one cron and message configuration from construction through every tick", async () => {
+    const test = createMockDeps(0)
+    const events: FlumeEvent[] = []
+    const message = vi.fn(() => ({}))
+    const replacement = vi.fn(() => ({ type: "replacement" }))
+    const options = { cron: "* * * * *", message }
+    const source = new FlumeTimeSource(options)
+    expect(
+      await source.start(createCtx({ deps: test.deps, onEvent: (event) => events.push(event) })),
+    ).toBeNull()
+    options.cron = "0 0 * * *"
+    options.message = replacement
+    test.setNow(60_000)
+    test.fire()
+    await source.stop()
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({
+      type: "tick",
+      data: { firedAt: 60_000, cron: "* * * * *" },
+      meta: { cron: "* * * * *" },
+    })
+    expect(message).toHaveBeenCalledWith({ firedAt: 60_000, cron: "* * * * *" })
+    expect(replacement).not.toHaveBeenCalled()
+  })
+
+  it("captures nested catchup policy before an asynchronous state load", async () => {
+    const test = createMockDeps(180_000)
+    const events: FlumeEvent[] = []
+    const loaded = Promise.withResolvers<FlumeTimeSourceState | null>()
+    const entered = Promise.withResolvers<void>()
+    const policy = { mode: "missed" as const, maxWindowMs: 180_000 }
+    const source = new FlumeTimeSource({
+      cron: "* * * * *",
+      catchupPolicy: policy,
+      statePersister: {
+        load: () => {
+          entered.resolve()
+          return loaded.promise
+        },
+        save: async () => {},
+      },
+    })
+    const opening = source.start(
+      createCtx({ deps: test.deps, onEvent: (event) => events.push(event) }),
+    )
+    await entered.promise
+    policy.maxWindowMs = 1
+    loaded.resolve({ lastFiredAt: 0 })
+    expect(await opening).toBeNull()
+    await source.stop()
+    expect(events.map(tickFiredAt)).toEqual([60_000, 120_000, 180_000])
+  })
+
   it("preserves a timer failure when a running scheduler halts", async () => {
     const test = createMockDeps(0)
     const logs: FlumeLog[] = []

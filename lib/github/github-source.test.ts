@@ -68,6 +68,24 @@ function flushPromises() {
 }
 
 describe("FlumeGitHubSource", () => {
+  it("uses the configuration captured at construction", async () => {
+    const test = createMockDeps()
+    test.mockFetch.mockResolvedValue(makeJsonResponse([]))
+    const options = { token: "example-token", pollInterval: 60 }
+    const source = new FlumeGitHubSource(options)
+    options.token = "replacement-token"
+    options.pollInterval = 1
+    expect(await source.start(createCtx({ deps: test.deps }))).toBeNull()
+    await source.stop()
+    expect(test.mockFetch).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: "Bearer example-token" }),
+      }),
+    )
+    expect(test.deps.setInterval).toHaveBeenCalledWith(expect.any(Function), 60_000)
+  })
+
   it("start() creates poller and forwards notifications as FlumeEvents", async () => {
     const test = createMockDeps()
     const receivedEvents: FlumeEvent[] = []

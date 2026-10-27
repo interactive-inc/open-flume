@@ -79,7 +79,11 @@ export abstract class FlumeSource {
     }
     this.lifecycle = Object.freeze({ kind: "active" })
 
-    const ctx = Object.freeze({ ...input })
+    const { reconnect, ...context } = input
+    const ctx = Object.freeze({
+      ...context,
+      reconnect: reconnect ? Object.freeze({ ...reconnect }) : null,
+    })
     this.ctx = ctx
     this.eventBuffer =
       typeof ctx.eventBuffer === "number" && Number.isFinite(ctx.eventBuffer)

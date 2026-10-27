@@ -2,6 +2,11 @@
 
 ## 未リリース
 
+- Slack Source は受信に使う appToken だけで構築できる。未使用だった botToken の必須指定を撤廃し、互換用の指定が残っていても読み取らず保持しない。
+
+- Flume、Confluence、全標準 Source の設定を生成時に固定する。既存 options の書換えによる通知先・認証情報・cron・catch-up・再接続方針の変更は反映しない。設定を変える場合は新しい Source / Flume を作成して replace する。ホスト signal も open 時ではなく生成時に選択する。
+- 設定取得の失敗は、コンストラクタから throw せず FLUME_RUNTIME_FAILED と元の cause を返す。Time の message が返した値の検証失敗でも tick と保存を継続し、非同期 message の誤用・遅延 rejection も診断する。
+
 - ホストの中断購読を起動から停止まで保持し、起動中に options.signal が変更されても所有者を切り替えない。購読解除の失敗は元の例外と公開コードを残し、中断と接続失敗が競合しても原因を捨てない。statuses は実行時にも不変のスナップショットを返す。
 - openTimeoutMs で Flume 全体の起動期限を指定できる。Confluence の交換期限も同じ所有者にまとめ、期限切れ・中断・タイマー故障を区別する。タイマー取消し失敗は診断に保持し、取消し済みの遅延発火を無効にする。
 

@@ -254,12 +254,14 @@ describe("FlumeDiscordSource reconnect", () => {
 
     MockWebSocket.latest = null
 
-    const source = new FlumeDiscordSource({ token: "test-token" })
+    const options = { token: "test-token" }
+    const source = new FlumeDiscordSource(options)
     const startPromise = source.start(createCtx({ deps: harness.deps, reconnect: RECONNECT }))
 
     simulateReadySequence()
     await startPromise
 
+    options.token = "replacement-token"
     const firstSocket = MockWebSocket.latest!
 
     firstSocket.simulateClose(1006, "network drop")
@@ -278,6 +280,7 @@ describe("FlumeDiscordSource reconnect", () => {
     const resumes = frames.filter((frame) => frame.op === 6)
 
     expect(resumes.length).toBe(1)
+    expect(resumes[0]!.d.token).toBe("test-token")
     expect(resumes[0]!.d.session_id).toBe("abc")
     expect(resumes[0]!.d.seq).toBe(1)
     expect(frames.filter((frame) => frame.op === 2).length).toBe(0)

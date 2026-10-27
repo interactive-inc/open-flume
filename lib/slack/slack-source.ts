@@ -1,3 +1,4 @@
+import { captureConfiguration } from "@/utils/capture-configuration"
 import type { FlumeSlackEnvelope, FlumeSlackSourceOptions, FlumeSourceStartContext } from "@/types"
 import { FlumeHttpError } from "@/errors/http-error"
 import { FlumeStartError } from "@/errors/start-error"
@@ -27,11 +28,19 @@ export class FlumeSlackSource extends FlumeSource {
 
   private seen: FlumeSlackSeenCache | null = null
 
-  constructor(private readonly options: FlumeSlackSourceOptions) {
+  private readonly options: FlumeSlackSourceOptions | FlumeStartError
+
+  constructor(options: FlumeSlackSourceOptions) {
     super()
+    this.options = captureConfiguration("slack source", () => ({
+      appToken: options.appToken,
+      idleTimeoutMs: options.idleTimeoutMs,
+      handshakeTimeoutMs: options.handshakeTimeoutMs,
+    }))
   }
 
   protected async connect(ctx: FlumeSourceStartContext): Promise<Error | null> {
+    if (this.options instanceof Error) return this.options
     if (!this.hasWebSocket(ctx)) {
       return new FlumeStartError(
         "Slack source: deps.WebSocket is null (no WebSocket runtime available)",
@@ -95,6 +104,7 @@ export class FlumeSlackSource extends FlumeSource {
   }
 
   private async connectInternal(ctx: FlumeSourceStartContext): Promise<Error | null> {
+    if (this.options instanceof Error) return this.options
     if (this.isStopped) return new FlumeStartError("Source stopped before reconnect")
     this.socket?.disconnect()
     this.setStatus("connecting")
