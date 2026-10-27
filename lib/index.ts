@@ -7,7 +7,11 @@ export { FlumeHttpError } from "@/errors/http-error"
 export { FlumeParseError } from "@/errors/parse-error"
 export { FlumeStartError } from "@/errors/start-error"
 export { Flume, type FlumeOptions } from "@/flume"
-export { FlumeConfluence } from "@/flume-confluence"
+export {
+  FlumeConfluence,
+  type FlumeConfluenceReplacement,
+  type FlumeConfluenceRemoval,
+} from "@/flume-confluence"
 export { FlumeRunning } from "@/flume-running"
 export { FlumeSource } from "@/flume-source"
 export { FlumeClosed, type FlumeCloseError } from "@/flume-closed"

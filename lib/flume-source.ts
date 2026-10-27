@@ -4,9 +4,11 @@ import type {
   FlumeSourceStartContext,
   FlumeStatus,
 } from "@/types"
+import { resolveFlumeErrorCode } from "@/errors/resolve-error-code"
 import { FlumeStartError } from "@/errors/start-error"
 import { FlumeSourceReuseError } from "@/errors/source-reuse-error"
 import { FlumeStatusEmitter } from "@/source-helpers/flume-status-emitter"
+import { snapshotValue } from "@/utils/snapshot-value"
 import { attempt } from "@/utils/attempt"
 import { safeErrorMessage } from "@/utils/safe-error-message"
 import { safeNormalizeError } from "@/utils/safe-normalize-error"
@@ -63,13 +65,24 @@ export abstract class FlumeSource {
 
   private eventBuffer = 1000
   private droppedEvents = 0
+  private rejectedEvents = 0
   private callbackFailures = 0
 
   private readonly cancelledStart = Promise.withResolvers<Error>()
 
   async start(ctx: FlumeSourceStartContext): Promise<Error | null> {
     const result = await attempt(() => this.runStart(ctx))
-    if (result instanceof Error && !(result instanceof FlumeSourceReuseError)) await this.stop()
+    if (result instanceof Error && !(result instanceof FlumeSourceReuseError)) {
+      const cleanup = await this.stop()
+      if (cleanup instanceof Error)
+        return new FlumeStartError(
+          `Source startup failed and cleanup failed: ${safeErrorMessage({ error: result })}`,
+          {
+            errorCode: resolveFlumeErrorCode("source.start.failed", result),
+            cause: new AggregateError([result, cleanup], "source startup and cleanup failed"),
+          },
+        )
+    }
     return result
   }
 
@@ -147,6 +160,13 @@ export abstract class FlumeSource {
     const disconnectResult = await attempt(() => this.disconnect())
 
     if (this.statusEmitter?.value !== "disconnected") this.statusEmitter?.set("disconnected")
+    if (disconnectResult instanceof Error)
+      this.ctx?.log.error({
+        action: "source.stop.failed",
+        message: safeErrorMessage({ error: disconnectResult }),
+        errorCode: "FLUME_STOP_FAILED",
+        error: disconnectResult,
+      })
     this.ctx = null
 
     return disconnectResult instanceof Error ? disconnectResult : null
@@ -166,6 +186,7 @@ export abstract class FlumeSource {
       eventBuffer: this.eventBuffer,
       pendingEvents: this.queue.size,
       droppedEvents: this.droppedEvents,
+      rejectedEvents: this.rejectedEvents,
       callbackFailures: this.callbackFailures,
     })
   }
@@ -188,8 +209,19 @@ export abstract class FlumeSource {
         })
       return
     }
+    const snapshot = attempt(() => ({ value: snapshotValue(event) }))
+    if (snapshot instanceof Error) {
+      this.rejectedEvents++
+      ctx.log.error({
+        action: "source.event.snapshot.error",
+        message: `Cannot capture source event: ${safeErrorMessage({ error: snapshot })}`,
+        errorCode: "FLUME_RUNTIME_FAILED",
+        error: snapshot,
+      })
+      return
+    }
     void this.queue.add(() => {
-      const result = attempt(() => ctx.onEvent(event))
+      const result = attempt(() => ctx.onEvent(snapshot.value))
       const report = (error: unknown) => {
         if (!(error instanceof Error)) return
         this.callbackFailures++

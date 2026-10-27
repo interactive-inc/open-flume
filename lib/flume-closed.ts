@@ -1,11 +1,11 @@
 import type { FlumeErrorCode } from "@/errors/error-codes"
 import type { FlumeSourceStatus } from "@/types"
 
-export type FlumeCloseError = {
+export type FlumeCloseError = Readonly<{
   source: string
   errorCode: FlumeErrorCode
   error: Error
-}
+}>
 
 type Props = {
   finalStatuses: ReadonlyArray<FlumeSourceStatus>

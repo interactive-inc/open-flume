@@ -40,6 +40,25 @@ function context(overrides: Partial<FlumeSourceStartContext> = {}): FlumeSourceS
 }
 
 describe("Source ingress and shutdown", () => {
+  it("preserves both direct startup and cleanup failures", async () => {
+    const connectFailure = new Error("connect failed")
+    const cleanupFailure = new Error("cleanup failed")
+    class FailingSource extends Source {
+      protected override async connect(): Promise<never> {
+        throw connectFailure
+      }
+      protected override disconnect(): void {
+        throw cleanupFailure
+      }
+    }
+    const source = new FailingSource()
+    const result = await source.start(context())
+    expect(result).toMatchObject({ errorCode: "FLUME_START_FAILED" })
+    if (!(result instanceof Error)) throw new Error("Expected startup failure")
+    expect((result.cause as AggregateError).errors).toEqual([connectFailure, cleanupFailure])
+    expect(await source.stop()).toBe(cleanupFailure)
+  })
+
   it("keeps late callback failures observable after stopping", async () => {
     const source = new Source()
     const gate = Promise.withResolvers<void>()

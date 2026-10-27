@@ -68,7 +68,7 @@ class MockWebSocket {
 
 const HELLO_MSG = '{"op":10,"d":{"heartbeat_interval":45000},"s":null,"t":null}'
 const READY_MSG =
-  '{"op":0,"d":{"session_id":"abc","resume_gateway_url":"wss://resume.example.com"},"s":1,"t":"READY"}'
+  '{"op":0,"d":{"session_id":"abc","resume_gateway_url":"wss://gateway-test.discord.gg"},"s":1,"t":"READY"}'
 
 const createMockDeps = (): FlumeRuntimeDeps => {
   const timerHandle = globalThis.setTimeout(() => {}, 0)
@@ -272,7 +272,7 @@ describe("FlumeDiscordSource reconnect", () => {
     const secondSocket = MockWebSocket.latest!
 
     expect(secondSocket).not.toBe(firstSocket)
-    expect(secondSocket.url).toBe("wss://resume.example.com/?v=10&encoding=json")
+    expect(secondSocket.url).toBe("wss://gateway-test.discord.gg/?v=10&encoding=json")
 
     secondSocket.simulateMessage(HELLO_MSG)
 

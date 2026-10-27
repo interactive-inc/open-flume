@@ -95,7 +95,7 @@ describe("real socket lifecycle", () => {
             op: 0,
             t: message.op === 6 ? "RESUMED" : "READY",
             s: sequence++,
-            d: { session_id: "test-session", resume_gateway_url: "wss://gateway.example.com" },
+            d: { session_id: "test-session", resume_gateway_url: "wss://gateway-test.discord.gg" },
           }),
         )
       })

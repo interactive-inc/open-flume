@@ -232,9 +232,9 @@ export class Flume {
     const signalError = openError ?? this.signalError(signal)
     if (signalError) {
       releaseSignal()
-      await this.rollback([...ownedSources])
+      const cleanupFailures = await this.rollback([...ownedSources])
       const error =
-        failures.length === 0
+        failures.length === 0 && cleanupFailures.length === 0
           ? signalError
           : new FlumeStartError(signalError.message, {
               errorCode: signalError.errorCode,
@@ -242,6 +242,7 @@ export class Flume {
                 [
                   ...(signalError.cause === undefined ? [] : [signalError.cause]),
                   ...failures.map((failure) => failure.error),
+                  ...cleanupFailures.map((failure) => failure.error),
                 ],
                 "source startup interrupted",
               ),
@@ -262,7 +263,7 @@ export class Flume {
         })
       }
 
-      await this.rollback([...ownedSources])
+      const cleanupFailures = await this.rollback([...ownedSources])
 
       const detail = failures
         .map((f) => `${f.name}: ${safeErrorMessage({ error: f.error })}`)
@@ -271,7 +272,7 @@ export class Flume {
         `Flume.open: ${failures.length} source(s) failed: ${detail}`,
         {
           cause: new AggregateError(
-            failures.map((failure) => failure.error),
+            [...failures, ...cleanupFailures].map((failure) => failure.error),
             "source startup failed",
           ),
         },
@@ -295,9 +296,20 @@ export class Flume {
     const finalSignalError = this.signalError(signal)
     if (!finalSignalError) return running
 
-    const error = finalSignalError
-    this.reportInterruptedOpen(error)
-    await running.close()
+    this.reportInterruptedOpen(finalSignalError)
+    const closed = await running.close()
+    const error = closed.errors().length
+      ? new FlumeStartError(finalSignalError.message, {
+          errorCode: finalSignalError.errorCode,
+          cause: new AggregateError(
+            [
+              ...(finalSignalError.cause === undefined ? [] : [finalSignalError.cause]),
+              ...closed.errors().map((entry) => entry.error),
+            ],
+            "cancelled startup cleanup failed",
+          ),
+        })
+      : finalSignalError
     return error
   }
 
@@ -363,7 +375,8 @@ export class Flume {
     return Promise.resolve().then(() => source.start(ctx))
   }
 
-  private async rollback(sources: ReadonlyArray<FlumeSource>): Promise<void> {
+  private async rollback(sources: ReadonlyArray<FlumeSource>): Promise<Failure[]> {
+    const failures: Failure[] = []
     const settled = await Promise.allSettled(
       sources.map((source) => Promise.resolve().then(() => source.stop())),
     )
@@ -374,14 +387,17 @@ export class Flume {
 
       if (result.status === "rejected") {
         const error = safeNormalizeError({ value: result.reason })
+        failures.push({ name, error })
         this.logRollbackFailure(name, error)
         continue
       }
 
       if (result.value instanceof Error) {
+        failures.push({ name, error: result.value })
         this.logRollbackFailure(name, result.value)
       }
     }
+    return failures
   }
 
   private logRollbackFailure(name: string, error: Error): void {

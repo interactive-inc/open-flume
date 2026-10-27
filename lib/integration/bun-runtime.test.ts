@@ -104,7 +104,10 @@ describe("Bun runtime against Node wire servers", () => {
                 op: 0,
                 t: message.op === 2 ? "READY" : "RESUMED",
                 s: sequence++,
-                d: { session_id: "test-session", resume_gateway_url: "wss://gateway.example.com" },
+                d: {
+                  session_id: "test-session",
+                  resume_gateway_url: "wss://gateway-test.discord.gg",
+                },
               }),
             )
             sendBatch()

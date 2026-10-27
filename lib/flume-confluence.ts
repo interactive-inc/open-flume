@@ -13,8 +13,10 @@ import type {
 import type { FlumeSource } from "@/flume-source"
 import { createFlumeDefaultDeps } from "@/deps"
 import { FlumeStartError } from "@/errors/start-error"
+import { FlumeClosed } from "@/flume-closed"
 import { Flume } from "@/flume"
 import { FlumeRunning } from "@/flume-running"
+import { snapshotValue } from "@/utils/snapshot-value"
 import { attempt } from "@/utils/attempt"
 
 const DEFAULT_REPLACE_TIMEOUT_MS = 10_000
@@ -32,16 +34,25 @@ type Props = {
   reconnect?: boolean | FlumeReconnectOptions
 }
 
+export type FlumeConfluenceReplacement = Readonly<{ previous: FlumeClosed }>
+
+export type FlumeConfluenceRemoval = Readonly<{
+  groupId: string
+  closed: FlumeClosed | null
+  /** remove が中断した起動の結果。通常の取消しも FLUME_ABORTED として返す。 */
+  openingError: Error | null
+}>
+
 type Opening = {
   controller: AbortController
-  done: Promise<void>
-  finish: () => void
+  done: Promise<Error | null>
+  finish: (result: Error | null) => void
 }
 
 type Group = {
   running: FlumeRunning | null
   opening: Opening | null
-  closing: Promise<void> | null
+  closing: Promise<FlumeConfluenceRemoval> | null
 }
 
 /**
@@ -50,7 +61,7 @@ type Group = {
  */
 export class FlumeConfluence {
   private readonly groups = new Map<string, Group>()
-  private closePromise: Promise<void> | null = null
+  private closePromise: Promise<ReadonlyArray<FlumeConfluenceRemoval>> | null = null
   private readonly deps: FlumeRuntimeDeps
 
   private readonly props: Readonly<Props> | FlumeStartError
@@ -82,7 +93,7 @@ export class FlumeConfluence {
     this.groups.set(id, group)
     const result = await this.startGroup(id, group, sources)
     if (result instanceof Error && !group.closing) this.groups.delete(id)
-    return result
+    return result instanceof Error ? result : null
   }
 
   /** 起動失敗時は旧接続を維持する。同じグループの並行 replace は拒否する。 */
@@ -90,7 +101,7 @@ export class FlumeConfluence {
     id: string,
     sources: ReadonlyArray<FlumeSource>,
     options?: { readonly replaceTimeoutMs?: number },
-  ): Promise<Error | null> {
+  ): Promise<FlumeConfluenceReplacement | Error> {
     if (this.props instanceof Error) return this.props
     if (this.isClosed) return new FlumeStartError(`FlumeConfluence: already closed: ${id}`)
     const group = this.groups.get(id)
@@ -108,28 +119,39 @@ export class FlumeConfluence {
       typeof requested === "number" && Number.isFinite(requested) && requested > 0
         ? Math.min(requested, 2_147_483_647)
         : DEFAULT_REPLACE_TIMEOUT_MS
-    return this.startGroup(id, group, sources, timeoutMs)
+    const result = await this.startGroup(id, group, sources, timeoutMs)
+    if (result instanceof Error) return result
+    // 稼働中グループのみ交換を開始するため、成功時は必ず旧接続の終了結果がある。
+    return Object.freeze({ previous: result! })
   }
 
-  remove(id: string): Promise<void> {
+  remove(id: string): Promise<FlumeConfluenceRemoval | undefined> {
     const group = this.groups.get(id)
-    if (!group) return Promise.resolve()
+    if (!group) return Promise.resolve(undefined)
     if (group.closing) return group.closing
 
     // user callback が remove を再入しても同じ完了を待てるよう、副作用より先に登録する。
     group.closing = Promise.resolve().then(async () => {
       const opening = group.opening
       if (opening) attempt(() => opening.controller.abort())
-      await Promise.all([opening?.done, group.running?.close()])
+      const [openingError, closed] = await Promise.all([opening?.done, group.running?.close()])
       this.groups.delete(id)
+      return Object.freeze({
+        groupId: id,
+        closed: closed ?? null,
+        openingError: openingError ?? null,
+      })
     })
     return group.closing
   }
 
-  closeAll(): Promise<void> {
+  closeAll(): Promise<ReadonlyArray<FlumeConfluenceRemoval>> {
     if (!this.closePromise) {
       this.closePromise = Promise.resolve().then(async () => {
-        await Promise.all([...this.groups.keys()].map((id) => this.remove(id)))
+        const results = await Promise.all([...this.groups.keys()].map((id) => this.remove(id)))
+        return Object.freeze(
+          results.filter((result): result is FlumeConfluenceRemoval => result !== undefined),
+        )
       })
     }
     return this.closePromise
@@ -159,10 +181,10 @@ export class FlumeConfluence {
     group: Group,
     sources: ReadonlyArray<FlumeSource>,
     timeoutMs?: number,
-  ): Promise<Error | null> {
+  ): Promise<FlumeClosed | Error | null> {
     const props = this.props
     if (props instanceof Error) return props
-    const completion = Promise.withResolvers<void>()
+    const completion = Promise.withResolvers<Error | null>()
     const opening: Opening = {
       controller: new AbortController(),
       done: completion.promise,
@@ -182,16 +204,23 @@ export class FlumeConfluence {
       }).open()
       if (next instanceof Error) return next
       if (this.isClosed || group.closing) {
-        await next.close()
-        return new FlumeStartError(`FlumeConfluence: removed during open: ${id}`)
+        const closed = await next.close()
+        return new FlumeStartError(`FlumeConfluence: removed during open: ${id}`, {
+          errorCode: "FLUME_ABORTED",
+          cause: closed.errors().length
+            ? new AggregateError(
+                closed.errors().map((entry) => entry.error),
+                "cancelled startup cleanup failed",
+              )
+            : undefined,
+        })
       }
       const previous = group.running
       group.running = next
-      await previous?.close()
-      return null
+      return previous ? await previous.close() : null
     })
     group.opening = null
-    opening.finish()
+    opening.finish(result instanceof Error ? result : null)
     return result
   }
 
@@ -202,7 +231,7 @@ export class FlumeConfluence {
     if (!onEvent) return undefined
 
     return (item: FlumeStreamItem) => {
-      const stamped: FlumeConfluenceItem = { ...item, groupId: id }
+      const stamped: FlumeConfluenceItem = Object.freeze({ ...item, groupId: id })
       return onEvent(stamped)
     }
   }
@@ -213,6 +242,6 @@ export class FlumeConfluence {
   ): FlumeErrorHandler | undefined {
     if (!onError) return undefined
 
-    return (log) => onError({ ...log, detail: { ...log.detail, groupId: id } })
+    return (log) => onError(snapshotValue({ ...log, detail: { ...log.detail, groupId: id } }))
   }
 }

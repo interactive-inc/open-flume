@@ -1,3 +1,4 @@
+import type { FlumeLog } from "@/types"
 import { describe, it, expect, vi } from "vitest"
 import { FlumeLogger } from "@/logger"
 
@@ -137,4 +138,30 @@ describe("FlumeLogger", () => {
 
     await new Promise((resolve) => globalThis.setTimeout(resolve, 0))
   })
+})
+
+it("reports malformed log detail without leaking an exception or stopping later logs", () => {
+  const logs: FlumeLog[] = []
+  const logger = new FlumeLogger({
+    source: "test",
+    deps: { now: () => 1 },
+    handler: (log) => logs.push(log),
+  })
+  const failure = new Error("detail getter failed")
+  logger.error({
+    action: "test",
+    message: "test",
+    detail: {
+      get value() {
+        throw failure
+      },
+    },
+  })
+  logger.info({ action: "later", message: "later" })
+  expect(logs[0]).toMatchObject({
+    action: "log.snapshot.error",
+    errorCode: "FLUME_RUNTIME_FAILED",
+    error: failure,
+  })
+  expect(logs[1]?.action).toBe("later")
 })

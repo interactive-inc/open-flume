@@ -239,10 +239,11 @@ describe("Flume", () => {
   })
 
   it("logs rollback failures into the firehose when a source's stop() rejects", async () => {
+    const cleanupFailure = new Error("stop-failed")
     class FailingStop extends MockSource {
       protected override async disconnect(): Promise<void> {
         this.stopCount += 1
-        throw new Error("stop-failed")
+        throw cleanupFailure
       }
     }
     const failingA = new FailingStop({ name: "discord" })
@@ -258,7 +259,9 @@ describe("Flume", () => {
       },
     })
 
-    await flume.open()
+    const result = await flume.open()
+    expect(result).toBeInstanceOf(Error)
+    expect(((result as Error).cause as AggregateError).errors).toContain(cleanupFailure)
 
     await waitFor(() =>
       expect(captured.some((c) => c.action === "flume.rollback.failed")).toBe(true),
@@ -679,7 +682,9 @@ describe("Flume onError", () => {
     await running.close()
     await running.drain()
 
-    const diagnostic = logs.find((log) => log.action === "onError.error")
+    const diagnostic = logs.find(
+      (log) => log.action === "onError.error" && log.detail?.itemAction === "flume.close.failed",
+    )
     expect(diagnostic?.message).toContain("error sink failed")
     expect(diagnostic?.detail).toEqual({
       callback: "onError",

@@ -24,50 +24,52 @@ export type FlumeRuntimeDeps = {
   clearInterval(id: FlumeTimerHandle): void
 }
 
+type ReadonlyData<T> = { readonly [P in keyof T]: ReadonlyData<T[P]> }
+
 // Event (discriminated by source)
 
 export type FlumeSourceName = "discord" | "slack" | "github" | "time"
 
-export type FlumeDiscordEvent = {
+export type FlumeDiscordEvent = Readonly<{
   source: "discord"
   type: string
-  data: Record<string, unknown>
-  meta: Record<string, string>
+  data: Readonly<Record<string, unknown>>
+  meta: Readonly<Record<string, string>>
   receivedAt: number
-}
+}>
 
-export type FlumeSlackEvent = {
+export type FlumeSlackEvent = Readonly<{
   source: "slack"
   type: string
-  data: Record<string, unknown>
-  meta: Record<string, string>
+  data: Readonly<Record<string, unknown>>
+  meta: Readonly<Record<string, string>>
   receivedAt: number
-}
+}>
 
-export type FlumeGitHubEvent = {
+export type FlumeGitHubEvent = Readonly<{
   source: "github"
   type: "notification"
-  data: FlumeGitHubNotification
-  meta: Record<string, string>
+  data: ReadonlyData<FlumeGitHubNotification>
+  meta: Readonly<Record<string, string>>
   receivedAt: number
-}
+}>
 
-export type FlumeTimeEvent = {
+export type FlumeTimeEvent = Readonly<{
   source: "time"
   type: string
-  data: Record<string, unknown>
-  meta: Record<string, string>
+  data: Readonly<Record<string, unknown>>
+  meta: Readonly<Record<string, string>>
   receivedAt: number
-}
+}>
 
-export type FlumeCustomEvent = {
+export type FlumeCustomEvent = Readonly<{
   source: "custom"
   sourceName: string
   type: string
-  data: Record<string, unknown>
-  meta: Record<string, string>
+  data: Readonly<Record<string, unknown>>
+  meta: Readonly<Record<string, string>>
   receivedAt: number
-}
+}>
 
 export type FlumeEvent =
   | FlumeDiscordEvent
@@ -80,7 +82,9 @@ export type FlumeEventHandler = (event: FlumeEvent) => void | Promise<void>
 
 // Unified stream (events + 全ログを 1 本の firehose に統合。使う側が kind / level で filter)
 
-export type FlumeStreamItem = { kind: "event"; event: FlumeEvent } | { kind: "log"; log: FlumeLog }
+export type FlumeStreamItem = Readonly<
+  { kind: "event"; event: FlumeEvent } | { kind: "log"; log: FlumeLog }
+>
 
 export type FlumeStreamHandler = (item: FlumeStreamItem) => unknown | Promise<unknown>
 
@@ -110,6 +114,8 @@ export type FlumeDeliveryStatus = Readonly<{
   droppedDiagnosticCallbacks: number
   callbackFailures: number
   droppedStreamItems: number
+  /** データの取得に失敗し、配送できなかった item 数。混雑による破棄とは区別する。 */
+  rejectedItems: number
 }>
 
 /** callback や pull の混雑と独立した警告・エラー履歴。古い履歴の破棄数も公開する。 */
@@ -137,29 +143,29 @@ export type FlumeStreamOptions = Readonly<{
 
 export type FlumeStatus = "disconnected" | "connecting" | "connected" | "reconnecting"
 
-export type FlumeSourceStatus = {
+export type FlumeSourceStatus = Readonly<{
   /**
    * 多くは `FlumeSourceName` のいずれかだが、`source.name` getter が throw する
    * 第三者 FlumeSource 実装に備えて `string` まで広げてある (fallback で `"?"`)
    */
   source: string
   status: FlumeStatus
-}
+}>
 
 // Logging
 
 export type FlumeLogLevel = "debug" | "info" | "warn" | "error"
 
-export type FlumeLog = {
+export type FlumeLog = Readonly<{
   level: FlumeLogLevel
   source: string
   action: string
   message: string
   error?: Error
   errorCode?: FlumeErrorCode
-  detail?: Record<string, unknown>
+  detail?: Readonly<Record<string, unknown>>
   timestamp: number
-}
+}>
 
 export type FlumeLogHandler = (log: FlumeLog) => void
 
@@ -212,6 +218,8 @@ export type FlumeSourceDeliveryStatus = Readonly<{
   eventBuffer: number
   pendingEvents: number
   droppedEvents: number
+  /** データの取得に失敗し、発行できなかった event 数。 */
+  rejectedEvents: number
   callbackFailures: number
 }>
 

@@ -10,6 +10,9 @@ import type {
   FlumeLogLevel,
   FlumeRuntimeDeps,
 } from "@/types"
+import { attempt } from "@/utils/attempt"
+import { snapshotValue } from "@/utils/snapshot-value"
+import { safeErrorMessage } from "@/utils/safe-error-message"
 import { safeInvokeCallback } from "@/utils/safe-invoke-callback"
 import { safeNow } from "@/utils/safe-now"
 
@@ -56,27 +59,42 @@ export class FlumeLogger {
 
     if (!handler) return
 
-    const log: FlumeLog = {
-      level,
-      source: this.props.source,
-      action: input.action,
-      message: input.message,
-      timestamp: safeNow({ deps: this.props.deps }),
-      error: input.error,
-      errorCode:
-        input.errorCode ??
-        (level === "error" || level === "warn" || input.error
-          ? resolveFlumeErrorCode(input.action, input.error)
-          : undefined),
-      detail:
-        (input.error instanceof FlumeConnectionError ||
-          input.error instanceof FlumeHttpError ||
-          input.error instanceof FlumeOperationError ||
-          input.error instanceof FlumeStateError) &&
-        input.error.context
-          ? { ...input.error.context, ...input.detail }
-          : input.detail,
-    }
+    const captured = attempt(() => {
+      const { action, message, error, errorCode, detail } = input
+      return snapshotValue<FlumeLog>({
+        level,
+        source: this.props.source,
+        action,
+        message,
+        timestamp: safeNow({ deps: this.props.deps }),
+        error,
+        errorCode:
+          errorCode ??
+          (level === "error" || level === "warn" || error
+            ? resolveFlumeErrorCode(action, error)
+            : undefined),
+        detail:
+          (error instanceof FlumeConnectionError ||
+            error instanceof FlumeHttpError ||
+            error instanceof FlumeOperationError ||
+            error instanceof FlumeStateError) &&
+          error.context
+            ? { ...error.context, ...detail }
+            : detail,
+      })
+    })
+    const log: FlumeLog =
+      captured instanceof Error
+        ? snapshotValue({
+            level: "error",
+            source: this.props.source,
+            action: "log.snapshot.error",
+            message: `Cannot capture log entry: ${safeErrorMessage({ error: captured })}`,
+            errorCode: "FLUME_RUNTIME_FAILED",
+            error: captured,
+            timestamp: safeNow({ deps: this.props.deps }),
+          })
+        : captured
 
     safeInvokeCallback({ fn: () => handler(log), onError: () => {} })
   }

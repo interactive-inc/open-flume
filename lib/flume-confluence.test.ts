@@ -45,6 +45,39 @@ const event = (type: string): FlumeEvent => ({
 })
 
 describe("FlumeConfluence", () => {
+  it("returns cleanup failures from removal independently of blocked callbacks", async () => {
+    const failure = new Error("disconnect failed")
+    const gate = Promise.withResolvers<void>()
+    class FailingStop extends MockSource {
+      protected override disconnect(): void {
+        super.disconnect()
+        throw failure
+      }
+    }
+    const confluence = new FlumeConfluence({ onEvent: () => gate.promise })
+    await confluence.add("group", [new FailingStop()])
+    const result = await confluence.remove("group")
+    expect(result?.closed?.errors()).toContainEqual(expect.objectContaining({ error: failure }))
+    gate.resolve()
+  })
+
+  it("returns the old generation's cleanup result after committing a replacement", async () => {
+    const failure = new Error("previous disconnect failed")
+    class FailingStop extends MockSource {
+      protected override disconnect(): void {
+        super.disconnect()
+        throw failure
+      }
+    }
+    const confluence = new FlumeConfluence()
+    await confluence.add("group", [new FailingStop()])
+    const result = await confluence.replace("group", [new MockSource()])
+    if (result instanceof Error) throw result
+    expect(result.previous.errors()).toContainEqual(expect.objectContaining({ error: failure }))
+    expect(confluence.has("group")).toBe(true)
+    await confluence.closeAll()
+  })
+
   it("keeps one configured sink across groups and replacements", async () => {
     const original: FlumeStreamItem[] = []
     const replacement: FlumeStreamItem[] = []
@@ -55,7 +88,7 @@ describe("FlumeConfluence", () => {
     expect(await confluence.add("group", [source])).toBeNull()
     source.pushEvent!(event("first"))
     const next = new MockSource()
-    expect(await confluence.replace("group", [next])).toBeNull()
+    expect(await confluence.replace("group", [next])).toHaveProperty("previous")
     next.pushEvent!(event("second"))
     await confluence.closeAll()
     await waitFor(() => expect(original.filter((item) => item.kind === "event")).toHaveLength(2))
@@ -219,7 +252,7 @@ describe("FlumeConfluence", () => {
     const newSrc = new TrackedSource("new")
 
     expect(await confluence.add("rotating", [oldSrc])).toBeNull()
-    expect(await confluence.replace("rotating", [newSrc])).toBeNull()
+    expect(await confluence.replace("rotating", [newSrc])).toHaveProperty("previous")
 
     expect(stops).toEqual(["old"])
     newSrc.pushEvent?.(event("after-replace"))
@@ -307,7 +340,14 @@ describe("FlumeConfluence", () => {
     const addPromise = confluence.add("pending", [source])
     await waitFor(() => expect(source.startCount).toBe(1))
 
-    await confluence.closeAll()
+    const results = await confluence.closeAll()
+    expect(results).toHaveLength(1)
+    expect(results[0]).toMatchObject({
+      groupId: "pending",
+      closed: null,
+      openingError: expect.any(Error),
+    })
+    expect(Object.isFrozen(results)).toBe(true)
 
     expect(await addPromise).toBeInstanceOf(Error)
     expect(source.stopCount).toBe(1)
@@ -388,7 +428,7 @@ describe("FlumeConfluence", () => {
     const previous = new MockSource()
     const next = new MockSource()
     expect(await confluence.add("replace", [previous])).toBeNull()
-    expect(await confluence.replace("replace", [next])).toBeNull()
+    expect(await confluence.replace("replace", [next])).toHaveProperty("previous")
 
     expect(confluence.observe("replace")?.diagnostics().entries).toContainEqual(
       expect.objectContaining({

@@ -19,27 +19,27 @@ describe("FlumeDiscordGatewaySession", () => {
   it("withReady() sets sessionId and resumeUrl, canResume() returns true", () => {
     const session = FlumeDiscordGatewaySession.empty().withReady(
       "sid-1",
-      "wss://resume.example.com",
+      "wss://gateway-test.discord.gg",
     )
 
     expect(session.sessionId).toBe("sid-1")
-    expect(session.resumeUrl).toBe("wss://resume.example.com")
+    expect(session.resumeUrl).toBe("wss://gateway-test.discord.gg")
     expect(session.canResume()).toBe(true)
   })
 
   it("withSeq() updates seq preserving other fields", () => {
     const session = FlumeDiscordGatewaySession.empty()
-      .withReady("sid-1", "wss://resume.example.com")
+      .withReady("sid-1", "wss://gateway-test.discord.gg")
       .withSeq(42)
 
     expect(session.seq).toBe(42)
     expect(session.sessionId).toBe("sid-1")
-    expect(session.resumeUrl).toBe("wss://resume.example.com")
+    expect(session.resumeUrl).toBe("wss://gateway-test.discord.gg")
   })
 
   it("withReset() returns empty session", () => {
     const session = FlumeDiscordGatewaySession.empty()
-      .withReady("sid-1", "wss://resume.example.com")
+      .withReady("sid-1", "wss://gateway-test.discord.gg")
       .withSeq(42)
       .withReset()
 
@@ -57,7 +57,7 @@ describe("FlumeDiscordGatewaySession", () => {
   it("withSeq creates new instance", () => {
     const original = FlumeDiscordGatewaySession.empty().withReady(
       "sid-1",
-      "wss://resume.example.com",
+      "wss://gateway-test.discord.gg",
     )
     const updated = original.withSeq(10)
 

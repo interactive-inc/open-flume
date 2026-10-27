@@ -161,3 +161,7 @@ Time の writer は idle / saving / halted、lifecycle は open / closing / clos
 起動期限は Flume.open の所有物とし、openTimeoutMs で指定する。Confluence の交換期限もこれを使い、別のタイマーや診断経路を持たない。ホスト signal は生成時に選び、購読は open から close まで一度だけ保持する。取消し失敗も Flume の診断履歴に残し、runtime の失敗と明示的な中断を区別する。
 
 公開コンストラクタの設定は captureConfiguration で一度だけ取り込み、再接続や通知時に呼出し側の options を読み直さない。nested の catchup / reconnect も値として固定する。deps・signal・statePersister は同じポート参照を保持し、呼出し側のオブジェクト自体を凍結しない。設定取得の例外は FLUME_RUNTIME_FAILED と cause を持つ起動エラーにする。callback の戻り値検証も例外隔離の範囲に含める。
+
+通知の object / array は snapshotValue で発行時にコピー・凍結し、Source、Logger、Delivery で同じ所有済み値を共有する。コピーは循環を保持する反復処理とし、Error / cause / クラス等の opaque 値は参照を維持する。取得失敗は拒否数と原因付き診断に残す。既存の呼出し側のオブジェクトを凍結しない。
+
+Confluence.replace は成功時に旧接続の previous: FlumeClosed を返し、旧接続の停止失敗と交換自体の失敗を区別する。remove / closeAll も終了結果と中断した起動の結果を返す。Source.start と Flume.open は、起動と後片付けが同時に失敗した場合も両方の原因を保持する。

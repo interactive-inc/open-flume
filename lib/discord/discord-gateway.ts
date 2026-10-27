@@ -234,6 +234,17 @@ export class FlumeDiscordGateway {
 
     const rebuilt = attempt(() => {
       const parsed = new URL(url)
+      if (
+        parsed.protocol !== "wss:" ||
+        !parsed.hostname.endsWith(".discord.gg") ||
+        parsed.username ||
+        parsed.password ||
+        parsed.port ||
+        parsed.hash
+      )
+        return new FlumeConnectionError("Untrusted Discord resume destination", {
+          errorCode: "FLUME_PROTOCOL_INVALID",
+        })
       parsed.searchParams.set("v", GATEWAY_VERSION)
       parsed.searchParams.set("encoding", GATEWAY_ENCODING)
       return parsed.toString()
@@ -241,7 +252,9 @@ export class FlumeDiscordGateway {
     if (rebuilt instanceof Error) {
       this.log.warn({
         action: "resume.url.invalid",
-        message: `resume url unparseable, dropping session and identifying fresh: ${safeErrorMessage({ error: rebuilt })}`,
+        message:
+          "resume URL rejected; dropping session and identifying through the default gateway",
+        detail: { reason: "invalid or untrusted destination" },
       })
       this.currentSession = this.currentSession.withReset()
       return GATEWAY_URL

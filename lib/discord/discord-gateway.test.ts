@@ -89,7 +89,7 @@ const createMockDeps = (): Deps => {
 
 const HELLO_MSG = '{"op":10,"d":{"heartbeat_interval":45000},"s":null,"t":null}'
 const READY_MSG =
-  '{"op":0,"d":{"session_id":"abc","resume_gateway_url":"wss://resume.example.com"},"s":1,"t":"READY"}'
+  '{"op":0,"d":{"session_id":"abc","resume_gateway_url":"wss://gateway-test.discord.gg"},"s":1,"t":"READY"}'
 const RESUMED_MSG = '{"op":0,"d":{},"s":2,"t":"RESUMED"}'
 const HEARTBEAT_ACK_MSG = '{"op":11,"d":null,"s":null,"t":null}'
 const SERVER_HEARTBEAT_MSG = '{"op":1,"d":null,"s":null,"t":null}'
@@ -187,7 +187,7 @@ const createGatewayWithTimers = (options?: {
 const createResumableSession = () =>
   new FlumeDiscordGatewaySession({
     sessionId: "sid-1",
-    resumeUrl: "wss://resume.example.com",
+    resumeUrl: "wss://gateway-test.discord.gg",
     seq: 7,
   })
 
@@ -482,18 +482,34 @@ describe("FlumeDiscordGateway", () => {
 })
 
 describe("FlumeDiscordGateway session and resume", () => {
+  it.each([
+    "wss://receiver.example.com",
+    "ws://gateway.discord.gg",
+    "wss://gateway.discord.gg.receiver.example.com",
+    "wss://gateway.discord.gg@receiver.example.com",
+    "wss://user:secret@gateway.discord.gg",
+    "wss://gateway.discord.gg:8443",
+    "wss://gateway.discord.gg/#fragment",
+  ])("rejects an untrusted resume destination before sending credentials: %s", (url) => {
+    const ctx = createGatewayWithTimers({ session: createResumableSession() })
+    ctx.gateway.connect(url)
+    expect(MockWebSocket.latest!.url).toBe("wss://gateway.discord.gg/?v=10&encoding=json")
+    expect(ctx.gateway.session.canResume()).toBe(false)
+    ctx.gateway.disconnect()
+  })
+
   it("connect(resumeUrl) appends v=10&encoding=json to the resume url", () => {
     const ctx = createGatewayWithTimers({ session: createResumableSession() })
 
-    ctx.gateway.connect("wss://resume.example.com")
+    ctx.gateway.connect("wss://gateway-test.discord.gg")
 
-    expect(MockWebSocket.latest!.url).toBe("wss://resume.example.com/?v=10&encoding=json")
+    expect(MockWebSocket.latest!.url).toBe("wss://gateway-test.discord.gg/?v=10&encoding=json")
   })
 
   it("injected session sends RESUME instead of IDENTIFY after HELLO", () => {
     const ctx = createGatewayWithTimers({ session: createResumableSession() })
 
-    ctx.gateway.connect("wss://resume.example.com")
+    ctx.gateway.connect("wss://gateway-test.discord.gg")
     MockWebSocket.latest!.simulateMessage(HELLO_MSG)
 
     const frames = MockWebSocket.latest!.sentMessages.map((raw) => JSON.parse(raw))

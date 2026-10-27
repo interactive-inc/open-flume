@@ -10,6 +10,7 @@ import type {
 } from "@/types"
 import { FlumeStreamHub } from "@/flume-stream-hub"
 import { FlumeSerialQueue } from "@/utils/serial-queue"
+import { snapshotValue } from "@/utils/snapshot-value"
 import { attempt } from "@/utils/attempt"
 import { safeErrorMessage } from "@/utils/safe-error-message"
 import { safeNow } from "@/utils/safe-now"
@@ -41,6 +42,7 @@ export class FlumeDelivery {
   private droppedEventCallbacks = 0
   private droppedLogCallbacks = 0
   private callbackFailures = 0
+  private rejectedItems = 0
   private droppedStreamItems = 0
   private pendingDiagnostics = 0
   private droppedDiagnosticCallbacks = 0
@@ -58,8 +60,26 @@ export class FlumeDelivery {
         : 1000
   }
 
-  publish(item: FlumeStreamItem): void {
+  publish(input: FlumeStreamItem): void {
     if (!this.accepting) return
+    const captured = attempt(() => ({ value: snapshotValue(input) }))
+    if (captured instanceof Error) {
+      this.rejectedItems++
+      this.publish({
+        kind: "log",
+        log: {
+          level: "error",
+          source: "flume",
+          action: "delivery.snapshot.error",
+          errorCode: "FLUME_RUNTIME_FAILED",
+          message: `Cannot capture stream item: ${safeErrorMessage({ error: captured })}`,
+          error: captured,
+          timestamp: safeNow({ deps: this.deps }),
+        },
+      })
+      return
+    }
+    const item = captured.value
     if (item.kind === "log") this.remember(item.log)
     this.hub.publish(item)
     this.enqueue("onEvent", item)
@@ -67,7 +87,20 @@ export class FlumeDelivery {
   }
 
   stream(options?: FlumeStreamOptions): AsyncIterableIterator<FlumeStreamItem> {
-    return this.hub.subscribe(options)
+    const stream = attempt(() => this.hub.subscribe(options))
+    if (!(stream instanceof Error)) return stream
+    const log = snapshotValue<FlumeLog>({
+      level: "error",
+      source: "flume",
+      action: "stream.options.error",
+      errorCode: "FLUME_RUNTIME_FAILED",
+      message: `Cannot read stream options; using defaults: ${safeErrorMessage({ error: stream })}`,
+      error: stream,
+      timestamp: safeNow({ deps: this.deps }),
+    })
+    if (this.accepting) this.publish({ kind: "log", log })
+    else this.remember(log)
+    return this.hub.subscribe()
   }
 
   status(): FlumeDeliveryStatus {
@@ -79,6 +112,7 @@ export class FlumeDelivery {
       droppedLogCallbacks: this.droppedLogCallbacks,
       droppedDiagnosticCallbacks: this.droppedDiagnosticCallbacks,
       callbackFailures: this.callbackFailures,
+      rejectedItems: this.rejectedItems,
       droppedStreamItems: this.droppedStreamItems,
     })
   }
@@ -96,12 +130,7 @@ export class FlumeDelivery {
     if (log.level !== "warn" && log.level !== "error") return
     this.diagnosticCount++
     if (this.diagnosticEntries.length >= DIAGNOSTIC_CAPACITY) this.diagnosticEntries.shift()
-    this.diagnosticEntries.push(
-      Object.freeze({
-        ...log,
-        detail: log.detail ? Object.freeze({ ...log.detail }) : undefined,
-      }),
-    )
+    this.diagnosticEntries.push(log)
   }
 
   close(): void {
@@ -167,7 +196,7 @@ export class FlumeDelivery {
             itemAction: item.log.action,
             itemDetail: item.log.detail,
           }
-    const log: FlumeLog = {
+    const log = snapshotValue<FlumeLog>({
       level: "error",
       errorCode: "FLUME_CALLBACK_FAILED",
       source: "flume",
@@ -176,11 +205,15 @@ export class FlumeDelivery {
       error,
       detail: { callback, ...detail },
       timestamp: safeNow({ deps: this.deps }),
-    }
+    })
     this.remember(log)
-    this.hub.publish({ kind: "log", log })
+    this.hub.publish(Object.freeze({ kind: "log", log }))
     if (notifyPeer)
-      this.enqueue(callback === "onEvent" ? "onError" : "onEvent", { kind: "log", log }, false)
+      this.enqueue(
+        callback === "onEvent" ? "onError" : "onEvent",
+        Object.freeze({ kind: "log", log }),
+        false,
+      )
   }
 
   private callbackOverflow(item: FlumeStreamItem): void {
@@ -189,7 +222,7 @@ export class FlumeDelivery {
     else this.droppedLogCallbacks++
     if (this.overflowed) return
     this.overflowed = true
-    const log: FlumeLog = {
+    const log = snapshotValue<FlumeLog>({
       level: "error",
       errorCode: "FLUME_BUFFER_OVERFLOW",
       source: "flume",
@@ -197,16 +230,16 @@ export class FlumeDelivery {
       message: "callback buffer overflowed; dropping new items (notified once per Flume)",
       detail: { buffer: this.capacity },
       timestamp: safeNow({ deps: this.deps }),
-    }
+    })
     this.remember(log)
-    this.hub.publish({ kind: "log", log })
+    this.hub.publish(Object.freeze({ kind: "log", log }))
     // 各診断 sink に一枠確保する。遅い callback でも無制限に積まない。
-    this.enqueue("onError", { kind: "log", log }, false)
-    this.enqueue("onEvent", { kind: "log", log }, false)
+    this.enqueue("onError", Object.freeze({ kind: "log", log }), false)
+    this.enqueue("onEvent", Object.freeze({ kind: "log", log }), false)
   }
 
   private streamOverflow(): void {
-    const log: FlumeLog = {
+    const log = snapshotValue<FlumeLog>({
       level: "warn",
       errorCode: "FLUME_BUFFER_OVERFLOW",
       source: "flume",
@@ -214,8 +247,8 @@ export class FlumeDelivery {
       message:
         "stream buffer overflowed, dropping items (notified once per stream; see FlumeStreamOptions.buffer)",
       timestamp: safeNow({ deps: this.deps }),
-    }
+    })
     this.remember(log)
-    this.enqueue("onEvent", { kind: "log", log })
+    this.enqueue("onEvent", Object.freeze({ kind: "log", log }))
   }
 }
