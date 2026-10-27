@@ -2,6 +2,7 @@ import type {
   FlumeConfluenceItem,
   FlumeConfluenceItemHandler,
   FlumeErrorHandler,
+  FlumeObservation,
   FlumeReconnectOptions,
   FlumeRuntimeDeps,
   FlumeStreamHandler,
@@ -121,6 +122,16 @@ export class FlumeConfluence {
 
   ids(): ReadonlyArray<string> {
     return [...this.groups.keys()].filter((id) => this.has(id))
+  }
+
+  /** 現在の接続世代を観測する。取得済みハンドルは replace / remove 後も利用できる。 */
+  observe(id: string): FlumeObservation | undefined {
+    const running = this.groups.get(id)?.running
+    if (!running) return undefined
+    return Object.freeze({
+      deliveryStatus: () => running.deliveryStatus(),
+      diagnostics: () => running.diagnostics(),
+    })
   }
 
   private async startGroup(

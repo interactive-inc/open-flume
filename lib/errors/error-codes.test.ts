@@ -21,7 +21,7 @@ function sources(directory: string): string[] {
 }
 
 describe("public diagnostic contract", () => {
-  it("registers every static library error action, so new paths cannot silently become generic errors", () => {
+  it("registers every library warning and error action, including dynamic actions", () => {
     const missing: string[] = []
     for (const path of sources("lib")) {
       const source = ts.createSourceFile(
@@ -34,7 +34,7 @@ describe("public diagnostic contract", () => {
         if (
           ts.isCallExpression(node) &&
           ts.isPropertyAccessExpression(node.expression) &&
-          node.expression.name.text === "error" &&
+          ["error", "warn"].includes(node.expression.name.text) &&
           node.expression.expression.getText(source).endsWith("log")
         ) {
           const input = node.arguments[0]
@@ -48,13 +48,13 @@ describe("public diagnostic contract", () => {
                 ts.isPropertyAssignment(property) && property.name.getText(source) === "errorCode",
             )
             if (
-              action &&
-              ts.isPropertyAssignment(action) &&
-              ts.isStringLiteral(action.initializer) &&
               !hasCode &&
-              !FLUME_ERROR_ACTIONS[action.initializer.text]
+              (!action ||
+                !ts.isPropertyAssignment(action) ||
+                !ts.isStringLiteral(action.initializer) ||
+                !FLUME_ERROR_ACTIONS[action.initializer.text])
             )
-              missing.push(`${path}: ${action.initializer.text}`)
+              missing.push(`${path}: ${action?.getText(source) ?? "missing action"}`)
           }
         }
         ts.forEachChild(node, visit)
@@ -62,6 +62,19 @@ describe("public diagnostic contract", () => {
       visit(source)
     }
     expect(missing).toEqual([])
+  })
+
+  it("does not classify successful operations as failures", () => {
+    const logs: FlumeLog[] = []
+    const log = new FlumeLogger({
+      source: "test",
+      handler: (entry) => logs.push(entry),
+      deps: { now: () => 0 },
+    })
+    log.debug({ action: "ws.send", message: "sent" })
+    log.warn({ action: "ws.send", message: "not open" })
+    expect(logs[0]?.errorCode).toBeUndefined()
+    expect(logs[1]?.errorCode).toBe("FLUME_CONNECTION_FAILED")
   })
 
   it("preserves service codes and the original cause independently of public errorCode", () => {

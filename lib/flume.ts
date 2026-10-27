@@ -1,4 +1,6 @@
 import type {
+  FlumeDeliveryStatus,
+  FlumeDiagnosticSnapshot,
   FlumeErrorHandler,
   FlumeReconnectConfig,
   FlumeReconnectOptions,
@@ -75,6 +77,15 @@ export class Flume {
       handler: (log) => this.delivery.publish({ kind: "log", log }),
       deps: this.deps,
     })
+  }
+
+  /** 起動失敗時や callback 停滞時も警告・エラーを取得できる。 */
+  diagnostics(): FlumeDiagnosticSnapshot {
+    return this.delivery.diagnostics()
+  }
+
+  deliveryStatus(): FlumeDeliveryStatus {
+    return this.delivery.status()
   }
 
   async open(): Promise<FlumeRunning | FlumeStartError> {

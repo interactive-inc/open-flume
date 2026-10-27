@@ -1,4 +1,5 @@
 import { resolveFlumeErrorCode } from "@/errors/resolve-error-code"
+import type { FlumeErrorContext } from "@/errors/error-context"
 import type { FlumeGitHubNotification, FlumeRuntimeDeps } from "@/types"
 import { FlumeHttpError } from "@/errors/http-error"
 import { FlumeParseError } from "@/errors/parse-error"
@@ -23,7 +24,7 @@ type Result = (
       checkpoint: FlumeGitHubCheckpoint
     }
   | { kind: "unchanged" }
-  | { kind: "rate-limit"; delayMs: number }
+  | { kind: "rate-limit"; delayMs: number; context: FlumeErrorContext }
 ) & { pollInterval: string | null }
 
 type Props = {
@@ -35,6 +36,7 @@ type Props = {
 
 const ENDPOINT = "https://api.github.com/notifications"
 const MAX_PAGES = 1000
+type Progress = { phase: string; page: number; httpStatus?: number; requestId?: string }
 
 /** 一回の取得を全ページで成功か失敗にする。既読・cursor・稼働状態は変更しない。 */
 export class FlumeGitHubNotificationReader {
@@ -48,7 +50,7 @@ export class FlumeGitHubNotificationReader {
       typeof requested === "number" && Number.isFinite(requested) && requested > 0
         ? Math.min(requested, 2_147_483_647)
         : 30_000
-    const progress = { phase: "request", page: 1 }
+    const progress: Progress = { phase: "request", page: 1 }
     const result = await withDeadline({
       context: () => ({ operation: "github.notifications", ...progress }),
       signal,
@@ -61,7 +63,7 @@ export class FlumeGitHubNotificationReader {
     return new FlumeHttpError({
       message: result.message,
       cause: result,
-      status: result instanceof FlumeHttpError ? result.status : 0,
+      status: result instanceof FlumeHttpError ? result.status : (progress.httpStatus ?? 0),
       code: result instanceof FlumeHttpError ? result.code : null,
       retryAfterMs: result instanceof FlumeHttpError ? result.retryAfterMs : null,
       errorCode: resolveFlumeErrorCode("http.error", result),
@@ -72,7 +74,7 @@ export class FlumeGitHubNotificationReader {
   private async readPages(
     checkpoint: FlumeGitHubCheckpoint,
     signal: AbortSignal,
-    progress: { phase: string; page: number },
+    progress: Progress,
   ): Promise<Result | Error> {
     const params = new URLSearchParams({ all: "false", per_page: "50" })
     if (checkpoint.since) params.set("since", checkpoint.since)
@@ -88,18 +90,35 @@ export class FlumeGitHubNotificationReader {
       visited.add(url)
       progress.phase = "request"
       progress.page = visited.size
+      delete progress.httpStatus
+      delete progress.requestId
       const response = await this.fetchPage(url, first === null ? checkpoint : null, signal)
       if (signal.aborted) return new Error("operation aborted")
       if (response instanceof Error) return response
+      progress.httpStatus = response.status
+      progress.requestId = response.headers.get("X-GitHub-Request-Id") ?? undefined
       if (first === null) first = response
       const pollInterval = first.headers.get("X-Poll-Interval")
       if (response.status === 304 && visited.size === 1) return { kind: "unchanged", pollInterval }
       progress.phase = "response status"
       const rateLimited = await this.isRateLimited(response)
+      if (rateLimited instanceof Error) return rateLimited
       if (rateLimited)
-        return { kind: "rate-limit", delayMs: this.retryDelay(response), pollInterval }
+        return {
+          kind: "rate-limit",
+          delayMs: this.retryDelay(response),
+          pollInterval,
+          context: { operation: "github.notifications", ...progress },
+        }
       if (!response.ok)
-        return new FlumeHttpError({ message: `HTTP ${response.status}`, status: response.status })
+        return new FlumeHttpError({
+          message: `HTTP ${response.status}`,
+          status: response.status,
+          errorCode:
+            response.status === 401 || response.status === 403
+              ? "FLUME_AUTH_FAILED"
+              : "FLUME_HTTP_FAILED",
+        })
 
       progress.phase = "response body"
       const page = await this.readBody(response)
@@ -181,7 +200,7 @@ export class FlumeGitHubNotificationReader {
     return null
   }
 
-  private async isRateLimited(response: Response): Promise<boolean> {
+  private async isRateLimited(response: Response): Promise<boolean | Error> {
     if (response.status === 429) return true
     if (response.status !== 403) return false
     if (
@@ -190,7 +209,7 @@ export class FlumeGitHubNotificationReader {
     )
       return true
     const text = await safeReadText({ response, context: "rate limit response" })
-    return typeof text === "string" && /secondary rate limit|abuse detection/i.test(text)
+    return text instanceof Error ? text : /secondary rate limit|abuse detection/i.test(text)
   }
 
   private retryDelay(response: Response): number {

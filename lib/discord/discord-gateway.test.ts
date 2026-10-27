@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest"
-import type { FlumeRuntimeDeps } from "@/types"
+import type { FlumeLog, FlumeRuntimeDeps } from "@/types"
 import { FlumeDiscordGateway } from "@/discord/discord-gateway"
 import { FlumeDiscordGatewaySession } from "@/discord/discord-gateway-session"
 import { FlumeConnectionError } from "@/errors/connection-error"
@@ -192,6 +192,53 @@ const createResumableSession = () =>
   })
 
 describe("FlumeDiscordGateway", () => {
+  it.each([
+    [1006, "FLUME_CONNECTION_FAILED"],
+    [4004, "FLUME_AUTH_FAILED"],
+    [4013, "FLUME_PROTOCOL_INVALID"],
+  ])("reports unexpected close %s after READY with its original cause", async (code, errorCode) => {
+    const logs: FlumeLog[] = []
+    const gateway = new FlumeDiscordGateway({
+      token: "test-token",
+      intents: 513,
+      deps: createMockDeps(),
+      onStatus: vi.fn(),
+      onDispatch: vi.fn(),
+      onLog: (log) => logs.push(log),
+    })
+    const opening = gateway.connect()
+    MockWebSocket.latest!.simulateMessage(HELLO_MSG)
+    MockWebSocket.latest!.simulateMessage(READY_MSG)
+    await opening
+    MockWebSocket.latest!.simulateClose(code as number, "test close")
+    const error = logs.find((log) => log.action === "ws.closed")
+    expect(error).toMatchObject({
+      level: "error",
+      errorCode,
+      detail: { code, phase: "connected", reason: "test close" },
+      error: { code, cause: { code, reason: "test close" } },
+    })
+    gateway.disconnect()
+    expect(logs.filter((log) => log.action === "ws.closed")).toHaveLength(1)
+  })
+
+  it("does not report intentional shutdown as an unexpected close", async () => {
+    const logs: FlumeLog[] = []
+    const gateway = new FlumeDiscordGateway({
+      token: "test-token",
+      intents: 513,
+      deps: createMockDeps(),
+      onStatus: vi.fn(),
+      onDispatch: vi.fn(),
+      onLog: (log) => logs.push(log),
+    })
+    const opening = gateway.connect()
+    MockWebSocket.latest!.simulateMessage(HELLO_MSG)
+    MockWebSocket.latest!.simulateMessage(READY_MSG)
+    await opening
+    gateway.disconnect()
+    expect(logs.filter((log) => log.action === "ws.closed")).toHaveLength(0)
+  })
   it("connect creates WebSocket with gateway URL", () => {
     const ctx = createGateway()
 

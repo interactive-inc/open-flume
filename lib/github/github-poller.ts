@@ -1,3 +1,4 @@
+import type { FlumeErrorContext } from "@/errors/error-context"
 import type {
   FlumeGitHubNotification,
   FlumeLogHandler,
@@ -176,7 +177,7 @@ export class FlumeGitHubPoller {
 
     this.followPollIntervalHeader(result.pollInterval)
     if (result.kind === "rate-limit") {
-      this.handleRateLimit(result.delayMs)
+      this.handleRateLimit(result.delayMs, result.context)
       return null
     }
     if (result.kind === "notifications") {
@@ -216,11 +217,11 @@ export class FlumeGitHubPoller {
     this.props.onConnected()
   }
 
-  private handleRateLimit(delayMs: number): void {
+  private handleRateLimit(delayMs: number, context: FlumeErrorContext): void {
     this.log.warn({
       action: "rate.limit",
       message: `rate limited, pausing for ${delayMs / 1000}s`,
-      detail: { delaySec: delayMs / 1000 },
+      detail: { ...context, delaySec: delayMs / 1000, retryAfterMs: delayMs },
     })
 
     this.clearTimer()

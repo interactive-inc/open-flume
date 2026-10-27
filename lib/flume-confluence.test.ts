@@ -45,6 +45,23 @@ const event = (type: string): FlumeEvent => ({
 })
 
 describe("FlumeConfluence", () => {
+  it("retains an observation handle across removal while callbacks are blocked", async () => {
+    const gate = Promise.withResolvers<void>()
+    const source = new MockSource()
+    const confluence = new FlumeConfluence({ callbackBuffer: 1, onEvent: () => gate.promise })
+    expect(await confluence.add("load", [source])).toBeNull()
+    const view = confluence.observe("load")!
+    for (let index = 0; index < 10; index++) source.pushEvent!(event("test"))
+    await confluence.remove("load")
+    expect(confluence.observe("load")).toBeUndefined()
+    expect(view.deliveryStatus().droppedEventCallbacks).toBe(10)
+    expect(view.diagnostics().entries).toContainEqual(
+      expect.objectContaining({ errorCode: "FLUME_BUFFER_OVERFLOW" }),
+    )
+    expect(Object.isFrozen(view)).toBe(true)
+    gate.resolve()
+    await waitFor(() => expect(view.deliveryStatus().pendingCallbacks).toBe(0))
+  })
   it("merges firehoses from every added group into one onEvent", async () => {
     const items: FlumeStreamItem[] = []
     const confluence = new FlumeConfluence({ onEvent: (item) => items.push(item) })

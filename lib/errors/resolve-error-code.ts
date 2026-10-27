@@ -23,7 +23,22 @@ export function resolveFlumeErrorCode(action: string, error?: Error): FlumeError
 }
 
 export const FLUME_ERROR_ACTIONS: Readonly<Record<string, FlumeErrorCode>> = Object.freeze({
+  "resume.url.invalid": "FLUME_PROTOCOL_INVALID",
+  "ws.close.synthesized": "FLUME_TIMEOUT",
+  "ws.close.fallback": "FLUME_TIMEOUT",
+  "ws.op.unknown": "FLUME_PROTOCOL_INVALID",
+  "heartbeat.zombie": "FLUME_TIMEOUT",
+  "session.invalid": "FLUME_CONNECTION_FAILED",
+  "meta.extract.error": "FLUME_PARSE_FAILED",
+  "flume.open.refused": "FLUME_START_FAILED",
+  "reconnect.config.invalid": "FLUME_RUNTIME_FAILED",
+  "slack.api.error": "FLUME_HTTP_FAILED",
+  "idle.timeout": "FLUME_TIMEOUT",
+  "envelope.parse.error": "FLUME_PARSE_FAILED",
+  "time.catchup.failed": "FLUME_CRON_INVALID",
+  "time.catchup.truncated": "FLUME_BUFFER_OVERFLOW",
   "ws.error": "FLUME_CONNECTION_FAILED",
+  "ws.closed": "FLUME_CONNECTION_FAILED",
   "ws.construct.error": "FLUME_CONNECTION_FAILED",
   "ws.listener.error": "FLUME_RUNTIME_FAILED",
   "handshake.timeout": "FLUME_TIMEOUT",

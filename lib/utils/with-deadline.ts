@@ -64,5 +64,7 @@ export async function withDeadline<T>(props: Props<T>): Promise<T | Error> {
   const detached = attempt(() => props.signal?.removeEventListener("abort", onAbort))
   if (detached instanceof Error)
     props.log.error({ action: "deadline.detach.error", message: detached.message, error: detached })
+  // run は本文読取まで所有する。status だけで完了した応答の残りの受信もここで止める。
+  controller.abort()
   return result
 }

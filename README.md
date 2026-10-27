@@ -476,7 +476,7 @@ With type-valid constructor input, the library guarantees that protocol IO and u
 
 ### 診断コードと調査情報
 
-`FLUME_ERROR_CODES` は公開コードと確認事項の一覧。コードの意味は変更・再利用しない。標準 error ログと公開エラーは `errorCode` を持つ。`action` は発生操作、`source` は接続元、`detail` はその時点の状況を示す。
+`FLUME_ERROR_CODES` は公開コードと確認事項の一覧。コードの意味は変更・再利用しない。標準 warn / error ログと公開エラーは `errorCode` を持つ。成功した debug / info ログには失敗コードを自動付与しない。`action` は発生操作、`source` は接続元、`detail` はその時点の状況を示す。
 
 ```ts
 import { FLUME_ERROR_CODES } from "@interactive-inc/flume"
@@ -499,16 +499,51 @@ const flume = new Flume({
 })
 ```
 
-- `FLUME_TIMEOUT` と `FLUME_ABORTED` は別の状態。GitHub の期限超過では operation・phase・page を記録する。`requestTimeoutMs` (既定 30 秒) は fetch、本文読取、全ページの取得を含む。
+- `FLUME_TIMEOUT` と `FLUME_ABORTED` は別の状態。GitHub の期限超過では operation・phase・page を記録する。応答を受け取れた場合は httpStatus と、サーバーが提供する requestId も保持する。`requestTimeoutMs` (既定 30 秒) は fetch、本文読取、全ページの取得を含む。
 - `FlumeHttpError.status` とサービス固有の `code`、`FlumeConnectionError.code` (WebSocket 切断コード) は `errorCode` と独立して保持する。元の例外は `cause` に保持し、複数 Source の起動失敗は `AggregateError.errors` まで辿れる。
 - `closed.errors()` には source・errorCode・元の error が残る。停止失敗をログの検索だけに依存させない。
-- `FLUME_BUFFER_OVERFLOW` は通知を破棄した診断。`running.deliveryStatus()` で callback の待機・失敗・破棄数と pull バッファの累積破棄数を確認できる。pull の値は購読バッファごとの合計であり、ユニークなイベント数ではない。
+- 予期しない WebSocket 切断は接続後も `ws.closed` として onError に通知する。切断コード・reason・接続段階・元の CloseEvent を保持する。明示的な close や接続更新の指示とは区別する。
+- `FLUME_BUFFER_OVERFLOW` は通知を破棄した診断。受信を継続し、`flume.deliveryStatus()` / `running.deliveryStatus()` で callback の待機・失敗・破棄数と pull バッファの累積破棄数を確認できる。pull の値は起動時バッファと各購読バッファでの破棄の合計であり、ユニークなイベント数ではない。
 - `close()` は Source の停止、`drain()` は受理した callback とその診断の配送完了を待つ。callback 内から `drain()` を待つと自身を待つため、callback の外で使う。完了しないユーザー callback は `drain()` も完了させないが、Source の停止は妨げない。
 - 相手側が理由を返さない切断では真因を断定しない。観測した切断コード、失敗した段階、直前の状態遷移から調査する。本文や token をログへ追加して原因推定しない。
 
 GitHub のページ送りは同一 API の通知エンドポイントだけを許可し、HTTP redirect は拒否する。全ページの JSON と schema が正常なときだけ既読・ETag・cursor を確定する。Slack の URL 取得にも handshakeTimeoutMs (既定 30 秒) を適用し、その後の WebSocket handshake には別に同じ期限を適用する。
 
 `FlumeConfluence.remove()` は接続途中のグループも中断し、停止まで待つ。同じグループの並行 replace は拒否する。Source の connect は中断時に解放されるが、カスタム Source は IO に `ctx.signal` を渡し、await 後に `this.isStopped` を確認して停止済みのリソースを作り直さないこと。
+
+### 過負荷時の観測
+
+`callbackBuffer` は実行中を含む callback の通常配送枠で、イベントと全レベルのログが共有する。満杯時は新着の配送を破棄し、受信と再接続を継続する。Slack の ACK はライブラリの受信に対する応答であり、利用側 callback の処理完了や永続化を保証しない。
+
+- `droppedEventCallbacks`: バッファ上限で破棄したイベントの onEvent 配送数。
+- `droppedLogCallbacks`: バッファ上限で破棄したログの onEvent / onError 配送数。同じログでも配送先が二つなら二件として数える。
+- `droppedCallbacks`: 上記二つの合計。
+- `droppedDiagnosticCallbacks`: ログ配送のうち診断専用枠でも受理できなかった数。専用枠も最大二件に制限する。
+- `callbackFailures`: 受理した callback の例外や callback 取得失敗の累積数。バッファ超過とは別に数える。
+
+`flume.diagnostics()` / `running.diagnostics()` は最新百件の warn / error を、callback や pull の混雑に依存せず返す。`total` は累積診断数、`evicted` は履歴上限で破棄した数。配列と各ログ・detail の直下は不変のスナップショットで、元の error / cause の参照を保持する。起動失敗後や close 後も取得できる。全履歴を保存する場合は、利用側のログ保存先へ継続的に転送する。
+
+```ts
+const state = running.deliveryStatus()
+console.log(state.droppedEventCallbacks, state.droppedLogCallbacks)
+const history = running.diagnostics()
+console.log(history.total, history.evicted, history.entries)
+
+// Confluence では稼働中のグループから観測専用ハンドルを取得する。
+const view = confluence.observe("group")
+await confluence.remove("group")
+console.log(view?.deliveryStatus(), view?.diagnostics())
+```
+
+Confluence の取得済み観測ハンドルは、その時点の接続世代を保持する。replace 後の新しい接続を観測する場合は再取得する。callback の停止待ちと同様、全記録の永久保存や相手サービス内部の真因特定をライブラリ単独で保証するものではない。
+
+### 障害と負荷の検証
+
+`bun run test` は単体試験に加え、ローカルの実 HTTP / WebSocket サーバーで再接続、Slack ACK、本文停止、handshake 停止、abort、タイマー解放を検査する。外部サービスや実トークンは使用しない。
+
+テストランナーとサーバーは Node.js で動かす。Bun の検証は別プロセスでライブラリを実行し、Bun 標準の fetch / WebSocket を Node.js の試験サーバーに接続する。ライブラリの受信側と試験サーバーの runtime 互換性を独立して検証するため、試験全体を `bun --bun` で起動しない。
+
+`bun run test:stress` は Discord と Slack をそれぞれ二百回接続し、各接続で五百件を受信する。十分な callbackBuffer を与えて順序・欠落・停止後の予約を検査する。小さなバッファでの破棄と回復は別の試験で件数まで検査する。実サービスでの長期運用や、runtime 内部の全リソースの証明に置き換わる試験ではない。
 
 ## Supported sources
 

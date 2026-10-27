@@ -1,6 +1,7 @@
 import type { FlumeLogHandler, FlumeRuntimeDeps } from "@/types"
 import { FlumeSlackConnectionResponseSchema } from "@/slack/slack-connection-response-schema"
 import { readSlackRetryAfterMs } from "@/slack/read-slack-retry-after-ms"
+import { slackErrorCode } from "@/slack/slack-error-code"
 import { FlumeConnectionError } from "@/errors/connection-error"
 import { FlumeHttpError } from "@/errors/http-error"
 import { FlumeParseError } from "@/errors/parse-error"
@@ -33,6 +34,7 @@ export async function obtainSlackUrl(
       method: "POST",
       headers: { Authorization: `Bearer ${props.appToken}` },
       signal: props.signal,
+      redirect: "error",
     }),
   )
 
@@ -41,6 +43,7 @@ export async function obtainSlackUrl(
     log.error({ action: "http.error", message: safeErrorMessage({ error }), error })
     return new FlumeConnectionError(`apps.connections.open transport: ${response.message}`, {
       cause: response,
+      context: { operation: "slack.apps.connections.open", phase: "HTTP request" },
     })
   }
 
@@ -51,6 +54,14 @@ export async function obtainSlackUrl(
   })
 
   const retryAfterMs = readSlackRetryAfterMs({ response })
+  const httpOk = response.status >= 200 && response.status < 300
+  const requestId = attempt(() => response.headers?.get("x-slack-req-id"))
+  const context = {
+    operation: "slack.apps.connections.open",
+    phase: "HTTP response body",
+    httpStatus: response.status,
+    ...(typeof requestId === "string" ? { requestId } : {}),
+  }
 
   if (response.status === 429) {
     log.warn({
@@ -59,6 +70,8 @@ export async function obtainSlackUrl(
       detail: { retryAfterMs },
     })
     return new FlumeHttpError({
+      context,
+      errorCode: "FLUME_RATE_LIMITED",
       message: "apps.connections.open: rate limited (429)",
       status: response.status,
       retryAfterMs,
@@ -68,7 +81,14 @@ export async function obtainSlackUrl(
   const text = await safeReadText({ response, context: "apps.connections.open" })
   if (text instanceof FlumeHttpError) {
     log.warn({ action: "http.body.read", message: safeErrorMessage({ error: text }), error: text })
-    return text
+    return new FlumeHttpError({
+      message: text.message,
+      status: response.status,
+      cause: text,
+      context,
+      retryAfterMs,
+      errorCode: slackErrorCode(response.status),
+    })
   }
 
   const json = safeJsonParse(text)
@@ -76,6 +96,8 @@ export async function obtainSlackUrl(
   if (json instanceof FlumeParseError) {
     log.warn({ action: "http.body.parse", message: json.message, error: json })
     return new FlumeHttpError({
+      context,
+      errorCode: httpOk ? "FLUME_PARSE_FAILED" : slackErrorCode(response.status),
       message: `apps.connections.open: invalid JSON body`,
       status: response.status,
       cause: json,
@@ -99,6 +121,8 @@ export async function obtainSlackUrl(
       detail: { issues: parsed.error.issues.map((i) => ({ path: i.path, message: i.message })) },
     })
     return new FlumeHttpError({
+      context,
+      errorCode: httpOk ? "FLUME_PARSE_FAILED" : slackErrorCode(response.status),
       message: "apps.connections.open: invalid response shape",
       status: response.status,
       cause: parsed.error,
@@ -106,14 +130,22 @@ export async function obtainSlackUrl(
     })
   }
 
-  if (!parsed.data.ok || !parsed.data.url) {
+  if (!httpOk || !parsed.data.ok || !parsed.data.url) {
+    const errorCode =
+      !parsed.data.url && parsed.data.ok && httpOk
+        ? "FLUME_PROTOCOL_INVALID"
+        : slackErrorCode(response.status, parsed.data.error)
+    const message = `apps.connections.open failed: HTTP ${response.status}, ${parsed.data.error ?? (httpOk ? "no url" : "unsuccessful HTTP status")}`
     log.warn({
       action: "slack.api.error",
-      message: `apps.connections.open failed: ${parsed.data.error ?? "no url"}`,
-      detail: { code: parsed.data.error ?? null },
+      errorCode,
+      message,
+      detail: { ...context, code: parsed.data.error ?? null },
     })
     return new FlumeHttpError({
-      message: `apps.connections.open failed: ${parsed.data.error ?? "no url"}`,
+      context,
+      errorCode,
+      message,
       status: response.status,
       code: parsed.data.error ?? null,
       retryAfterMs,

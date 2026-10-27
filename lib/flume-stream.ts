@@ -32,6 +32,18 @@ export class FlumeStream implements AsyncIterableIterator<FlumeStreamItem> {
 
   constructor(private readonly props: Props) {}
 
+  /** 最初の購読だけで使う。履歴を確定した後に観測者へ通知し、再入した新着との順序を守る。 */
+  seed(items: ReadonlyArray<FlumeStreamItem>): void {
+    if (this.closed) return
+    const dropped = Math.max(0, items.length - this.props.buffer)
+    const kept =
+      this.props.onOverflow === "drop-newest"
+        ? items.slice(0, this.props.buffer)
+        : items.slice(dropped)
+    this.items.push(...kept)
+    if (dropped > 0) this.recordDrop(dropped)
+  }
+
   push(item: FlumeStreamItem): void {
     if (this.closed) return
 
@@ -42,9 +54,12 @@ export class FlumeStream implements AsyncIterableIterator<FlumeStreamItem> {
     }
 
     if (this.items.length >= this.props.buffer) {
+      if (this.props.onOverflow !== "drop-newest") {
+        this.items.shift()
+        this.items.push(item)
+      }
       this.recordDrop()
-      if (this.props.onOverflow === "drop-newest") return
-      this.items.shift()
+      return
     }
     this.items.push(item)
   }
@@ -86,8 +101,8 @@ export class FlumeStream implements AsyncIterableIterator<FlumeStreamItem> {
     return this
   }
 
-  private recordDrop(): void {
-    this.droppedCount++
-    this.props.onDrop?.({ dropped: 1, first: this.droppedCount === 1 })
+  private recordDrop(dropped = 1): void {
+    this.droppedCount += dropped
+    this.props.onDrop?.({ dropped, first: this.droppedCount === dropped })
   }
 }

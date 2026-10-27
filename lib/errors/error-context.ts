@@ -3,4 +3,6 @@ export type FlumeErrorContext = Readonly<{
   operation: string
   phase: string
   page?: number
+  httpStatus?: number
+  requestId?: string
 }>

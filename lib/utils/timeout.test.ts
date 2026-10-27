@@ -25,6 +25,35 @@ function setup() {
 }
 
 describe("FlumeTimeout ownership", () => {
+  it("does not overwrite a newer schedule made by the clear-failure observer", () => {
+    const callbacks: Array<() => void> = []
+    const outer = vi.fn()
+    const replacement = vi.fn()
+    const timer = new FlumeTimeout({
+      action: "test.timer",
+      deps: {
+        setTimeout: (callback) => {
+          callbacks.push(callback)
+          return callbacks.length
+        },
+        clearTimeout: () => {
+          throw new Error("clear failed")
+        },
+      },
+      log: new FlumeLogger({
+        source: "test",
+        deps: { now: () => 0 },
+        handler: () => {
+          timer.schedule(replacement, 1)
+        },
+      }),
+    })
+    timer.schedule(vi.fn(), 1)
+    timer.schedule(outer, 1)
+    callbacks.forEach((callback) => callback())
+    expect(outer).not.toHaveBeenCalled()
+    expect(replacement).toHaveBeenCalledTimes(1)
+  })
   it("invalidates a cancelled callback before reporting a failed clear", () => {
     const test = setup()
     const fired = vi.fn()

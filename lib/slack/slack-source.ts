@@ -6,6 +6,7 @@ import { scheduleFlumeReconnect } from "@/schedule-reconnect"
 import { flumeExtractSlackMeta } from "@/slack/extract-slack-meta"
 import { FlumeSlackSeenCache } from "@/slack/slack-seen-cache"
 import { FlumeSlackSocketMode } from "@/slack/slack-socket-mode"
+import { slackErrorCode } from "@/slack/slack-error-code"
 import { FlumeSource } from "@/flume-source"
 import { attempt } from "@/utils/attempt"
 import { safeErrorMessage } from "@/utils/safe-error-message"
@@ -14,20 +15,6 @@ import { safeNow } from "@/utils/safe-now"
 
 const SEEN_CACHE_MAX = 1024
 const SEEN_CACHE_TTL_MS = 5 * 60 * 1000
-
-/**
- * `apps.connections.open` が返す恒久エラー。トークンが無効な状態で再接続しても
- * 回復しないため、reconnect を打ち切って呼び出し側へエラーを返す
- */
-const TERMINAL_SLACK_ERROR_CODES = new Set([
-  "invalid_auth",
-  "account_inactive",
-  "token_revoked",
-  "not_authed",
-  "not_allowed_token_type",
-  "token_expired",
-  "missing_scope",
-])
 
 export class FlumeSlackSource extends FlumeSource {
   readonly name = "slack" as const
@@ -174,8 +161,7 @@ export class FlumeSlackSource extends FlumeSource {
 
   private isTerminalSlackError(error: Error): boolean {
     if (!(error instanceof FlumeHttpError)) return false
-    if (error.code === null) return false
-    return TERMINAL_SLACK_ERROR_CODES.has(error.code)
+    return slackErrorCode(error.status, error.code) === "FLUME_AUTH_FAILED"
   }
 
   private minRetryDelayMs(error: Error): number | undefined {

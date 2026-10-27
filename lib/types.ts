@@ -101,8 +101,28 @@ export type FlumeDeliveryStatus = Readonly<{
   callbackBuffer: number
   pendingCallbacks: number
   droppedCallbacks: number
+  /** onEvent に渡せなかったイベント数 */
+  droppedEventCallbacks: number
+  /** onEvent / onError に渡せなかったログ配送数 */
+  droppedLogCallbacks: number
+  /** droppedCallbacks のうち、診断専用枠でも受理できなかった数 */
+  droppedDiagnosticCallbacks: number
   callbackFailures: number
   droppedStreamItems: number
+}>
+
+/** callback や pull の混雑と独立した警告・エラー履歴。古い履歴の破棄数も公開する。 */
+export type FlumeDiagnosticSnapshot = Readonly<{
+  capacity: number
+  total: number
+  evicted: number
+  entries: ReadonlyArray<Readonly<FlumeLog>>
+}>
+
+/** 接続の変更権限を渡さず、配送と診断だけを観測するハンドル。 */
+export type FlumeObservation = Readonly<{
+  deliveryStatus(): FlumeDeliveryStatus
+  diagnostics(): FlumeDiagnosticSnapshot
 }>
 
 export type FlumeStreamOptions = {

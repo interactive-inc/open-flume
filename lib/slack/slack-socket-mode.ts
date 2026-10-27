@@ -537,6 +537,25 @@ export class FlumeSlackSocketMode {
       return
     }
 
+    const error = new FlumeConnectionError(
+      `WebSocket closed ${this.hasConnected ? "after connection" : "before hello"} (code=${ev.code}, reason=${ev.reason || "none"})`,
+      {
+        code: ev.code,
+        cause: ev,
+        context: {
+          operation: "slack.socket-mode",
+          phase: this.hasConnected ? "connected" : "handshake",
+        },
+      },
+    )
+    if (this.ws !== null && !this.isStoppedFlag)
+      this.log.error({
+        action: "ws.closed",
+        message: error.message,
+        error,
+        detail: { code: ev.code, reason: ev.reason },
+      })
+    this.completeConnect(error)
     this.settleClose({ code: ev.code })
   }
 

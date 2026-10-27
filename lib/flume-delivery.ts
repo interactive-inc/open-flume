@@ -1,5 +1,6 @@
 import type {
   FlumeDeliveryStatus,
+  FlumeDiagnosticSnapshot,
   FlumeErrorHandler,
   FlumeLog,
   FlumeRuntimeDeps,
@@ -21,6 +22,9 @@ type Props = {
 
 type Callback = "onEvent" | "onError"
 
+const DIAGNOSTIC_CAPACITY = 100
+const DIAGNOSTIC_CALLBACK_CAPACITY = 2
+
 /** 配送・callback の例外隔離・終了を一箇所で所有する。Source の停止とは独立して drain する。 */
 export class FlumeDelivery {
   private readonly queue = new FlumeSerialQueue()
@@ -34,8 +38,14 @@ export class FlumeDelivery {
   private accepting = true
   private overflowed = false
   private droppedCallbacks = 0
+  private droppedEventCallbacks = 0
+  private droppedLogCallbacks = 0
   private callbackFailures = 0
   private droppedStreamItems = 0
+  private pendingDiagnostics = 0
+  private droppedDiagnosticCallbacks = 0
+  private diagnosticCount = 0
+  private readonly diagnosticEntries: Readonly<FlumeLog>[] = []
 
   constructor(
     private readonly props: Props,
@@ -50,6 +60,7 @@ export class FlumeDelivery {
 
   publish(item: FlumeStreamItem): void {
     if (!this.accepting) return
+    if (item.kind === "log") this.remember(item.log)
     this.hub.publish(item)
     this.enqueue("onEvent", item)
     if (item.kind === "log" && item.log.level === "error") this.enqueue("onError", item)
@@ -64,9 +75,33 @@ export class FlumeDelivery {
       callbackBuffer: this.capacity,
       pendingCallbacks: this.queue.size,
       droppedCallbacks: this.droppedCallbacks,
+      droppedEventCallbacks: this.droppedEventCallbacks,
+      droppedLogCallbacks: this.droppedLogCallbacks,
+      droppedDiagnosticCallbacks: this.droppedDiagnosticCallbacks,
       callbackFailures: this.callbackFailures,
       droppedStreamItems: this.droppedStreamItems,
     })
+  }
+
+  diagnostics(): FlumeDiagnosticSnapshot {
+    return Object.freeze({
+      capacity: DIAGNOSTIC_CAPACITY,
+      total: this.diagnosticCount,
+      evicted: this.diagnosticCount - this.diagnosticEntries.length,
+      entries: Object.freeze([...this.diagnosticEntries]),
+    })
+  }
+
+  private remember(log: FlumeLog): void {
+    if (log.level !== "warn" && log.level !== "error") return
+    this.diagnosticCount++
+    if (this.diagnosticEntries.length >= DIAGNOSTIC_CAPACITY) this.diagnosticEntries.shift()
+    this.diagnosticEntries.push(
+      Object.freeze({
+        ...log,
+        detail: log.detail ? Object.freeze({ ...log.detail }) : undefined,
+      }),
+    )
   }
 
   close(): void {
@@ -94,12 +129,23 @@ export class FlumeDelivery {
     }
     if (!invoke) return
     if (this.queue.size >= this.capacity && notifyPeer) {
-      this.callbackOverflow()
+      this.callbackOverflow(item)
       return
+    }
+
+    if (!notifyPeer) {
+      if (this.pendingDiagnostics >= DIAGNOSTIC_CALLBACK_CAPACITY) {
+        this.droppedCallbacks++
+        this.droppedLogCallbacks++
+        this.droppedDiagnosticCallbacks++
+        return
+      }
+      this.pendingDiagnostics++
     }
 
     void this.queue.add(async () => {
       const result = await attempt(async () => invoke())
+      if (!notifyPeer) this.pendingDiagnostics--
       if (result instanceof Error) this.reportFailure(callback, result, item, notifyPeer)
     })
   }
@@ -131,13 +177,16 @@ export class FlumeDelivery {
       detail: { callback, ...detail },
       timestamp: safeNow({ deps: this.deps }),
     }
+    this.remember(log)
     this.hub.publish({ kind: "log", log })
     if (notifyPeer)
       this.enqueue(callback === "onEvent" ? "onError" : "onEvent", { kind: "log", log }, false)
   }
 
-  private callbackOverflow(): void {
+  private callbackOverflow(item: FlumeStreamItem): void {
     this.droppedCallbacks++
+    if (item.kind === "event") this.droppedEventCallbacks++
+    else this.droppedLogCallbacks++
     if (this.overflowed) return
     this.overflowed = true
     const log: FlumeLog = {
@@ -149,6 +198,7 @@ export class FlumeDelivery {
       detail: { buffer: this.capacity },
       timestamp: safeNow({ deps: this.deps }),
     }
+    this.remember(log)
     this.hub.publish({ kind: "log", log })
     // 各診断 sink に一枠確保する。遅い callback でも無制限に積まない。
     this.enqueue("onError", { kind: "log", log }, false)
@@ -165,6 +215,7 @@ export class FlumeDelivery {
         "stream buffer overflowed, dropping items (notified once per stream; see FlumeStreamOptions.buffer)",
       timestamp: safeNow({ deps: this.deps }),
     }
+    this.remember(log)
     this.enqueue("onEvent", { kind: "log", log })
   }
 }

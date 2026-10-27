@@ -453,10 +453,16 @@ export class FlumeDiscordGateway {
     const d = isRecord(msg.d) ? msg.d : null
     const rawInterval = d === null ? null : d.heartbeat_interval
 
-    if (typeof rawInterval !== "number" || !Number.isFinite(rawInterval) || rawInterval <= 0) {
+    if (
+      typeof rawInterval !== "number" ||
+      !Number.isInteger(rawInterval) ||
+      rawInterval < 1 ||
+      rawInterval > 2_147_483_647
+    ) {
       // interval 0 のまま setInterval すると heartbeat flood になるためプロトコルエラー扱い
       const error = new FlumeConnectionError(
-        "malformed HELLO: heartbeat_interval is not a finite number > 0",
+        "malformed HELLO: heartbeat_interval must be an integer from 1 to 2147483647ms",
+        { errorCode: "FLUME_PROTOCOL_INVALID" },
       )
       this.log.error({
         action: "gateway.hello.invalid",
@@ -497,7 +503,7 @@ export class FlumeDiscordGateway {
     if (heartbeatError instanceof Error) {
       const error = new FlumeConnectionError(
         `heartbeat timer scheduling failed: ${safeErrorMessage({ error: heartbeatError })}`,
-        { cause: heartbeatError },
+        { cause: heartbeatError, errorCode: "FLUME_TIMER_FAILED" },
       )
       this.completeConnect(error)
       this.forceClose({ code: 4000, reason: "heartbeat timer failure" })
@@ -604,6 +610,30 @@ export class FlumeDiscordGateway {
     this.teardownDone = true
 
     const terminal = TERMINAL_CLOSE_CODES.has(ev.code)
+    const error = new FlumeConnectionError(
+      `WebSocket closed ${this.hasConnected ? "after connection" : "before ready"} (code=${ev.code}, reason=${ev.reason || "none"})`,
+      {
+        code: ev.code,
+        cause: ev,
+        errorCode:
+          ev.code === 4004 || ev.code === 4014
+            ? "FLUME_AUTH_FAILED"
+            : terminal
+              ? "FLUME_PROTOCOL_INVALID"
+              : "FLUME_CONNECTION_FAILED",
+        context: {
+          operation: "discord.gateway",
+          phase: this.hasConnected ? "connected" : "handshake",
+        },
+      },
+    )
+    if (this.ws !== null && !this.isStoppedFlag)
+      this.log.error({
+        action: "ws.closed",
+        message: error.message,
+        error,
+        detail: { code: ev.code, reason: ev.reason, terminal },
+      })
     this.log.info({
       action: "ws.close",
       message: `code=${ev.code} reason=${ev.reason || "none"}${terminal ? " (terminal)" : ""}`,
@@ -633,9 +663,6 @@ export class FlumeDiscordGateway {
     }
 
     if (!this.pendingResolved) {
-      const error = new FlumeConnectionError(`WebSocket closed before ready (code=${ev.code})`, {
-        code: ev.code,
-      })
       this.completeConnect(error)
     }
   }

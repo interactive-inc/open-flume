@@ -19,6 +19,39 @@ const createMockDeps = (body: unknown, status = 200, headers?: Record<string, st
 describe("obtainSlackUrl", () => {
   const appToken = "xapp-test-token"
 
+  it.each([401, 403, 500, 503])(
+    "rejects HTTP %s even if its JSON claims success",
+    async (status) => {
+      const result = await obtainSlackUrl({
+        appToken,
+        deps: createMockDeps({ ok: true, url: "wss://example.com" }, status),
+      })
+      expect(result).toBeInstanceOf(FlumeHttpError)
+      expect(result).toMatchObject({
+        status,
+        errorCode: status < 500 ? "FLUME_AUTH_FAILED" : "FLUME_HTTP_FAILED",
+      })
+    },
+  )
+
+  it.each([
+    [200, { ok: false, error: "invalid_auth" }, "FLUME_AUTH_FAILED"],
+    [200, { ok: false, error: "ratelimited" }, "FLUME_RATE_LIMITED"],
+    [429, {}, "FLUME_RATE_LIMITED"],
+    [200, "not-json", "FLUME_PARSE_FAILED"],
+    [200, { unexpected: true }, "FLUME_PARSE_FAILED"],
+    [503, "not-json", "FLUME_HTTP_FAILED"],
+  ])(
+    "classifies HTTP %s and its service response independently",
+    async (status, body, errorCode) => {
+      const result = await obtainSlackUrl({
+        appToken,
+        deps: createMockDeps(body, status as number),
+      })
+      expect(result).toMatchObject({ status, errorCode })
+    },
+  )
+
   it("returns url when response is ok with url", async () => {
     const deps = createMockDeps({ ok: true, url: "wss://example.com" })
 

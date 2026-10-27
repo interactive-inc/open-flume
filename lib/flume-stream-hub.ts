@@ -71,13 +71,12 @@ export class FlumeStreamHub {
       return stream
     }
 
+    this.streams.add(stream)
     if (!this.hasSubscribed) {
       this.hasSubscribed = true
-      for (const item of this.startupItems) stream.push(item)
-      this.startupItems.splice(0)
+      stream.seed(this.startupItems.splice(0))
     }
 
-    this.streams.add(stream)
     return stream
   }
 

@@ -3,6 +3,7 @@ import { waitFor } from "@/test-utils/wait-for"
 import { FlumeSlackSocketMode } from "@/slack/slack-socket-mode"
 import { FlumeConnectionError } from "@/errors/connection-error"
 import { FlumeHttpError } from "@/errors/http-error"
+import type { FlumeLog } from "@/types"
 
 type Listener = (ev: unknown) => void
 
@@ -105,6 +106,37 @@ const createDeps = (overrides?: {
 }
 
 describe("FlumeSlackSocketMode", () => {
+  it.each([false, true])(
+    "distinguishes planned shutdown from an unexpected close (planned=%s)",
+    async (planned) => {
+      const { deps, getSocket } = createDeps()
+      const logs: FlumeLog[] = []
+      const mode = new FlumeSlackSocketMode({
+        appToken: "test-token",
+        deps,
+        onMessage: vi.fn(),
+        onConnected: vi.fn(),
+        onDisconnected: vi.fn(),
+        onLog: (log) => logs.push(log),
+      })
+      const opening = mode.connect()
+      await waitFor(() => expect(getSocket()).not.toBeNull())
+      getSocket()!.simulateMessage('{"type":"hello"}')
+      await opening
+      if (planned) mode.disconnect()
+      else getSocket()!.simulateClose(1006, "test close")
+      const errors = logs.filter((log) => log.action === "ws.closed")
+      expect(errors).toHaveLength(planned ? 0 : 1)
+      if (!planned)
+        expect(errors[0]).toMatchObject({
+          level: "error",
+          errorCode: "FLUME_CONNECTION_FAILED",
+          detail: { code: 1006, phase: "connected" },
+          error: { cause: { code: 1006, reason: "test close" } },
+        })
+      mode.disconnect()
+    },
+  )
   it("connect() obtains URL and opens WebSocket", async () => {
     const mockFetch = createMockFetch()
     const { deps, getSocket } = createDeps({ fetch: mockFetch })

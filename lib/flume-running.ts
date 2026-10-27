@@ -1,5 +1,6 @@
 import type {
   FlumeDeliveryStatus,
+  FlumeDiagnosticSnapshot,
   FlumeSourceStatus,
   FlumeStreamItem,
   FlumeStreamOptions,
@@ -82,6 +83,10 @@ export class FlumeRunning {
   /** 待機・失敗・破棄を副作用なしの不変スナップショットで確認する。 */
   deliveryStatus(): FlumeDeliveryStatus {
     return this.props.delivery.status()
+  }
+
+  diagnostics(): FlumeDiagnosticSnapshot {
+    return this.props.delivery.diagnostics()
   }
 
   statuses(): ReadonlyArray<FlumeSourceStatus> {

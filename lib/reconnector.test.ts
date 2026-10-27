@@ -33,6 +33,54 @@ const delayOf = (schedule: FlumeReconnectSchedule): number => {
 }
 
 describe("FlumeReconnector", () => {
+  it("invalidates pending retries on reset, including callbacks retained by a broken runtime", () => {
+    let callback = () => {}
+    const reconnector = new FlumeReconnector({
+      maxAttempts: 5,
+      baseDelay: 100,
+      maxDelay: 1000,
+      log: createLog(),
+      deps: {
+        setTimeout: (fn) => {
+          callback = fn
+          return 1
+        },
+        clearTimeout: () => {
+          throw new Error("clear failed")
+        },
+        random: () => 0,
+      },
+    })
+    const retry = vi.fn()
+    reconnector.schedule(retry)
+    reconnector.reset()
+    callback()
+    callback()
+    expect(retry).not.toHaveBeenCalled()
+  })
+
+  it("runs a timer callback at most once", () => {
+    let callback = () => {}
+    const reconnector = new FlumeReconnector({
+      maxAttempts: 5,
+      baseDelay: 100,
+      maxDelay: 1000,
+      log: createLog(),
+      deps: {
+        setTimeout: (fn) => {
+          callback = fn
+          return 1
+        },
+        clearTimeout: () => {},
+        random: () => 0,
+      },
+    })
+    const retry = vi.fn()
+    reconnector.schedule(retry)
+    callback()
+    callback()
+    expect(retry).toHaveBeenCalledTimes(1)
+  })
   it("schedule calls setTimeout with jittered delay", () => {
     const { reconnector, deps } = createReconnector()
     const fn = vi.fn()

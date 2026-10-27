@@ -14,6 +14,7 @@ type Armed = Readonly<{ id: symbol; handle: FlumeTimerHandle }>
 /** タイマー一個の所有者。取消しを先に確定し、clearTimeout が失敗しても古い発火を無効にする。 */
 export class FlumeTimeout {
   private armed: Armed | null = null
+  private revision = 0
 
   constructor(private readonly props: Props) {}
 
@@ -22,7 +23,10 @@ export class FlumeTimeout {
   }
 
   schedule(callback: () => void, delayMs: number): Error | null {
-    this.cancel()
+    const revision = ++this.revision
+    this.clearTimer()
+    // clear の失敗通知中に stop / schedule が再入した場合、新しい操作を優先する。
+    if (revision !== this.revision) return null
     const id = Symbol()
     this.armed = Object.freeze({ id, handle: null })
     const delay = Math.min(Math.max(0, delayMs), 2_147_483_647)
@@ -44,6 +48,11 @@ export class FlumeTimeout {
   }
 
   cancel(): void {
+    this.revision++
+    this.clearTimer()
+  }
+
+  private clearTimer(): void {
     const armed = this.armed
     if (!armed) return
     this.armed = null

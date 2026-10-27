@@ -1,6 +1,6 @@
-import type { FlumeRuntimeDeps, FlumeTimerHandle } from "@/types"
+import type { FlumeRuntimeDeps } from "@/types"
 import { FlumeLogger } from "@/logger"
-import { attempt } from "@/utils/attempt"
+import { FlumeTimeout } from "@/utils/timeout"
 import { safeErrorMessage } from "@/utils/safe-error-message"
 import { safeInvokeCallback } from "@/utils/safe-invoke-callback"
 import { safeRandom } from "@/utils/safe-random"
@@ -35,19 +35,18 @@ export type FlumeReconnectSchedule =
 /**
  * 指数バックオフ + ジッタ付きの再接続スケジューラ。
  * setTimeout コールバック内のユーザー fn が throw / reject しても reconnect ループは止めない。
- * `generation` は clearTimeout が throw して古い timer が生き残った場合でも
- * stale な発火を無視するための世代トークン
+ * timer の取消し・古い発火の無効化は FlumeTimeout が所有する。
  */
 export class FlumeReconnector {
   private currentAttempt = 0
 
   private isAborted = false
 
-  private timer: FlumeTimerHandle | null = null
+  private readonly timer: FlumeTimeout
 
-  private generation = 0
-
-  constructor(private readonly props: Props) {}
+  constructor(private readonly props: Props) {
+    this.timer = new FlumeTimeout({ ...props, action: "reconnect.timer" })
+  }
 
   get attempt(): number {
     return this.currentAttempt
@@ -60,48 +59,39 @@ export class FlumeReconnector {
   schedule(fn: () => void, options?: ScheduleOptions): FlumeReconnectSchedule {
     if (this.isAborted) return { kind: "refused" }
     if (this.currentAttempt >= this.props.maxAttempts) {
-      this.generation++
-      this.clearTimer()
+      this.timer.cancel()
       return { kind: "exhausted" }
     }
 
-    this.clearTimer()
     const delay = this.computeDelay(options?.minDelayMs ?? 0)
-    const scheduledGeneration = ++this.generation
-
-    const timerResult = attempt(() =>
-      this.props.deps.setTimeout(() => this.runRetry(fn, scheduledGeneration), delay),
-    )
+    const previousAttempt = this.currentAttempt
+    this.currentAttempt++
+    const timerResult = this.timer.schedule(() => this.runRetry(fn), delay)
     if (timerResult instanceof Error) {
+      this.currentAttempt = previousAttempt
       this.props.log.error({
         action: "reconnect.timer.schedule.error",
         message: safeErrorMessage({ error: timerResult }),
         error: timerResult,
       })
-      this.timer = null
       return { kind: "refused" }
     }
 
-    this.currentAttempt++
-    this.timer = timerResult
     return { kind: "scheduled", delayMs: delay }
   }
 
   reset(): void {
     this.currentAttempt = 0
+    this.timer.cancel()
   }
 
   cancel(): void {
     this.isAborted = true
-    this.generation++
-    this.clearTimer()
+    this.timer.cancel()
   }
 
-  private runRetry(fn: () => void, scheduledGeneration: number): void {
+  private runRetry(fn: () => void): void {
     if (this.isAborted) return
-    if (scheduledGeneration !== this.generation) return
-
-    this.timer = null
     safeInvokeCallback({
       fn,
       onError: (error) => {
@@ -112,21 +102,6 @@ export class FlumeReconnector {
         })
       },
     })
-  }
-
-  private clearTimer(): void {
-    if (this.timer === null) return
-
-    const handle = this.timer
-    const result = attempt(() => this.props.deps.clearTimeout(handle))
-    if (result instanceof Error) {
-      this.props.log.error({
-        action: "reconnect.timer.clear.error",
-        message: safeErrorMessage({ error: result }),
-        error: result,
-      })
-    }
-    this.timer = null
   }
 
   private computeDelay(minDelayMs: number): number {

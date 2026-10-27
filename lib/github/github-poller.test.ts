@@ -68,6 +68,63 @@ function flushPromises() {
 }
 
 describe("FlumeGitHubPoller", () => {
+  it.each([200, 401, 403, 503])(
+    "retains HTTP %s and request identity when a response fails",
+    async (status) => {
+      const test = createTestDeps()
+      test.mockFetch.mockResolvedValueOnce(
+        new Response("invalid JSON", {
+          status,
+          headers: { "X-GitHub-Request-Id": "test-request" },
+        }),
+      )
+      const poller = new FlumeGitHubPoller({
+        token: "test-token",
+        interval: 60,
+        deps: test.deps,
+        onConnected: vi.fn(),
+        onDisconnected: vi.fn(),
+        onNotifications: vi.fn(),
+      })
+      const result = await poller.start()
+      expect(result).toMatchObject({
+        status,
+        context: { httpStatus: status, requestId: "test-request", page: 1 },
+        errorCode:
+          status === 200
+            ? "FLUME_PARSE_FAILED"
+            : status === 503
+              ? "FLUME_HTTP_FAILED"
+              : "FLUME_AUTH_FAILED",
+      })
+      poller.stop()
+    },
+  )
+
+  it("preserves the original body failure while classifying a 403", async () => {
+    const test = createTestDeps()
+    const cause = new Error("body interrupted")
+    test.mockFetch.mockResolvedValueOnce(
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.error(cause)
+          },
+        }),
+        { status: 403 },
+      ),
+    )
+    const poller = new FlumeGitHubPoller({
+      token: "test-token",
+      interval: 60,
+      deps: test.deps,
+      onConnected: vi.fn(),
+      onDisconnected: vi.fn(),
+      onNotifications: vi.fn(),
+    })
+    expect(await poller.start()).toMatchObject({ status: 403, cause: { cause } })
+    poller.stop()
+  })
   it("start() does initial poll and calls onConnected", async () => {
     const test = createTestDeps()
     const onConnected = vi.fn()

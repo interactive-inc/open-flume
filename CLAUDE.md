@@ -148,6 +148,8 @@ export class MySource extends FlumeSource {
 
 ## 診断の契約
 
-公開エラーと標準 error ログは `errorCode` を持つ。`lib/errors/error-codes.ts` を正本とし、コードの意味を変更・再利用しない。標準 error ログの action を追加したら `resolve-error-code.ts` に分類を追加する。登録漏れはテストで検出する。HTTP status、サービス固有の code、cause を捨ててメッセージだけに置き換えない。
+公開エラーと標準 warn / error ログは `errorCode` を持つ。`lib/errors/error-codes.ts` を正本とし、コードの意味を変更・再利用しない。action を追加したら `resolve-error-code.ts` に分類を追加する。動的 action は errorCode を明示する。登録漏れはテストで検出する。成功ログに失敗コードを付けない。HTTP status、requestId、サービス固有の code、cause を捨ててメッセージだけに置き換えない。
 
-callbackBuffer は既定 1000。満杯時は新着 callback を破棄し、`callback.overflow` を一度通知する。診断用の配送は別枠で受け付ける。`running.deliveryStatus()` は pending・failure・drop の累積値を不変スナップショットで返す。pull の drop は各バッファでの破棄の合計であり、ユニークなイベント数ではない。
+callbackBuffer は既定 1000。満杯時は新着 callback を破棄して受信を継続し、`callback.overflow` を一度通知する。診断用の配送は最大二件の別枠で受け付ける。`deliveryStatus()` は pending・failure・drop の累積値を不変スナップショットで返し、イベントとログの破棄数を分ける。pull の drop は各バッファでの破棄の合計であり、ユニークなイベント数ではない。`diagnostics()` は最新百件の警告・エラーと履歴上限による破棄数を callback の混雑と独立して返す。Confluence は `observe(id)` で接続世代ごとの観測ハンドルを取得できる。
+
+`bun run test:stress` は実 HTTP / WebSocket と実 timer で二百回の接続、各五百件の配送を検査する。注入 runtime の取消し失敗・遅延発火・callback 再入は単体試験で検査する。
