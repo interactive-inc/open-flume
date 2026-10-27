@@ -193,6 +193,8 @@ export type FlumeSourceLocalStatusHandler = (status: FlumeStatus, detail?: strin
 
 export type FlumeSourceStartContext = {
   onEvent: FlumeEventHandler
+  /** Source 単体へ非同期 callback を渡す場合の上限。既定 1000。Flume への同期転送は滞留しない。 */
+  eventBuffer?: number
   log: FlumeLogger
   deps: FlumeRuntimeDeps
   /** Source 内部の status 遷移ブリッジ。Flume 公開 API に status callback は無く、遷移は log に出る */
@@ -204,6 +206,13 @@ export type FlumeSourceStartContext = {
    */
   signal?: AbortSignal
 }
+
+export type FlumeSourceDeliveryStatus = Readonly<{
+  eventBuffer: number
+  pendingEvents: number
+  droppedEvents: number
+  callbackFailures: number
+}>
 
 // Source 構築 options — domain config のみ。
 // cross-cutting (onEvent firehose / onError / signal / deps / reconnect) は Flume 側で受け取る
@@ -270,20 +279,31 @@ export type FlumeTimeMessage = {
 
 /**
  * 起動 / 終了をまたいだ状態を 1 つ載せる純粋な DI ポート。flume 内部で fs / db / network を
- * 触らないように、I/O の場所と方式は host が決める。load の失敗は null 復帰扱い、save の
- * 失敗は best-effort (source 側で log するが throw しない)。Time source は save を直列実行し、
- * stop 時に queued save の完了を待つ。persister 内から Flume の終了を await しない。
- * stop は load の待機を解除するが、host 側で開始した read IO 自体は中断しない。
+ * 触らないように、I/O の場所と方式は host が決める。signal に従って IO を中断する。
+ * load 失敗時は catchup を省略する。save は直列化し、待機中は最新値に集約する。
+ * stop は各保存の期限まで待ち、最後の未解消エラーを返す。persister 内から終了を await しない。
+ * 期限切れ後は完了順の逆転を防ぐため追加保存を停止する (tick は継続)。
  */
 export type FlumeStatePersister<S> = {
-  load(): Promise<S | null>
-  save(state: S): Promise<void>
+  load(options?: { signal: AbortSignal }): Promise<S | null>
+  save(state: S, options?: { signal: AbortSignal }): Promise<void>
 }
 
 /** `FlumeTimeSource` の statePersister が保存する形 */
 export type FlumeTimeSourceState = {
   readonly lastFiredAt: number
 }
+
+/** checkpoint の保存状態。pendingWrites は未完了 IO と最新の待機値の合計 (最大二件)。 */
+export type FlumeTimeStateStatus = Readonly<{
+  phase: "idle" | "saving" | "halted"
+  pendingWrites: number
+  coalescedWrites: number
+  failedWrites: number
+  lastRequestedAt: number | null
+  lastSavedAt: number | null
+  error: Error | null
+}>
 
 /**
  * `FlumeTimeSource` の起動時 catch-up 方針。statePersister が読めた lastFiredAt から
@@ -306,6 +326,8 @@ export type FlumeTimeSourceOptions = {
    * (lastFiredAt が分からないので)。flume は fs / db を触らないので host が実装を渡す
    */
   statePersister?: FlumeStatePersister<FlumeTimeSourceState>
+  /** 各 load / save の期限。既定 30 秒、最大 2,147,483,647 ms。不正値は既定値へ戻す。 */
+  stateTimeoutMs?: number
   /** statePersister が読めた lastFiredAt を元に過去 tick を再発火する方針 (既定 "off") */
   catchupPolicy?: FlumeCatchupPolicy
 }

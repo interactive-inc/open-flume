@@ -118,7 +118,7 @@ export class MySource extends FlumeSource {
 }
 ```
 
-`this.emit({...})` は base の serial queue 経由で `ctx.onEvent` に流す (`attempt` で例外隔離済み)。`this.setStatus(...)` は冪等遷移を握り潰しつつ status を log に出す (`ctx.onStatus` は内部ブリッジで optional)。subclass は try/catch を書く必要がない。
+`this.emit({...})` は同期の受け手へその場で転送し、非同期 callback だけを有限の serial queue で処理する (`attempt` で例外隔離済み)。Source 単体の eventBuffer は既定 1000。満杯時は破棄数を公開して受信を継続する。Source.stop は通知完了を待たず、callback 外の drain で待つ。`this.setStatus(...)` は冪等遷移を握り潰しつつ status を log に出す (`ctx.onStatus` は内部ブリッジで optional)。subclass は try/catch を書く必要がない。
 
 主エントリ (`@interactive-inc/flume`) は `Flume` / `FlumeRunning` / `FlumeClosed` / `FlumeSource` / 型 / 共通ユーティリティのみ。Source 実装は `./discord` `./slack` `./github` `./time` の subpath エントリ (`lib/discord.ts` / `lib/slack.ts` / `lib/github.ts` / `lib/time.ts`) を介してのみロードされる。
 
@@ -153,3 +153,5 @@ export class MySource extends FlumeSource {
 callbackBuffer は既定 1000。満杯時は新着 callback を破棄して受信を継続し、`callback.overflow` を一度通知する。診断用の配送は最大二件の別枠で受け付ける。`deliveryStatus()` は pending・failure・drop の累積値を不変スナップショットで返し、イベントとログの破棄数を分ける。pull の drop は各バッファでの破棄の合計であり、ユニークなイベント数ではない。`diagnostics()` は最新百件の警告・エラーと履歴上限による破棄数を callback の混雑と独立して返す。Confluence は `observe(id)` で接続世代ごとの観測ハンドルを取得できる。
 
 `bun run test:stress` は実 HTTP / WebSocket と実 timer で二百回の接続、各五百件の配送を検査する。注入 runtime の取消し失敗・遅延発火・callback 再入は単体試験で検査する。
+
+Time の状態保存は実行中一件と最新の待機値一件に制限する。load / save は stateTimeoutMs (既定三十秒) で期限を設ける。保存が期限切れになったら追加保存を停止し、古い書込との順序逆転を避ける。tick は継続する。stateStatus で未保存時刻・集約数・失敗・原因を公開し、未解消の保存エラーは停止結果にも含める。

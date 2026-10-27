@@ -234,7 +234,11 @@ class MyWebhookSource extends FlumeSource {
 }
 ```
 
-`this.emit({...})` queues events through the base's serial queue and routes them to `ctx.onEvent` with `attempt()` isolation. `this.setStatus(...)` deduplicates idempotent transitions and logs the change. IO started after `connect()` returns, such as timer callbacks, must use `attempt()` or `safeInvokeCallback()` as shown above; both are exported from the root entry so custom sources do not need raw try/catch.
+`this.emit({...})` は同期の受け手へその場で転送し、非同期 callback は Source ごとに順序を保って処理する。Flume の有限配送バッファの手前に無制限なキューを作らない。Source を直接 `start(ctx)` する場合は `ctx.eventBuffer` (既定 1000、実行中を含む) が上限となり、満杯時は新着を破棄して受信を継続する。`source.deliveryStatus()` は `pendingEvents`・`droppedEvents`・`callbackFailures` を不変スナップショットで返す。
+
+`source.stop()` は接続の停止まで待ち、通知 callback の完了は待たない。callback 内から停止を await できる。受理済み通知とその失敗診断まで待つ場合は、callback の外で `await source.stop(); await source.drain()` とする。単体起動でも signal は停止まで購読され、起動失敗時は自動で後始末する。
+
+`this.setStatus(...)` は同じ状態と理由の連続通知を省略する。`connect()` の後に動く timer などの IO は `attempt()` または `safeInvokeCallback()` で囲む。どちらも root entry から import できる。
 
 ## Time source
 
@@ -266,7 +270,13 @@ new FlumeTimeSource({
 
 `tick.firedAt` is the scheduled wall-clock time (epoch ms), not the exact `setTimeout` firing instant. A throwing `message()` is isolated and falls back to the defaults. Parse the cron up front with `parseCron(expr)` (returns `FlumeCron | FlumeParseError`) or compute the next fire with `flumeCronNext(cron, afterMs)`.
 
-With `statePersister`, state writes are serialized in tick order and source shutdown waits for queued writes to settle. A failed write is logged and later writes still run. Keep the persister's IO bounded and avoid waiting for Flume lifecycle completion inside it. Stopping during `load()` releases startup immediately and ignores a late result; cancellation of the host's underlying read remains the persister's responsibility. Use `catchupPolicy` (`off`, `lastOnly`, or `missed`) to control replay on the next start. When multiple sources share a persistence key, the host must also serialize or atomically order their writes.
+`statePersister` は checkpoint を直列保存する。保存が遅い間は実行中の一件と最新の待機値一件だけを保持し、中間の保存要求は最新値へ集約する。tick の配送とは独立している。`stateTimeoutMs` は各 `load` / `save` の期限 (既定 30 秒)。persister の任意引数 `{ signal }` を IO に渡し、取消しに対応すること。
+
+通常の保存失敗は記録して次の保存を続ける。保存が期限切れになると `stateStatus().phase` が `halted` となり、tick は継続するが追加保存は停止する。取消し非対応の古い書き込みが後から完了して新しい checkpoint を上書きするのを防ぐため、同じ Source では自動再開しない。復旧時は保存先に残る処理の終了を確認すること。
+
+`source.stateStatus()` で `lastRequestedAt`・`lastSavedAt`・`pendingWrites` (最大二件)・`coalescedWrites`・`failedWrites`・`error` を確認できる。`pendingWrites` は終了後も未完了のホスト IO や未保存の待機値を含む。通常の保存失敗が解消されないまま停止した場合も `error` と二つの時刻から未保存状態を判別できる。停止は有限件数の保存を各期限まで待ち、最後の未解消エラーを `source.stop()` と `FlumeClosed.errors()` に返す。persister 内から Flume の終了を await しない。
+
+`load` の失敗・期限切れ・不正な保存値は診断を残して catchup を省略する。停止時は load の signal を中断し、遅延結果を無視する。`catchupPolicy` (`off` / `lastOnly` / `missed`) で次回起動時の再配送を選ぶ。同じ保存キーを複数の Source で共有する場合は、ホスト側でも書き込み順を直列化するか、版の比較を原子的に行う。
 
 ## Pull stream
 

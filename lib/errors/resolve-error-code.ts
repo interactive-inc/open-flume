@@ -12,6 +12,7 @@ export function resolveFlumeErrorCode(action: string, error?: Error): FlumeError
       "FLUME_START_FAILED",
       "FLUME_CONNECTION_FAILED",
       "FLUME_HTTP_FAILED",
+      "FLUME_STATE_FAILED",
       "FLUME_INTERNAL_ERROR",
     ].includes(category)
   )
@@ -94,6 +95,7 @@ export const FLUME_ERROR_ACTIONS: Readonly<Record<string, FlumeErrorCode>> = Obj
   "message.error": "FLUME_CALLBACK_FAILED",
   "stream.overflow": "FLUME_BUFFER_OVERFLOW",
   "callback.overflow": "FLUME_BUFFER_OVERFLOW",
+  "source.event.overflow": "FLUME_BUFFER_OVERFLOW",
   "deadline.detach.error": "FLUME_RUNTIME_FAILED",
   "deadline.clear.error": "FLUME_TIMER_FAILED",
   "handshake.timer.schedule.error": "FLUME_TIMER_FAILED",

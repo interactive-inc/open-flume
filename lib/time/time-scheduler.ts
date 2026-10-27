@@ -22,7 +22,7 @@ type Props = {
   cron: FlumeCron
   onTick: (firedAt: number) => void
   /** cron / timer エラーで恒久停止したとき (dead-but-green 防止)。stop() 起因では呼ばれない */
-  onHalt?: () => void
+  onHalt?: (error: Error) => void
   onLog?: FlumeLogHandler
   deps: Deps
 }
@@ -176,13 +176,18 @@ export class FlumeTimeScheduler {
   private halt(error: Error): void {
     this.isStoppedFlag = true
     this.clearTimer()
-    this.log.error({ action: "scheduler.halted", message: error.message, error })
+    this.log.error({
+      action: "scheduler.halted",
+      message: error.message,
+      error,
+      errorCode: error instanceof FlumeParseError ? "FLUME_CRON_INVALID" : "FLUME_TIMER_FAILED",
+    })
 
     const onHalt = this.props.onHalt
     if (!onHalt) return
 
     safeInvokeCallback({
-      fn: () => onHalt(),
+      fn: () => onHalt(error),
       onError: (haltError) => {
         this.log.error({
           action: "scheduler.halt.error",

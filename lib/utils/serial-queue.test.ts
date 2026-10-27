@@ -2,6 +2,42 @@ import { describe, it, expect } from "vitest"
 import { FlumeSerialQueue } from "@/utils/serial-queue"
 
 describe("FlumeSerialQueue", () => {
+  it("runs synchronous ingress without retaining a promise queue", async () => {
+    const queue = new FlumeSerialQueue({ immediate: true })
+    let calls = 0
+    for (let index = 0; index < 10000; index++)
+      queue.add(() => {
+        calls++
+      })
+    expect(calls).toBe(10000)
+    expect(queue.size).toBe(0)
+    await queue.drain()
+  })
+
+  it("preserves FIFO during synchronous reentry and an asynchronous pause", async () => {
+    const queue = new FlumeSerialQueue({ immediate: true })
+    const gate = Promise.withResolvers<void>()
+    const order: number[] = []
+    queue.add(() => {
+      order.push(0)
+      queue.add(async () => {
+        await gate.promise
+        order.push(1)
+      })
+      queue.add(() => {
+        order.push(2)
+      })
+    })
+    queue.add(() => {
+      order.push(3)
+    })
+    expect(order).toEqual([0])
+    expect(queue.size).toBe(3)
+    gate.resolve()
+    await Promise.all([queue.drain(), queue.drain()])
+    expect(order).toEqual([0, 1, 2, 3])
+    expect(queue.size).toBe(0)
+  })
   it("runs tasks in submission order serially", async () => {
     const queue = new FlumeSerialQueue()
     const order: number[] = []

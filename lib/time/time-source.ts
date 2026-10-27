@@ -1,9 +1,8 @@
 import type {
   FlumeCatchupPolicy,
   FlumeSourceStartContext,
-  FlumeStatePersister,
   FlumeTimeSourceOptions,
-  FlumeTimeSourceState,
+  FlumeTimeStateStatus,
   FlumeTimeTick,
 } from "@/types"
 import type { FlumeCron } from "@/time/parse-cron"
@@ -18,7 +17,7 @@ import { isRecord } from "@/utils/is-record"
 import { safeErrorMessage } from "@/utils/safe-error-message"
 import { safeNormalizeError } from "@/utils/safe-normalize-error"
 import { safeNow } from "@/utils/safe-now"
-import { FlumeSerialQueue } from "@/utils/serial-queue"
+import { FlumeTimeState } from "@/time/time-state"
 
 /**
  * cron スケジュールで tick を emit する Source。外部接続を持たないため
@@ -27,7 +26,7 @@ import { FlumeSerialQueue } from "@/utils/serial-queue"
  * options.statePersister + options.catchupPolicy を渡すと:
  *  1. 起動時に lastFiredAt を読み出す
  *  2. lastFiredAt から now までの過ぎ去った cron マッチを policy に従って再発火する
- *  3. 各 tick 後に lastFiredAt を順番に保存する (tick をブロックせず、停止時に完了を待つ)
+ *  3. 各 tick 後に lastFiredAt を直列保存する (混雑中は最新値に集約し、停止は期限内で待つ)
  *
  * 保存先や形式は flume の関知ではなく statePersister の実装が決める (純粋 DI)。
  *
@@ -40,9 +39,7 @@ export class FlumeTimeSource extends FlumeSource {
 
   private scheduler: FlumeTimeScheduler | null = null
 
-  private readonly loadCancelled = Promise.withResolvers<null>()
-
-  private readonly saveQueue = new FlumeSerialQueue()
+  private persistence: FlumeTimeState | null = null
 
   constructor(private readonly options: FlumeTimeSourceOptions) {
     super()
@@ -55,6 +52,7 @@ export class FlumeTimeSource extends FlumeSource {
     if (cron instanceof FlumeParseError) {
       const error = new FlumeStartError(
         `Time source: invalid cron "${this.options.cron}": ${cron.message}`,
+        { errorCode: "FLUME_CRON_INVALID", cause: cron },
       )
       ctx.log.error({ action: "source.start.failed", message: safeErrorMessage({ error }), error })
       this.setStatus("disconnected", error.message)
@@ -62,7 +60,15 @@ export class FlumeTimeSource extends FlumeSource {
     }
 
     const persister = this.options.statePersister ?? null
-    const lastFiredAt = persister === null ? null : await this.loadLastFiredAt(ctx, persister)
+    this.persistence =
+      persister === null
+        ? null
+        : new FlumeTimeState({
+            ctx,
+            persister,
+            timeoutMs: this.options.stateTimeoutMs,
+          })
+    const lastFiredAt = (await this.persistence?.load()) ?? null
 
     if (this.isStopped) return new FlumeStartError("Time source: stopped during state load")
 
@@ -70,8 +76,8 @@ export class FlumeTimeSource extends FlumeSource {
       cron,
       onLog: ctx.log.handler,
       deps: ctx.deps,
-      onTick: (firedAt) => this.handleTick(ctx, firedAt, persister),
-      onHalt: () => this.handleSchedulerHalt(ctx),
+      onTick: (firedAt) => this.handleTick(ctx, firedAt),
+      onHalt: (error) => this.handleSchedulerHalt(ctx, error),
     })
 
     // catchup (<= startedAt) とスケジューラ初回ターゲット (> startedAt) の境界を同一時刻に
@@ -80,7 +86,10 @@ export class FlumeTimeSource extends FlumeSource {
 
     const result = this.scheduler.start(startedAt)
     if (result instanceof Error) {
-      const error = new FlumeStartError(`Time source: ${safeErrorMessage({ error: result })}`)
+      const error = new FlumeStartError(`Time source: ${safeErrorMessage({ error: result })}`, {
+        errorCode: result instanceof FlumeParseError ? "FLUME_CRON_INVALID" : "FLUME_TIMER_FAILED",
+        cause: result,
+      })
       this.setStatus("disconnected", error.message)
       return error
     }
@@ -88,26 +97,27 @@ export class FlumeTimeSource extends FlumeSource {
     this.setStatus("connected")
 
     if (lastFiredAt !== null && persister !== null) {
-      this.runCatchup({ ctx, cron, lastFiredAt, persister, now: startedAt })
+      this.runCatchup({ ctx, cron, lastFiredAt, now: startedAt })
     }
 
     return null
   }
 
-  protected async disconnect(): Promise<void> {
-    this.loadCancelled.resolve(null)
+  protected async disconnect(): Promise<void | Error> {
     this.scheduler?.stop()
     this.scheduler = null
-    await this.saveQueue.drain()
+    const error = await this.persistence?.close()
+    if (error instanceof Error) return error
   }
 
-  private handleTick(
-    ctx: FlumeSourceStartContext,
-    firedAt: number,
-    persister: FlumeStatePersister<FlumeTimeSourceState> | null,
-  ): void {
+  /** 状態保存の混雑・失敗と最後に保存できた時刻。永続化未設定なら null。 */
+  stateStatus(): FlumeTimeStateStatus | null {
+    return this.persistence?.status() ?? null
+  }
+
+  private handleTick(ctx: FlumeSourceStartContext, firedAt: number): void {
     this.emitTick(ctx, firedAt)
-    if (persister !== null) this.saveLastFiredAt(ctx, persister, firedAt)
+    this.persistence?.save(firedAt)
   }
 
   private emitTick(ctx: FlumeSourceStartContext, firedAt: number): void {
@@ -127,7 +137,6 @@ export class FlumeTimeSource extends FlumeSource {
     ctx: FlumeSourceStartContext
     cron: FlumeCron
     lastFiredAt: number
-    persister: FlumeStatePersister<FlumeTimeSourceState>
     now: number
   }): void {
     const policy: FlumeCatchupPolicy = this.options.catchupPolicy ?? { mode: "off" }
@@ -171,50 +180,18 @@ export class FlumeTimeSource extends FlumeSource {
     }
 
     const last = matches[matches.length - 1]
-    if (last !== undefined) this.saveLastFiredAt(props.ctx, props.persister, last)
+    if (last !== undefined) this.persistence?.save(last)
   }
 
   /** スケジューラが cron エラーで恒久停止した (dead-but-green を防ぐため接続状態を落とす) */
-  private handleSchedulerHalt(ctx: FlumeSourceStartContext): void {
+  private handleSchedulerHalt(ctx: FlumeSourceStartContext, error: Error): void {
     ctx.log.error({
       action: "time.scheduler.halted",
-      message: "scheduler halted due to cron error; time source will not tick again",
+      message: `scheduler halted: ${safeErrorMessage({ error })}; time source will not tick again`,
+      error,
+      errorCode: error instanceof FlumeParseError ? "FLUME_CRON_INVALID" : "FLUME_TIMER_FAILED",
     })
-    this.setStatus("disconnected", "scheduler halted")
-  }
-
-  private async loadLastFiredAt(
-    ctx: FlumeSourceStartContext,
-    persister: FlumeStatePersister<FlumeTimeSourceState>,
-  ): Promise<number | null> {
-    const result = await Promise.race([attempt(() => persister.load()), this.loadCancelled.promise])
-    if (result instanceof Error) {
-      ctx.log.warn({
-        action: "time.state.load.error",
-        message: safeErrorMessage({ error: result }),
-        error: result,
-      })
-      return null
-    }
-    if (result === null) return null
-    if (typeof result.lastFiredAt !== "number" || !Number.isFinite(result.lastFiredAt)) return null
-    return result.lastFiredAt
-  }
-
-  private saveLastFiredAt(
-    ctx: FlumeSourceStartContext,
-    persister: FlumeStatePersister<FlumeTimeSourceState>,
-    lastFiredAt: number,
-  ): void {
-    void this.saveQueue.add(async () => {
-      const error = await attempt(() => persister.save({ lastFiredAt }))
-      if (!(error instanceof Error)) return
-      ctx.log.warn({
-        action: "time.state.save.error",
-        message: safeErrorMessage({ error }),
-        error,
-      })
-    })
+    this.setStatus("disconnected", `scheduler halted: ${safeErrorMessage({ error })}`)
   }
 
   private safeMessage(ctx: FlumeSourceStartContext, tick: FlumeTimeTick): Record<string, unknown> {
