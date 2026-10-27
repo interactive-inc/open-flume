@@ -108,6 +108,8 @@ export class FlumeSlackSource extends FlumeSource {
   }
 
   private async connectInternal(ctx: FlumeSourceStartContext): Promise<Error | null> {
+    if (this.isStopped) return new FlumeStartError("Source stopped before reconnect")
+    this.socket?.disconnect()
     this.setStatus("connecting")
 
     // close()/disconnect() は this.socket を null 化するため、await 以降と callback 内の
@@ -118,8 +120,11 @@ export class FlumeSlackSource extends FlumeSource {
       handshakeTimeoutMs: this.options.handshakeTimeoutMs,
       onLog: ctx.log.handler,
       deps: ctx.deps,
-      onMessage: (envelope) => this.handleMessage(ctx, envelope),
+      onMessage: (envelope) => {
+        if (socket === this.socket) this.handleMessage(ctx, envelope)
+      },
       onConnected: () => {
+        if (socket !== this.socket) return
         if (this.reconnector && this.reconnector.attempt > 0) {
           ctx.log.info({
             action: "reconnect.reset",
@@ -130,6 +135,7 @@ export class FlumeSlackSource extends FlumeSource {
         this.setStatus("connected")
       },
       onDisconnected: () => {
+        if (socket !== this.socket) return
         if (socket.isStopped) {
           this.setStatus("disconnected")
           return

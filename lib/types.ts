@@ -1,3 +1,4 @@
+import type { FlumeErrorCode } from "@/errors/error-codes"
 import type { z } from "zod/v4"
 import type { FlumeLogger } from "@/logger"
 import type { FlumeGatewayMessageSchema } from "@/discord/discord-gateway-message-schema"
@@ -95,6 +96,15 @@ export type FlumeConfluenceItemHandler = (item: FlumeConfluenceItem) => unknown 
 
 export type FlumeStreamOverflow = "drop-oldest" | "drop-newest"
 
+/** 累積破棄数は log を購読していなくても確認できる。stream 側は購読バッファごとの合計。 */
+export type FlumeDeliveryStatus = Readonly<{
+  callbackBuffer: number
+  pendingCallbacks: number
+  droppedCallbacks: number
+  callbackFailures: number
+  droppedStreamItems: number
+}>
+
 export type FlumeStreamOptions = {
   /** バッファ上限 (既定 1000)。consumer が遅れて溢れたら onOverflow に従う */
   buffer?: number
@@ -125,6 +135,7 @@ export type FlumeLog = {
   action: string
   message: string
   error?: Error
+  errorCode?: FlumeErrorCode
   detail?: Record<string, unknown>
   timestamp: number
 }
@@ -138,6 +149,7 @@ export type FlumeLogInput = {
   action: string
   message: string
   error?: Error
+  errorCode?: FlumeErrorCode
   detail?: Record<string, unknown>
 }
 
@@ -167,11 +179,8 @@ export type FlumeSourceStartContext = {
   onStatus?: FlumeSourceLocalStatusHandler
   reconnect: FlumeReconnectConfig | null
   /**
-   * Flume に渡された signal をそのまま転送する。
-   * connect 中の abort は `FlumeSource` 基底クラスが購読して `stop()` を発火する
-   * (進行中の接続を中断して `Flume.open()` を解放する)。connect 完了後の abort は
-   * FlumeRunning が runClose を駆動する。source 実装が自前で `fetch(url, { signal })`
-   * などへ伝播させたい場合にも使える。Flume.options.signal が未設定なら省略される。
+   * Flume が所有する接続用 signal。host の abort・起動失敗・close で中断する。
+   * custom source も IO へ渡し、await 後は isStopped を確認して新しいリソースを作らない。
    */
   signal?: AbortSignal
 }
@@ -218,6 +227,8 @@ export type FlumeSlackSourceOptions = {
 
 export type FlumeGitHubSourceOptions = {
   token: string
+  /** 全ページの fetch と body 読取を含む期限。既定 30 秒 */
+  requestTimeoutMs?: number
   pollInterval?: number
 }
 

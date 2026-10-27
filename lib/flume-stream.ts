@@ -4,8 +4,8 @@ type Props = {
   buffer: number
   onOverflow: FlumeStreamOverflow
   onClose: () => void
-  /** buffer 溢れで item を落とした時の通知 (この stream で最初の 1 回だけ発火する) */
-  onDrop?: (input: { dropped: number }) => void
+  /** 破棄ごとに通知する。first はこの stream の最初の破棄だけ true */
+  onDrop?: (input: { dropped: number; first: boolean }) => void
 }
 
 type Resolver = (result: IteratorResult<FlumeStreamItem>) => void
@@ -88,8 +88,6 @@ export class FlumeStream implements AsyncIterableIterator<FlumeStreamItem> {
 
   private recordDrop(): void {
     this.droppedCount++
-    if (this.droppedCount > 1) return
-
-    this.props.onDrop?.({ dropped: 1 })
+    this.props.onDrop?.({ dropped: 1, first: this.droppedCount === 1 })
   }
 }

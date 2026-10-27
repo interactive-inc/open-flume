@@ -38,6 +38,29 @@ class ManualSource extends FlumeSource {
 }
 
 describe("lifecycle regressions", () => {
+  it("delivers errors from the final status snapshot before sealing delivery", async () => {
+    const failure = new Error("status failed")
+    class BrokenStatusSource extends ManualSource {
+      override status(): never {
+        throw failure
+      }
+    }
+    const source = new BrokenStatusSource()
+    const running = await new Flume({ sources: [source] }).open()
+    expect(running).toBeInstanceOf(FlumeRunning)
+    if (running instanceof Error) return
+    const stream = running.stream()
+    await running.close()
+    const actions: string[] = []
+    for await (const item of stream) {
+      if (item.kind === "log" && item.log.error === failure) {
+        actions.push(item.log.action)
+        expect(item.log.errorCode).toBe("FLUME_RUNTIME_FAILED")
+      }
+    }
+    expect(actions).toEqual(["source.status.failed"])
+  })
+
   it("allows onEvent to await close, including after an asynchronous boundary", async () => {
     const source = new ManualSource()
     const owner = Promise.withResolvers<FlumeRunning>()
@@ -203,5 +226,144 @@ describe("lifecycle regressions", () => {
     expect(source.stopCount).toBe(0)
     await source.stop()
     if (host instanceof FlumeRunning) await host.close()
+  })
+})
+
+describe("resource ownership regressions", () => {
+  it("cancels a connect that ignores abort without waiting for its promise", async () => {
+    const entered = Promise.withResolvers<void>()
+    class HangingSource extends ManualSource {
+      protected override async connect(): Promise<Error | null> {
+        entered.resolve()
+        return new Promise(() => {})
+      }
+    }
+    const source = new HangingSource()
+    const controller = new AbortController()
+    const opening = new Flume({ sources: [source], signal: controller.signal }).open()
+    await entered.promise
+    controller.abort()
+    expect(await opening).toMatchObject({ errorCode: "FLUME_ABORTED" })
+    expect(source.stopCount).toBe(1)
+  })
+
+  it("cancels pending siblings as soon as one source fails", async () => {
+    const entered = Promise.withResolvers<void>()
+    class HangingSource extends ManualSource {
+      protected override async connect(): Promise<Error | null> {
+        entered.resolve()
+        return new Promise(() => {})
+      }
+    }
+    class FailingSource extends ManualSource {
+      protected override async connect(): Promise<Error | null> {
+        await entered.promise
+        return new Error("connection refused")
+      }
+    }
+    const pending = new HangingSource()
+    const failed = new FailingSource()
+    const result = await new Flume({ sources: [pending, failed] }).open()
+    expect(result).toBeInstanceOf(Error)
+    expect(pending.stopCount).toBe(1)
+    expect(failed.stopCount).toBe(1)
+    if (result instanceof Error) expect(result.cause).toBeInstanceOf(AggregateError)
+  })
+
+  it("shares stop completion when disconnect re-enters stop", async () => {
+    class ReentrantSource extends ManualSource {
+      nested: Promise<Error | null> | null = null
+      protected override disconnect(): void {
+        super.disconnect()
+        if (this.stopCount === 1) this.nested = this.stop()
+      }
+    }
+    const source = new ReentrantSource()
+    const running = await new Flume({ sources: [source] }).open()
+    if (running instanceof Error) throw running
+    await running.close()
+    expect(await source.nested).toBeNull()
+    expect(source.stopCount).toBe(1)
+  })
+
+  it("remove aborts a pending add and waits for cleanup", async () => {
+    const entered = Promise.withResolvers<void>()
+    class HangingSource extends ManualSource {
+      protected override async connect(): Promise<Error | null> {
+        entered.resolve()
+        return new Promise(() => {})
+      }
+    }
+    const source = new HangingSource()
+    const groups = new FlumeConfluence()
+    const adding = groups.add("pending", [source])
+    await entered.promise
+    await groups.remove("pending")
+    expect(source.stopCount).toBe(1)
+    expect(await adding).toBeInstanceOf(Error)
+    expect(groups.ids()).toEqual([])
+  })
+
+  it("closeAll includes an already running remove", async () => {
+    const gate = Promise.withResolvers<void>()
+    const entered = Promise.withResolvers<void>()
+    class SlowSource extends ManualSource {
+      protected override async disconnect(): Promise<void> {
+        entered.resolve()
+        await gate.promise
+        super.disconnect()
+      }
+    }
+    const source = new SlowSource()
+    const groups = new FlumeConfluence()
+    await groups.add("slow", [source])
+    const removing = groups.remove("slow")
+    await entered.promise
+    let closed = false
+    const closing = groups.closeAll().then(() => {
+      closed = true
+    })
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(closed).toBe(false)
+    gate.resolve()
+    await Promise.all([removing, closing])
+    expect(source.stopCount).toBe(1)
+  })
+
+  it("reports bounded callback overflow without recursive diagnostics", async () => {
+    const gate = Promise.withResolvers<void>()
+    const entered = Promise.withResolvers<void>()
+    const errors: string[] = []
+    const source = new ManualSource()
+    const running = await new Flume({
+      sources: [source],
+      callbackBuffer: 8,
+      onEvent: async (item) => {
+        if (item.kind === "event") {
+          entered.resolve()
+          await gate.promise
+        }
+      },
+      onError: (log) => {
+        if (log.errorCode) errors.push(log.errorCode)
+      },
+    }).open()
+    if (running instanceof Error) throw running
+    await running.drain()
+    const stream = running.stream({ buffer: 500 })
+    source.receive()
+    await entered.promise
+    for (let index = 0; index < 100; index++) source.receive()
+    await running.close()
+    gate.resolve()
+    await running.drain()
+    expect(running.deliveryStatus()).toMatchObject({ pendingCallbacks: 0, callbackFailures: 0 })
+    expect(running.deliveryStatus().droppedCallbacks).toBeGreaterThan(0)
+    expect(Object.isFrozen(running.deliveryStatus())).toBe(true)
+    expect(errors.filter((code) => code === "FLUME_BUFFER_OVERFLOW")).toHaveLength(1)
+    const actions: string[] = []
+    for await (const item of stream) if (item.kind === "log") actions.push(item.log.action)
+    expect(actions.filter((action) => action === "callback.overflow")).toHaveLength(1)
   })
 })

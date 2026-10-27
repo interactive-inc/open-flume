@@ -78,6 +78,8 @@ export class FlumeDiscordSource extends FlumeSource {
     ctx: FlumeSourceStartContext,
     session?: FlumeDiscordGatewaySession,
   ): Promise<Error | null> {
+    if (this.isStopped) return new FlumeStartError("Source stopped before reconnect")
+    this.gateway?.disconnect()
     this.setStatus("connecting")
 
     const gateway = new FlumeDiscordGateway({

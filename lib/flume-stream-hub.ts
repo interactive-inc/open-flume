@@ -5,7 +5,7 @@ const DEFAULT_BUFFER = 1000
 
 type Props = {
   /** buffer 溢れ通知。Flume が warn ログへ橋渡しする */
-  onDrop?: (input: { dropped: number }) => void
+  onDrop?: (input: { dropped: number; first: boolean }) => void
 }
 
 /**
@@ -45,10 +45,11 @@ export class FlumeStreamHub {
     if (!this.hasSubscribed) {
       if (this.startupItems.length >= DEFAULT_BUFFER) {
         this.startupItems.shift()
-        if (!this.startupDropNotified) {
-          this.startupDropNotified = true
-          this.props.onDrop?.({ dropped: 1 })
-        }
+        const first = !this.startupDropNotified
+        this.startupDropNotified = true
+        this.startupItems.push(item)
+        this.props.onDrop?.({ dropped: 1, first })
+        return
       }
       this.startupItems.push(item)
       return

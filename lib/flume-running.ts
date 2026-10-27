@@ -1,5 +1,10 @@
-import type { FlumeSourceStatus, FlumeStreamItem, FlumeStreamOptions } from "@/types"
-import type { FlumeStreamHub } from "@/flume-stream-hub"
+import type {
+  FlumeDeliveryStatus,
+  FlumeSourceStatus,
+  FlumeStreamItem,
+  FlumeStreamOptions,
+} from "@/types"
+import type { FlumeDelivery } from "@/flume-delivery"
 import type { FlumeSource } from "@/flume-source"
 import { FlumeLogger } from "@/logger"
 import { FlumeClosed, type FlumeCloseError } from "@/flume-closed"
@@ -7,15 +12,13 @@ import { attempt } from "@/utils/attempt"
 import { safeErrorMessage } from "@/utils/safe-error-message"
 import { safeInvokeCallback } from "@/utils/safe-invoke-callback"
 import { safeNormalizeError } from "@/utils/safe-normalize-error"
-import { FlumeSerialQueue } from "@/utils/serial-queue"
 
 type Props = {
   sources: ReadonlyArray<FlumeSource>
   signal?: AbortSignal
+  controller: AbortController
   log: FlumeLogger
-  hub: FlumeStreamHub
-  callbackQueue: FlumeSerialQueue
-  seal: () => void
+  delivery: FlumeDelivery
 }
 
 /**
@@ -63,7 +66,7 @@ export class FlumeRunning {
   close(): Promise<FlumeClosed> {
     if (this.closePromise) return this.closePromise
 
-    this.closePromise = this.runClose()
+    this.closePromise = Promise.resolve().then(() => this.runClose())
     return this.closePromise
   }
 
@@ -73,7 +76,12 @@ export class FlumeRunning {
    */
   async drain(): Promise<void> {
     if (this.closePromise) await this.closePromise
-    await this.props.callbackQueue.drain()
+    await this.props.delivery.drain()
+  }
+
+  /** 待機・失敗・破棄を副作用なしの不変スナップショットで確認する。 */
+  deliveryStatus(): FlumeDeliveryStatus {
+    return this.props.delivery.status()
   }
 
   statuses(): ReadonlyArray<FlumeSourceStatus> {
@@ -88,7 +96,7 @@ export class FlumeRunning {
    * consumer が遅れて buffer を超えたら `onOverflow` (既定 drop-oldest) に従う
    */
   stream(options?: FlumeStreamOptions): AsyncIterableIterator<FlumeStreamItem> {
-    return this.props.hub.subscribe(options)
+    return this.props.delivery.stream(options)
   }
 
   /**
@@ -114,19 +122,13 @@ export class FlumeRunning {
       })
     }
 
-    const sealed = attempt(() => this.props.seal())
-    if (sealed instanceof Error) {
-      this.props.log.error({
-        action: "flume.close.seal.failed",
-        message: safeErrorMessage({ error: sealed }),
-        error: sealed,
-      })
-    }
-    void this.props.callbackQueue.drain().then(() => this.props.hub.close())
-    return new FlumeClosed({ finalStatuses: this.snapshotStatuses(), closeErrors })
+    const finalStatuses = this.snapshotStatuses()
+    this.props.delivery.close()
+    return new FlumeClosed({ finalStatuses, closeErrors })
   }
 
   private async closeSources(closeErrors: FlumeCloseError[]): Promise<void> {
+    this.props.controller.abort()
     this.props.log.info({
       action: "flume.close",
       message: `closing ${this.props.sources.length} source(s)`,
@@ -148,7 +150,7 @@ export class FlumeRunning {
             : null
       if (error === null) continue
 
-      closeErrors.push({ source: name, error })
+      closeErrors.push({ source: name, errorCode: "FLUME_STOP_FAILED", error })
       this.props.log.error({
         action: "flume.close.failed",
         message: `${name}: ${safeErrorMessage({ error })}`,

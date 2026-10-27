@@ -456,7 +456,7 @@ new Flume({
 
 ## Safety
 
-- Ordering — each source has its own `FlumeSerialQueue` and per-source events are published FIFO. The public `onEvent` and `onError` callbacks share one global queue, so callback invocations never race across sources. `close()` stops the sources; a subsequent `drain()` waits for callbacks and their failure diagnostics. Pull subscribers receive items when they are published and have independent bounded buffers. The push callback queue is unbounded; use pull-only consumption for a bounded slow consumer.
+- Ordering — each source has its own `FlumeSerialQueue` and per-source events are published FIFO. The public `onEvent` and `onError` callbacks share one global queue, so callback invocations never race across sources. `close()` stops the sources; a subsequent `drain()` waits for callbacks and their failure diagnostics. Pull subscribers receive items when they are published and have independent bounded buffers. push の通常配送には `callbackBuffer` (既定 1000) の上限があり、満杯時は新着を破棄する。診断用の配送は別枠で受け付け、`callback.overflow` を通知する。
 - Duplicate suppression — Slack envelopes are deduped by `envelope_id` (`FlumeSlackSeenCache`) to absorb ack retries. GitHub notifications are deduped by `id + updated_at` (`FlumeGitHubSeenCache`). Discord uses session resume so the Gateway does not re-emit dispatches.
 - Partial-failure rollback — if any source fails during `Flume.open()`, sources acquired by that open are stopped, including partially connected failures. A source that refused reuse remains with its existing owner. A `FlumeStartError` is returned with per-source detail.
 - Idempotent close — `FlumeRunning.close()` is safe to call concurrently; the first call wins and subsequent callers receive the same `FlumeClosed` snapshot. The same guard exists at source level: a double-`close()` (e.g. via signal abort racing a manual close) does not re-invoke `disconnect()`.
@@ -473,6 +473,42 @@ Flume does not throw on protocol/network failures. Every entry point returns `T 
 Exceptions thrown or rejected from `onEvent` / `onError` are isolated and emitted as `onEvent.error` / `onError.error` diagnostics; they are never rethrown into the protocol loop.
 
 With type-valid constructor input, the library guarantees that protocol IO and user callback failures do not escape `open()`, `close()`, the `onEvent` invocation path, the `stream()` iterator, the abort-signal path, or the `onError` callback. These boundaries route work through internal `safe*` wrappers and the generic `attempt()` helper.
+
+### 診断コードと調査情報
+
+`FLUME_ERROR_CODES` は公開コードと確認事項の一覧。コードの意味は変更・再利用しない。標準 error ログと公開エラーは `errorCode` を持つ。`action` は発生操作、`source` は接続元、`detail` はその時点の状況を示す。
+
+```ts
+import { FLUME_ERROR_CODES } from "@interactive-inc/flume"
+
+const flume = new Flume({
+  sources,
+  callbackBuffer: 1000,
+  onError: (log) => {
+    console.error(
+      {
+        errorCode: log.errorCode,
+        guidance: log.errorCode ? FLUME_ERROR_CODES[log.errorCode] : undefined,
+        source: log.source,
+        action: log.action,
+        detail: log.detail,
+      },
+      log.error,
+    )
+  },
+})
+```
+
+- `FLUME_TIMEOUT` と `FLUME_ABORTED` は別の状態。GitHub の期限超過では operation・phase・page を記録する。`requestTimeoutMs` (既定 30 秒) は fetch、本文読取、全ページの取得を含む。
+- `FlumeHttpError.status` とサービス固有の `code`、`FlumeConnectionError.code` (WebSocket 切断コード) は `errorCode` と独立して保持する。元の例外は `cause` に保持し、複数 Source の起動失敗は `AggregateError.errors` まで辿れる。
+- `closed.errors()` には source・errorCode・元の error が残る。停止失敗をログの検索だけに依存させない。
+- `FLUME_BUFFER_OVERFLOW` は通知を破棄した診断。`running.deliveryStatus()` で callback の待機・失敗・破棄数と pull バッファの累積破棄数を確認できる。pull の値は購読バッファごとの合計であり、ユニークなイベント数ではない。
+- `close()` は Source の停止、`drain()` は受理した callback とその診断の配送完了を待つ。callback 内から `drain()` を待つと自身を待つため、callback の外で使う。完了しないユーザー callback は `drain()` も完了させないが、Source の停止は妨げない。
+- 相手側が理由を返さない切断では真因を断定しない。観測した切断コード、失敗した段階、直前の状態遷移から調査する。本文や token をログへ追加して原因推定しない。
+
+GitHub のページ送りは同一 API の通知エンドポイントだけを許可し、HTTP redirect は拒否する。全ページの JSON と schema が正常なときだけ既読・ETag・cursor を確定する。Slack の URL 取得にも handshakeTimeoutMs (既定 30 秒) を適用し、その後の WebSocket handshake には別に同じ期限を適用する。
+
+`FlumeConfluence.remove()` は接続途中のグループも中断し、停止まで待つ。同じグループの並行 replace は拒否する。Source の connect は中断時に解放されるが、カスタム Source は IO に `ctx.signal` を渡し、await 後に `this.isStopped` を確認して停止済みのリソースを作り直さないこと。
 
 ## Supported sources
 

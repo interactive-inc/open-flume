@@ -6,12 +6,21 @@
 export class FlumeSerialQueue {
   private chain: Promise<void> = Promise.resolve()
 
+  private depth = 0
+
+  get size(): number {
+    return this.depth
+  }
+
   add(task: () => Promise<void>): Promise<void> {
+    this.depth++
     const completion = this.chain.then(async () => {
       try {
         await task()
       } catch {
         // task 例外は queue を止めない (sources 側で log.error する)
+      } finally {
+        this.depth--
       }
     })
     this.chain = completion

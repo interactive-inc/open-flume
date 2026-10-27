@@ -1,13 +1,15 @@
+import type { FlumeErrorCode } from "@/errors/error-codes"
 import type { FlumeSourceStatus } from "@/types"
 
 export type FlumeCloseError = {
   source: string
+  errorCode: FlumeErrorCode
   error: Error
 }
 
 type Props = {
   finalStatuses: ReadonlyArray<FlumeSourceStatus>
-  closeErrors: ReadonlyArray<FlumeCloseError>
+  closeErrors: ReadonlyArray<{ source: string; error: Error; errorCode?: FlumeErrorCode }>
 }
 
 /**
@@ -27,7 +29,9 @@ export class FlumeClosed {
       props.finalStatuses.map((status) => Object.freeze({ ...status })),
     )
     this.closeErrors = Object.freeze(
-      props.closeErrors.map((closeError) => Object.freeze({ ...closeError })),
+      props.closeErrors.map((closeError): FlumeCloseError =>
+        Object.freeze({ ...closeError, errorCode: closeError.errorCode ?? "FLUME_STOP_FAILED" }),
+      ),
     )
     Object.freeze(this)
   }

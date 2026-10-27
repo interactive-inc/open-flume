@@ -62,10 +62,10 @@ class MockWebSocket {
     }
   }
 
-  simulateError(): void {
+  simulateError(error?: Error): void {
     const listeners = this.listeners["error"] ?? []
     for (const fn of listeners) {
-      fn({})
+      fn({ error, message: error?.message })
     }
   }
 }
@@ -756,5 +756,75 @@ describe("FlumeDiscordGateway listener registration failure", () => {
 
     expect(connectResult).toBeInstanceOf(FlumeConnectionError)
     expect(FailingListenerWebSocket.latest!.closeCalls.length).toBe(1)
+  })
+})
+
+describe("gateway resource regressions", () => {
+  it("retains the runtime cause and phase of a WebSocket error", async () => {
+    const { gateway } = createGateway()
+    const connecting = gateway.connect()
+    const cause = new Error("connection reset")
+    MockWebSocket.latest!.simulateError(cause)
+    expect(await connecting).toMatchObject({
+      cause,
+      message: "WebSocket connection error: connection reset",
+      errorCode: "FLUME_CONNECTION_FAILED",
+      context: { operation: "discord.gateway", phase: "handshake" },
+    })
+    gateway.disconnect()
+  })
+
+  it("does not restart heartbeat or dispatch from a closed socket", async () => {
+    const { gateway, deps, onDispatch, onStatus } = createGateway()
+    const connecting = gateway.connect()
+    const socket = MockWebSocket.latest!
+    socket.simulateMessage(HELLO_MSG)
+    socket.simulateMessage(READY_MSG)
+    await connecting
+    socket.simulateClose(1006, "")
+    const calls = vi.mocked(deps.setTimeout).mock.calls.length
+    const events = onDispatch.mock.calls.length
+    socket.simulateMessage(HELLO_MSG)
+    socket.simulateMessage(READY_MSG)
+    expect(vi.mocked(deps.setTimeout).mock.calls).toHaveLength(calls)
+    expect(onDispatch.mock.calls).toHaveLength(events)
+    expect(onStatus.mock.calls.map(([status]) => status)).toEqual(["connected", "disconnected"])
+    gateway.disconnect()
+  })
+
+  it("invalid-session timer cannot close or schedule after disconnect even if cancellation fails", async () => {
+    const { deps, timers } = createTimerDeps()
+    deps.clearTimeout = () => {
+      throw new Error("cancel failed")
+    }
+    const gateway = new FlumeDiscordGateway({
+      token: "test-token",
+      intents: 0,
+      deps,
+      onDispatch: vi.fn(),
+      onStatus: vi.fn(),
+    })
+    const connecting = gateway.connect()
+    const socket = MockWebSocket.latest!
+    socket.emitCloseEvents = false
+    socket.simulateMessage(HELLO_MSG)
+    socket.simulateMessage(READY_MSG)
+    await connecting
+    socket.simulateMessage(INVALID_SESSION_NULL_MSG)
+    gateway.disconnect()
+    const count = timers.length
+    for (const timer of timers.slice()) timer.fn()
+    expect(timers).toHaveLength(count)
+  })
+
+  it("closes a socket that emits error without a close event", async () => {
+    const { gateway } = createGateway()
+    const connecting = gateway.connect()
+    const socket = MockWebSocket.latest!
+    socket.emitCloseEvents = false
+    socket.simulateError()
+    expect(await connecting).toBeInstanceOf(Error)
+    expect(socket.readyState).toBe(MockWebSocket.CLOSED)
+    gateway.disconnect()
   })
 })

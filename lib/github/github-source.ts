@@ -28,6 +28,7 @@ export class FlumeGitHubSource extends FlumeSource {
 
     this.poller = new FlumeGitHubPoller({
       token: this.options.token,
+      requestTimeoutMs: this.options.requestTimeoutMs,
       interval: this.getPollIntervalSec(),
       onLog: ctx.log.handler,
       deps: ctx.deps,

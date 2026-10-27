@@ -14,22 +14,25 @@ type Props = {
  * 経由で例外を隔離する
  */
 export class FlumeStatusEmitter {
-  private currentStatus: FlumeStatus = "disconnected"
-
-  private currentDetail: string | null = null
+  private current: Readonly<{ status: FlumeStatus; detail: string | null }> = Object.freeze({
+    status: "disconnected",
+    detail: null,
+  })
 
   constructor(private readonly props: Props) {}
 
   get value(): FlumeStatus {
-    return this.currentStatus
+    return this.current.status
   }
 
   set(next: FlumeStatus, detail?: string): void {
     const normalizedDetail = detail ?? null
 
-    if (this.currentStatus === next && this.currentDetail === normalizedDetail) return
+    if (this.current.status === next && this.current.detail === normalizedDetail) return
 
-    const prev = this.currentStatus
+    const prev = this.current.status
+    const transition = Object.freeze({ status: next, detail: normalizedDetail })
+    this.current = transition
     const suffix = detail ? ` (${detail})` : ""
 
     this.props.log.info({
@@ -38,8 +41,7 @@ export class FlumeStatusEmitter {
       detail: { from: prev, to: next, reason: normalizedDetail },
     })
 
-    this.currentStatus = next
-    this.currentDetail = normalizedDetail
+    if (this.current !== transition) return
 
     const onStatus = this.props.onStatus
     if (!onStatus) return

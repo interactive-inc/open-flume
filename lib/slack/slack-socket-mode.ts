@@ -10,6 +10,9 @@ import { isRecord } from "@/utils/is-record"
 import { safeErrorMessage } from "@/utils/safe-error-message"
 import { safeJsonParse } from "@/utils/safe-json-parse"
 import { safeNow } from "@/utils/safe-now"
+import { FlumeTimeout } from "@/utils/timeout"
+import { withDeadline } from "@/utils/with-deadline"
+import { webSocketError } from "@/utils/web-socket-error"
 import { safeStringify } from "@/utils/safe-stringify"
 
 type Deps = Pick<
@@ -78,17 +81,27 @@ export class FlumeSlackSocketMode {
 
   private idleWatchdog: unknown = null
 
-  private handshakeTimer: unknown = null
+  private readonly handshakeTimer: FlumeTimeout
 
-  private closeFallbackTimer: unknown = null
+  private readonly closeFallbackTimer: FlumeTimeout
 
   private closeHandled = false
+
+  private consumed = false
+
+  private readonly controller = new AbortController()
 
   constructor(private readonly props: Props) {
     this.log = new FlumeLogger({
       source: "slack.socket-mode",
       handler: props.onLog,
       deps: props.deps,
+    })
+    this.handshakeTimer = new FlumeTimeout({ ...props, log: this.log, action: "handshake.timer" })
+    this.closeFallbackTimer = new FlumeTimeout({
+      ...props,
+      log: this.log,
+      action: "ws.close.fallback",
     })
   }
 
@@ -99,11 +112,19 @@ export class FlumeSlackSocketMode {
   async connect(options?: ConnectOptions): Promise<FlumeConnectionError | FlumeHttpError | null> {
     this.log.info({ action: "connect.start", message: "opening WebSocket connection" })
 
-    const url = await obtainSlackUrl({
-      appToken: this.props.appToken,
-      signal: options?.signal,
-      onLog: this.props.onLog,
+    if (this.consumed || this.isStoppedFlag)
+      return new FlumeConnectionError("socket mode is single-use")
+    this.consumed = true
+    const signal = options?.signal
+      ? AbortSignal.any([options.signal, this.controller.signal])
+      : this.controller.signal
+    const url = await withDeadline({
       deps: this.props.deps,
+      log: this.log,
+      signal,
+      timeoutMs: this.handshakeTimeoutMs(),
+      context: () => ({ operation: "slack.apps.connections.open", phase: "HTTP response" }),
+      run: (signal) => obtainSlackUrl({ ...this.props, signal }),
     })
 
     if (url instanceof FlumeHttpError) {
@@ -111,9 +132,11 @@ export class FlumeSlackSocketMode {
       return url
     }
 
-    if (url instanceof FlumeConnectionError) {
+    if (url instanceof Error) {
       this.log.error({ action: "url.error", message: url.message, error: url })
-      return url
+      return url instanceof FlumeConnectionError
+        ? url
+        : new FlumeConnectionError(url.message, { cause: url })
     }
 
     if (this.isStoppedFlag) {
@@ -129,6 +152,7 @@ export class FlumeSlackSocketMode {
   disconnect(): void {
     this.log.info({ action: "disconnect", message: "stopping socket mode" })
     this.isStoppedFlag = true
+    this.controller.abort()
 
     this.disarmIdleWatchdog()
     this.clearCloseFallback()
@@ -161,7 +185,7 @@ export class FlumeSlackSocketMode {
   }
 
   private disarmIdleWatchdog(): void {
-    if (!this.idleWatchdog) return
+    if (this.idleWatchdog === null) return
 
     const handle = this.idleWatchdog
     this.idleWatchdog = null
@@ -177,7 +201,7 @@ export class FlumeSlackSocketMode {
   }
 
   private checkIdle(idleLimit: number): void {
-    if (!this.hasConnected || this.isStoppedFlag) return
+    if (!this.hasConnected || this.isStoppedFlag || this.closeHandled) return
 
     const elapsed = safeNow({ deps: this.props.deps }) - this.lastFrameAt
     if (elapsed < idleLimit) return
@@ -235,7 +259,7 @@ export class FlumeSlackSocketMode {
       const listenerResult = attempt(() => {
         socket.addEventListener("message", (ev) => this.safeOnMessage(ev, socket))
         socket.addEventListener("close", (ev) => this.safeOnClose(ev))
-        socket.addEventListener("error", () => this.safeOnError())
+        socket.addEventListener("error", (ev) => this.safeOnError(ev))
       })
       if (listenerResult instanceof Error) {
         const error = new FlumeConnectionError(
@@ -262,16 +286,16 @@ export class FlumeSlackSocketMode {
     this.pendingResolve(error)
   }
 
-  private armHandshakeTimer(): void {
+  private handshakeTimeoutMs(): number {
     const configured = this.props.handshakeTimeoutMs
-    const timeoutMs =
-      typeof configured === "number" && Number.isFinite(configured) && configured > 0
-        ? configured
-        : HANDSHAKE_TIMEOUT_DEFAULT_MS
+    return typeof configured === "number" && Number.isFinite(configured) && configured > 0
+      ? Math.min(configured, 2_147_483_647)
+      : HANDSHAKE_TIMEOUT_DEFAULT_MS
+  }
 
-    const handle = attempt(() =>
-      this.props.deps.setTimeout(() => this.onHandshakeTimeout(timeoutMs), timeoutMs),
-    )
+  private armHandshakeTimer(): void {
+    const timeoutMs = this.handshakeTimeoutMs()
+    const handle = this.handshakeTimer.schedule(() => this.onHandshakeTimeout(timeoutMs), timeoutMs)
 
     if (handle instanceof Error) {
       const error = new FlumeConnectionError(
@@ -287,33 +311,18 @@ export class FlumeSlackSocketMode {
       this.forceClose()
       return
     }
-
-    this.handshakeTimer = handle
   }
 
   private clearHandshakeTimer(): void {
-    if (this.handshakeTimer === null) return
-
-    const handle = this.handshakeTimer
-    this.handshakeTimer = null
-
-    const result = attempt(() => this.props.deps.clearTimeout(handle))
-    if (result instanceof Error) {
-      this.log.error({
-        action: "handshake.timer.clear.error",
-        message: safeErrorMessage({ error: result }),
-        error: result,
-      })
-    }
+    this.handshakeTimer.cancel()
   }
 
   private onHandshakeTimeout(timeoutMs: number): void {
-    this.handshakeTimer = null
-
     if (this.pendingResolved || this.isStoppedFlag) return
 
     const error = new FlumeConnectionError(
       `handshake timeout: no hello within ${timeoutMs}ms — force-closing socket`,
+      { errorCode: "FLUME_TIMEOUT" },
     )
 
     this.log.error({
@@ -334,16 +343,16 @@ export class FlumeSlackSocketMode {
     const socket = this.ws
     if (socket === null) return
 
+    this.ws = null
+    this.disarmIdleWatchdog()
     this.armCloseFallback()
     this.closeSocket(socket)
   }
 
   private armCloseFallback(): void {
-    if (this.closeFallbackTimer !== null) return
+    if (this.closeFallbackTimer.isArmed) return
 
-    const handle = attempt(() =>
-      this.props.deps.setTimeout(() => this.onCloseFallback(), CLOSE_FALLBACK_MS),
-    )
+    const handle = this.closeFallbackTimer.schedule(() => this.onCloseFallback(), CLOSE_FALLBACK_MS)
 
     if (handle instanceof Error) {
       this.log.error({
@@ -354,29 +363,13 @@ export class FlumeSlackSocketMode {
       this.onCloseFallback()
       return
     }
-
-    this.closeFallbackTimer = handle
   }
 
   private clearCloseFallback(): void {
-    if (this.closeFallbackTimer === null) return
-
-    const handle = this.closeFallbackTimer
-    this.closeFallbackTimer = null
-
-    const result = attempt(() => this.props.deps.clearTimeout(handle))
-    if (result instanceof Error) {
-      this.log.error({
-        action: "ws.close.fallback.clear.error",
-        message: safeErrorMessage({ error: result }),
-        error: result,
-      })
-    }
+    this.closeFallbackTimer.cancel()
   }
 
   private onCloseFallback(): void {
-    this.closeFallbackTimer = null
-
     if (this.closeHandled || this.isStoppedFlag) return
 
     this.log.warn({
@@ -435,8 +428,8 @@ export class FlumeSlackSocketMode {
     }
   }
 
-  private safeOnError(): void {
-    const r = attempt(() => this.onError())
+  private safeOnError(ev: Event): void {
+    const r = attempt(() => this.onError(ev))
     if (r instanceof Error) {
       this.log.error({
         action: "ws.error.threw",
@@ -447,6 +440,7 @@ export class FlumeSlackSocketMode {
   }
 
   private onMessage(raw: string, socket: WebSocket): void {
+    if (this.isStoppedFlag || this.closeHandled || socket !== this.ws) return
     // Touch the idle watermark on ANY inbound frame — parse に失敗するフレームでも
     // 届いている時点で pipe は生きているため、parse guard より前で更新する
     this.lastFrameAt = safeNow({ deps: this.props.deps })
@@ -546,10 +540,18 @@ export class FlumeSlackSocketMode {
     this.settleClose({ code: ev.code })
   }
 
-  private onError(): void {
-    const error = new FlumeConnectionError("WebSocket connection error")
+  private onError(ev: Event): void {
+    if (this.isStoppedFlag || this.closeHandled) return
+    const error = webSocketError({
+      event: ev,
+      context: {
+        operation: "slack.socket-mode",
+        phase: this.hasConnected ? "connected" : "handshake",
+      },
+    })
     this.log.error({ action: "ws.error", message: safeErrorMessage({ error }), error })
     this.completeConnect(error)
+    this.forceClose()
   }
 
   private closeSocket(ws: WebSocket | null): void {

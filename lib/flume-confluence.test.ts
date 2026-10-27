@@ -238,11 +238,13 @@ describe("FlumeConfluence", () => {
     await confluence.closeAll()
 
     expect(source.stopCount).toBe(1)
-    expect(errors).toContainEqual(
-      expect.objectContaining({
-        action: "onEvent.error",
-        detail: expect.objectContaining({ groupId: "async", itemType: "reject" }),
-      }),
+    await waitFor(() =>
+      expect(errors).toContainEqual(
+        expect.objectContaining({
+          action: "onEvent.error",
+          detail: expect.objectContaining({ groupId: "async", itemType: "reject" }),
+        }),
+      ),
     )
   })
 
@@ -292,9 +294,46 @@ describe("FlumeConfluence", () => {
 
     const result = await confluence.replace("replace", [next])
 
-    expect(result).toBeInstanceOf(Error)
+    expect(result).toMatchObject({
+      errorCode: "FLUME_TIMER_FAILED",
+      cause: new Error("timer failed"),
+    })
     expect(previous.stopCount).toBe(0)
     expect(confluence.has("replace")).toBe(true)
+    await confluence.closeAll()
+  })
+
+  it.each(["remove", "timeout"])("distinguishes replacement cancellation by %s", async (reason) => {
+    const entered = Promise.withResolvers<void>()
+    const timer = { callback: (): void => {} }
+    class PendingSource extends MockSource {
+      protected override async connect(): Promise<Error | null> {
+        entered.resolve()
+        return new Promise(() => {})
+      }
+    }
+    const confluence = new FlumeConfluence({
+      deps: {
+        ...createFlumeDefaultDeps(),
+        setTimeout: (callback) => {
+          timer.callback = callback
+          return 1
+        },
+        clearTimeout: () => {},
+      },
+    })
+    const previous = new MockSource()
+    const next = new PendingSource()
+    await confluence.add("replace", [previous])
+    const replacing = confluence.replace("replace", [next])
+    await entered.promise
+    if (reason === "remove") await confluence.remove("replace")
+    else timer.callback()
+    expect(await replacing).toMatchObject({
+      errorCode: reason === "remove" ? "FLUME_ABORTED" : "FLUME_TIMEOUT",
+    })
+    expect(next.stopCount).toBe(1)
+    expect(previous.stopCount).toBe(reason === "remove" ? 1 : 0)
     await confluence.closeAll()
   })
 

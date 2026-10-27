@@ -1,0 +1,100 @@
+import { attempt } from "@/utils/attempt"
+import { FLUME_ERROR_CODES, type FlumeErrorCode } from "@/errors/error-codes"
+
+/** メッセージの文字列解析をせず、型付き例外または発生操作から公開コードを解決する。 */
+export function resolveFlumeErrorCode(action: string, error?: Error): FlumeErrorCode {
+  const category = Object.hasOwn(FLUME_ERROR_ACTIONS, action)
+    ? FLUME_ERROR_ACTIONS[action]
+    : undefined
+  if (
+    category &&
+    ![
+      "FLUME_START_FAILED",
+      "FLUME_CONNECTION_FAILED",
+      "FLUME_HTTP_FAILED",
+      "FLUME_INTERNAL_ERROR",
+    ].includes(category)
+  )
+    return category
+  const errorCode = attempt(() => (error && "errorCode" in error ? error.errorCode : undefined))
+  if (typeof errorCode === "string" && Object.hasOwn(FLUME_ERROR_CODES, errorCode))
+    return errorCode as FlumeErrorCode
+  return category ?? "FLUME_EXTERNAL_ERROR"
+}
+
+export const FLUME_ERROR_ACTIONS: Readonly<Record<string, FlumeErrorCode>> = Object.freeze({
+  "ws.error": "FLUME_CONNECTION_FAILED",
+  "ws.construct.error": "FLUME_CONNECTION_FAILED",
+  "ws.listener.error": "FLUME_RUNTIME_FAILED",
+  "handshake.timeout": "FLUME_TIMEOUT",
+  "ws.message.threw": "FLUME_INTERNAL_ERROR",
+  "ws.close.threw": "FLUME_INTERNAL_ERROR",
+  "ws.error.threw": "FLUME_INTERNAL_ERROR",
+  "ws.parse.error": "FLUME_PARSE_FAILED",
+  "gateway.hello.invalid": "FLUME_PROTOCOL_INVALID",
+  "ws.close.error": "FLUME_STOP_FAILED",
+  "ws.send": "FLUME_CONNECTION_FAILED",
+  "ws.send.serialize.error": "FLUME_PARSE_FAILED",
+  "heartbeat.fire.error": "FLUME_CALLBACK_FAILED",
+  "heartbeat.zombie.error": "FLUME_CALLBACK_FAILED",
+  "deps.web-socket.read.error": "FLUME_RUNTIME_FAILED",
+  "connect.failed": "FLUME_CONNECTION_FAILED",
+  "reconnect.unhandled": "FLUME_INTERNAL_ERROR",
+  "flume.abort.close.failed": "FLUME_STOP_FAILED",
+  "signal.addListener.failed": "FLUME_RUNTIME_FAILED",
+  "signal.removeListener.failed": "FLUME_RUNTIME_FAILED",
+  "flume.close.unhandled": "FLUME_STOP_FAILED",
+  "flume.close.failed": "FLUME_STOP_FAILED",
+  "source.status.failed": "FLUME_RUNTIME_FAILED",
+  "onEvent.error": "FLUME_CALLBACK_FAILED",
+  "onError.error": "FLUME_CALLBACK_FAILED",
+  "onStatus.error": "FLUME_CALLBACK_FAILED",
+  "flume.source.failed": "FLUME_START_FAILED",
+  "flume.open.failed": "FLUME_START_FAILED",
+  "flume.open.aborted": "FLUME_ABORTED",
+  "flume.rollback.failed": "FLUME_STOP_FAILED",
+  "github.abort-controller.new.error": "FLUME_RUNTIME_FAILED",
+  "slack.abort-controller.new.error": "FLUME_RUNTIME_FAILED",
+  "poll.unhandled": "FLUME_INTERNAL_ERROR",
+  "http.error": "FLUME_HTTP_FAILED",
+  "http.body.read": "FLUME_HTTP_FAILED",
+  "http.body.parse": "FLUME_PARSE_FAILED",
+  "http.body.schema": "FLUME_PARSE_FAILED",
+  "http.rate-limited": "FLUME_RATE_LIMITED",
+  "rate.limit": "FLUME_RATE_LIMITED",
+  "source.start.failed": "FLUME_START_FAILED",
+  "reconnect.timer.error": "FLUME_CALLBACK_FAILED",
+  "reconnect.exhausted": "FLUME_RECONNECT_EXHAUSTED",
+  "reconnect.refused": "FLUME_TIMER_FAILED",
+  "reconnect.terminal": "FLUME_AUTH_FAILED",
+  "url.error": "FLUME_CONNECTION_FAILED",
+  "cron.no-next": "FLUME_CRON_INVALID",
+  "scheduler.arm.error": "FLUME_TIMER_FAILED",
+  "scheduler.tick.error": "FLUME_CALLBACK_FAILED",
+  "scheduler.halted": "FLUME_CRON_INVALID",
+  "scheduler.halt.error": "FLUME_CALLBACK_FAILED",
+  "time.scheduler.halted": "FLUME_CRON_INVALID",
+  "time.state.load.error": "FLUME_STATE_FAILED",
+  "time.state.save.error": "FLUME_STATE_FAILED",
+  "message.error": "FLUME_CALLBACK_FAILED",
+  "stream.overflow": "FLUME_BUFFER_OVERFLOW",
+  "callback.overflow": "FLUME_BUFFER_OVERFLOW",
+  "deadline.detach.error": "FLUME_RUNTIME_FAILED",
+  "deadline.clear.error": "FLUME_TIMER_FAILED",
+  "handshake.timer.schedule.error": "FLUME_TIMER_FAILED",
+  "heartbeat.interval.schedule.error": "FLUME_TIMER_FAILED",
+  "heartbeat.initial.schedule.error": "FLUME_TIMER_FAILED",
+  "heartbeat.initial.clear.error": "FLUME_TIMER_FAILED",
+  "heartbeat.interval.clear.error": "FLUME_TIMER_FAILED",
+  "session.invalid.timer.error": "FLUME_TIMER_FAILED",
+  "ws.close.fallback.schedule.error": "FLUME_TIMER_FAILED",
+  "poller.interval.schedule.error": "FLUME_TIMER_FAILED",
+  "poller.rate-limit.schedule.error": "FLUME_TIMER_FAILED",
+  "poller.timer.clear.error": "FLUME_TIMER_FAILED",
+  "poller.rate-limit.clear.error": "FLUME_TIMER_FAILED",
+  "reconnect.timer.schedule.error": "FLUME_TIMER_FAILED",
+  "reconnect.timer.clear.error": "FLUME_TIMER_FAILED",
+  "idle.watchdog.schedule.error": "FLUME_TIMER_FAILED",
+  "idle.watchdog.clear.error": "FLUME_TIMER_FAILED",
+  "scheduler.timer.clear.error": "FLUME_TIMER_FAILED",
+})

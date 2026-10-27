@@ -25,4 +25,4 @@ jobs:
         run: bun run build
       - name: Validate published types
         run: |
-          bunx tsc --noEmit --strict --skipLibCheck dist/index.d.ts dist/discord.d.ts dist/slack.d.ts dist/github.d.ts
+          bunx tsc --noEmit --strict --skipLibCheck dist/index.d.ts dist/discord.d.ts dist/slack.d.ts dist/github.d.ts dist/time.d.ts
