@@ -356,6 +356,7 @@ describe("FlumeConfluence", () => {
 
   it("ignores a stale replace timeout when clearTimeout throws", async () => {
     const timer = { callback: (): void => {} }
+    const failure = new Error("clear failed")
     const deps = {
       ...createFlumeDefaultDeps(),
       setTimeout: (callback: () => void) => {
@@ -363,7 +364,7 @@ describe("FlumeConfluence", () => {
         return 1
       },
       clearTimeout: () => {
-        throw new Error("clear failed")
+        throw failure
       },
     }
     const confluence = new FlumeConfluence({ deps })
@@ -372,6 +373,13 @@ describe("FlumeConfluence", () => {
     expect(await confluence.add("replace", [previous])).toBeNull()
     expect(await confluence.replace("replace", [next])).toBeNull()
 
+    expect(confluence.observe("replace")?.diagnostics().entries).toContainEqual(
+      expect.objectContaining({
+        action: "flume.open.timer.clear.error",
+        errorCode: "FLUME_TIMER_FAILED",
+        error: failure,
+      }),
+    )
     timer.callback()
 
     expect(next.stopCount).toBe(0)

@@ -17,6 +17,7 @@ import { FlumeLogger } from "@/logger"
 import { FlumeRunning } from "@/flume-running"
 import { resolveFlumeReconnectConfig } from "@/reconnect-config"
 import { attempt } from "@/utils/attempt"
+import { FlumeTimeout } from "@/utils/timeout"
 import { safeErrorMessage } from "@/utils/safe-error-message"
 import { safeNormalizeError } from "@/utils/safe-normalize-error"
 
@@ -34,6 +35,8 @@ export type FlumeOptions = {
   /** push callback の待機上限 (既定 1000)。超過時は新着を落とし callback.overflow を通知する */
   callbackBuffer?: number
   signal?: AbortSignal
+  /** 起動全体の期限 (ms)。未指定は無期限。期限切れでは取得済み Source を停止する。 */
+  openTimeoutMs?: number
   deps?: FlumeRuntimeDeps
   /**
    * 再接続方針。未指定 / false は無効 (接続断で source は disconnected のまま)。
@@ -89,8 +92,35 @@ export class Flume {
   }
 
   async open(): Promise<FlumeRunning | FlumeStartError> {
-    const guard = this.guardOpen()
+    const selected = attempt(() => ({
+      signal: this.options.signal,
+      timeoutMs: this.options.openTimeoutMs,
+    }))
+    if (selected instanceof Error) {
+      const error = new FlumeStartError("Flume.open: cannot read startup options", {
+        cause: selected,
+        errorCode: "FLUME_RUNTIME_FAILED",
+      })
+      this.log.error({ action: "flume.open.refused", message: error.message, error })
+      return error
+    }
+    const { signal, timeoutMs: requestedTimeout } = selected
+    const guard = this.guardOpen(signal)
     if (guard) return guard
+    if (
+      requestedTimeout !== undefined &&
+      (typeof requestedTimeout !== "number" ||
+        !Number.isFinite(requestedTimeout) ||
+        requestedTimeout <= 0)
+    ) {
+      const error = new FlumeStartError(
+        "Flume.open: openTimeoutMs must be a finite positive number",
+      )
+      this.log.warn({ action: "flume.open.refused", message: error.message, error })
+      return error
+    }
+    const timeoutMs =
+      requestedTimeout === undefined ? undefined : Math.min(requestedTimeout, 2_147_483_647)
 
     this.consumed = true
     this.log.info({
@@ -102,11 +132,24 @@ export class Flume {
     const reconnect = this.resolveReconnect()
 
     const controller = new AbortController()
-    const signal = this.options.signal
-    const onAbort = () => controller.abort()
+    let subscribed = true
+    const onAbort = () => {
+      if (subscribed) controller.abort()
+    }
+    const releaseSignal = () => {
+      if (!subscribed) return
+      subscribed = false
+      const detached = attempt(() => signal?.removeEventListener("abort", onAbort))
+      if (detached instanceof Error)
+        this.log.warn({
+          action: "signal.removeListener.failed",
+          message: safeErrorMessage({ error: detached }),
+          error: detached,
+        })
+    }
     const attached = attempt(() => signal?.addEventListener("abort", onAbort, { once: true }))
     if (attached instanceof Error) {
-      attempt(() => signal?.removeEventListener("abort", onAbort))
+      releaseSignal()
       const error = new FlumeStartError("Flume.open: cannot observe abort signal", {
         cause: attached,
         errorCode: "FLUME_RUNTIME_FAILED",
@@ -115,7 +158,28 @@ export class Flume {
       this.finishFailedOpen()
       return error
     }
-    if (this.isSignalAborted()) controller.abort()
+    const timer = new FlumeTimeout({ deps: this.deps, log: this.log, action: "flume.open.timer" })
+    let openError = this.signalError(signal)
+    if (!openError && timeoutMs !== undefined) {
+      const scheduled = timer.schedule(() => {
+        openError = new FlumeStartError(`Flume.open: timed out after ${timeoutMs}ms`, {
+          errorCode: "FLUME_TIMEOUT",
+        })
+        controller.abort()
+      }, timeoutMs)
+      if (scheduled instanceof Error)
+        openError = new FlumeStartError("Flume.open: failed to schedule startup timeout", {
+          cause: scheduled,
+          errorCode: "FLUME_TIMER_FAILED",
+        })
+    }
+    if (openError) {
+      timer.cancel()
+      releaseSignal()
+      this.reportInterruptedOpen(openError)
+      this.finishFailedOpen()
+      return openError
+    }
     const settled = await Promise.allSettled(
       this.sources.map(async (source) => {
         const result = await attempt(() => this.safeStart(source, reconnect, controller.signal))
@@ -123,7 +187,8 @@ export class Flume {
         return result
       }),
     )
-    attempt(() => signal?.removeEventListener("abort", onAbort))
+
+    timer.cancel()
 
     const failures: Failure[] = []
     const ownedSources = new Set<FlumeSource>()
@@ -146,17 +211,30 @@ export class Flume {
       }
     }
 
-    if (this.isSignalAborted()) {
+    const signalError = openError ?? this.signalError(signal)
+    if (signalError) {
+      releaseSignal()
       await this.rollback([...ownedSources])
-      const error = new FlumeStartError("Flume.open: aborted during open", {
-        errorCode: "FLUME_ABORTED",
-      })
-      this.log.warn({ action: "flume.open.aborted", message: safeErrorMessage({ error }), error })
+      const error =
+        failures.length === 0
+          ? signalError
+          : new FlumeStartError(signalError.message, {
+              errorCode: signalError.errorCode,
+              cause: new AggregateError(
+                [
+                  ...(signalError.cause === undefined ? [] : [signalError.cause]),
+                  ...failures.map((failure) => failure.error),
+                ],
+                "source startup interrupted",
+              ),
+            })
+      this.reportInterruptedOpen(error)
       this.finishFailedOpen()
       return error
     }
 
     if (failures.length > 0) {
+      releaseSignal()
       for (const failure of failures) {
         this.log.error({
           action: "flume.source.failed",
@@ -189,20 +267,26 @@ export class Flume {
 
     const running = new FlumeRunning({
       sources: this.sources,
-      signal: this.options.signal,
+      signal,
+      releaseSignal,
       log: this.log,
       delivery: this.delivery,
       controller,
     })
 
-    if (!this.isSignalAborted()) return running
+    const finalSignalError = this.signalError(signal)
+    if (!finalSignalError) return running
 
+    const error = finalSignalError
+    this.reportInterruptedOpen(error)
     await running.close()
-    const error = new FlumeStartError("Flume.open: aborted while entering running state", {
-      errorCode: "FLUME_ABORTED",
-    })
-    this.log.warn({ action: "flume.open.aborted", message: safeErrorMessage({ error }), error })
     return error
+  }
+
+  private reportInterruptedOpen(error: FlumeStartError): void {
+    if (error.errorCode === "FLUME_ABORTED")
+      this.log.warn({ action: "flume.open.aborted", message: error.message, error })
+    else this.log.error({ action: "flume.open.failed", message: error.message, error })
   }
 
   /** 起動失敗の戻り値は callback を待たず、配送済み診断の完了後に hub を閉じる。 */
@@ -210,17 +294,15 @@ export class Flume {
     this.delivery.close()
   }
 
-  private guardOpen(): FlumeStartError | null {
+  private guardOpen(signal: AbortSignal | undefined): FlumeStartError | null {
     if (this.consumed) {
       const error = new FlumeStartError("Flume.open: already opened")
       this.log.warn({ action: "flume.open.refused", message: safeErrorMessage({ error }), error })
       return error
     }
 
-    if (this.isSignalAborted()) {
-      const error = new FlumeStartError("Flume.open: signal already aborted", {
-        errorCode: "FLUME_ABORTED",
-      })
+    const error = this.signalError(signal)
+    if (error) {
       this.log.warn({ action: "flume.open.refused", message: safeErrorMessage({ error }), error })
       return error
     }
@@ -242,11 +324,16 @@ export class Flume {
     return result
   }
 
-  private isSignalAborted(): boolean {
-    const signal = this.options.signal
-    if (!signal) return false
-    const result = attempt(() => signal.aborted === true)
-    return result instanceof Error ? true : result
+  private signalError(signal: AbortSignal | undefined): FlumeStartError | null {
+    const aborted = attempt(() => signal?.aborted === true)
+    if (aborted instanceof Error)
+      return new FlumeStartError("Flume.open: cannot read abort state", {
+        cause: aborted,
+        errorCode: "FLUME_RUNTIME_FAILED",
+      })
+    return aborted
+      ? new FlumeStartError("Flume.open: aborted by host signal", { errorCode: "FLUME_ABORTED" })
+      : null
   }
 
   private sourceName(source: FlumeSource): string {

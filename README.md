@@ -525,6 +525,14 @@ GitHub のページ送りは同一 API の通知エンドポイントだけを�
 
 `FlumeConfluence.remove()` は接続途中のグループも中断し、停止まで待つ。同じグループの並行 replace は拒否する。Source の connect は中断時に解放されるが、カスタム Source は IO に `ctx.signal` を渡し、await 後に `this.isStopped` を確認して停止済みのリソースを作り直さないこと。
 
+### 起動期限と中断の所有者
+
+`new Flume({ sources, signal, openTimeoutMs: 10_000 })` は起動全体に期限を設ける。openTimeoutMs は有限の正数で、未指定なら全体期限なし。タイマーの上限を超える指定は 2,147,483,647 ms に制限する。期限切れでは接続中の処理を中断し、取得済み Source の停止を待って FLUME_TIMEOUT を返す。カスタム Source の disconnect が完了しなければ、後始末の待機は続く。
+
+ホストの signal は open 時に一度選び、停止まで同じ購読を保持する。起動中に渡した options.signal を変更しても中断先は変わらない。明示的な中断は FLUME_ABORTED、起動期限の予約失敗は FLUME_TIMER_FAILED、signal 操作の失敗は FLUME_RUNTIME_FAILED として区別する。取消し済みタイマーは runtime の clearTimeout が失敗しても接続を停止しない。元の例外は診断の error に残る。
+
+Confluence の replaceTimeoutMs は同じ起動期限を使う。交換が失敗したら既存の接続を維持する。交換成功時の取消し失敗は、新しい接続の observe(id).diagnostics() でも取得できる。running.statuses() の配列と各要素は実行時にも凍結される。
+
 ### 過負荷時の観測
 
 `callbackBuffer` は実行中を含む callback の通常配送枠で、イベントと全レベルのログが共有する。満杯時は新着の配送を破棄し、受信と再接続を継続する。Slack の ACK はライブラリの受信に対する応答であり、利用側 callback の処理完了や永続化を保証しない。

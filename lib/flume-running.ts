@@ -17,6 +17,7 @@ import { safeNormalizeError } from "@/utils/safe-normalize-error"
 type Props = {
   sources: ReadonlyArray<FlumeSource>
   signal?: AbortSignal
+  releaseSignal: () => void
   controller: AbortController
   log: FlumeLogger
   delivery: FlumeDelivery
@@ -36,6 +37,7 @@ export class FlumeRunning {
 
   constructor(private readonly props: Props) {
     this.onAbort = () => {
+      if (this.closePromise) return
       this.props.log.info({ action: "flume.abort", message: "signal aborted, closing" })
       safeInvokeCallback({
         fn: () => this.close(),
@@ -49,7 +51,7 @@ export class FlumeRunning {
       })
     }
 
-    const signal = props.signal
+    const signal = props.controller.signal
     if (signal) {
       const result = attempt(() => signal.addEventListener("abort", this.onAbort, { once: true }))
       if (result instanceof Error) {
@@ -108,7 +110,7 @@ export class FlumeRunning {
    * `Flume({ signal })` に渡された AbortSignal をそのまま公開する。
    * 直接の controller を持っていない呼び出し元が `running.signal?.aborted`
    * で abort 状態を確認できる。`FlumeConfluence` 経由で開かれたグループでは
-   * host の signal ではなく confluence 内部の timeout controller の signal になる点に注意
+   * host の signal ではなく confluence 内部のグループ管理用 controller の signal になる点に注意
    */
   get signal(): AbortSignal | undefined {
     return this.props.signal
@@ -164,7 +166,8 @@ export class FlumeRunning {
       })
     }
 
-    const signal = this.props.signal
+    this.props.releaseSignal()
+    const signal = this.props.controller.signal
     if (signal) {
       const result = attempt(() => signal.removeEventListener("abort", this.onAbort))
       if (result instanceof Error) {
@@ -180,21 +183,23 @@ export class FlumeRunning {
   }
 
   private snapshotStatuses(): ReadonlyArray<FlumeSourceStatus> {
-    return this.props.sources.map((source) => {
-      const name = this.sourceName(source)
-      const status = attempt(() => source.status())
-      if (status instanceof Error) {
-        const error = safeNormalizeError({ value: status })
-        this.props.log.error({
-          action: "source.status.failed",
-          message: `${name}: ${safeErrorMessage({ error })}`,
-          error,
-          detail: { source: name },
-        })
-        return { source: name, status: "disconnected" as const }
-      }
-      return { source: name, status }
-    })
+    return Object.freeze(
+      this.props.sources.map((source) => {
+        const name = this.sourceName(source)
+        const status = attempt(() => source.status())
+        if (status instanceof Error) {
+          const error = safeNormalizeError({ value: status })
+          this.props.log.error({
+            action: "source.status.failed",
+            message: `${name}: ${safeErrorMessage({ error })}`,
+            error,
+            detail: { source: name },
+          })
+          return Object.freeze({ source: name, status: "disconnected" as const })
+        }
+        return Object.freeze({ source: name, status })
+      }),
+    )
   }
 
   private sourceName(source: FlumeSource): string {

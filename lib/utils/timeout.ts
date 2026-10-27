@@ -43,7 +43,10 @@ export class FlumeTimeout {
       return handle
     }
     if (this.armed?.id === id) this.armed = Object.freeze({ id, handle })
-    else attempt(() => this.props.deps.clearTimeout(handle))
+    else {
+      const cleared = attempt(() => this.props.deps.clearTimeout(handle))
+      if (cleared instanceof Error) this.report("clear.error", cleared)
+    }
     return null
   }
 

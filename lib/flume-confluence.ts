@@ -148,7 +148,16 @@ export class FlumeConfluence {
     }
     group.opening = opening
     const result = await attempt(async () => {
-      const next = await this.openGroup(id, sources, opening.controller, timeoutMs)
+      const next = await new Flume({
+        sources,
+        onEvent: this.wrapOnEvent(id),
+        onError: this.wrapOnError(id),
+        callbackBuffer: this.props.callbackBuffer,
+        deps: this.deps,
+        reconnect: this.props.reconnect,
+        signal: opening.controller.signal,
+        openTimeoutMs: timeoutMs,
+      }).open()
       if (next instanceof Error) return next
       if (this.isClosed || group.closing) {
         await next.close()
@@ -161,67 +170,6 @@ export class FlumeConfluence {
     })
     group.opening = null
     opening.finish()
-    return result
-  }
-
-  /**
-   * 1 グループ分の Flume を開いて FlumeRunning を返す。timeoutMs を指定すると AbortSignal を
-   * ctx.signal として各 source へ注入し、超過時に abort して進行中の connect ごと中止する
-   * (source 側は base クラスが signal を購読して stop() を発火する)。
-   * 失敗時の rollback は Flume 本体に任せる
-   */
-  private async openGroup(
-    id: string,
-    sources: ReadonlyArray<FlumeSource>,
-    controller: AbortController,
-    timeoutMs: number | undefined,
-  ): Promise<FlumeRunning | Error> {
-    const timeoutState = { isArmed: timeoutMs !== undefined, expired: false }
-    const timeoutResult =
-      timeoutMs === undefined
-        ? null
-        : attempt(() =>
-            this.deps.setTimeout(() => {
-              if (timeoutState.isArmed && !controller.signal.aborted) {
-                timeoutState.expired = true
-                controller.abort()
-              }
-            }, timeoutMs),
-          )
-    if (timeoutResult instanceof Error) {
-      attempt(() => controller.abort())
-      return new FlumeStartError(`FlumeConfluence: failed to schedule timeout for "${id}"`, {
-        cause: timeoutResult,
-        errorCode: "FLUME_TIMER_FAILED",
-      })
-    }
-
-    const flume = new Flume({
-      sources,
-      onEvent: this.wrapOnEvent(id),
-      onError: this.wrapOnError(id),
-      callbackBuffer: this.props.callbackBuffer,
-      deps: this.props.deps,
-      reconnect: this.props.reconnect,
-      signal: controller.signal,
-    })
-
-    const result = await attempt(() => flume.open())
-    timeoutState.isArmed = false
-    if (timeoutResult !== null) {
-      attempt(() => this.deps.clearTimeout(timeoutResult))
-    }
-
-    if (result instanceof Error) {
-      if (timeoutState.expired) {
-        return new FlumeStartError(
-          `FlumeConfluence: open of "${id}" timed out after ${timeoutMs}ms`,
-          { cause: result, errorCode: "FLUME_TIMEOUT" },
-        )
-      }
-      return result
-    }
-
     return result
   }
 

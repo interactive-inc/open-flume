@@ -25,6 +25,38 @@ function setup() {
 }
 
 describe("FlumeTimeout ownership", () => {
+  it("retains cleanup faults when an injected runtime fires synchronously", () => {
+    const failure = new Error("clear failed after synchronous fire")
+    const logs: FlumeLog[] = []
+    const callback = vi.fn()
+    const timer = new FlumeTimeout({
+      action: "test.timer",
+      deps: {
+        setTimeout: (fire) => {
+          fire()
+          return 1
+        },
+        clearTimeout: () => {
+          throw failure
+        },
+      },
+      log: new FlumeLogger({
+        source: "test",
+        handler: (entry) => logs.push(entry),
+        deps: { now: () => 0 },
+      }),
+    })
+    expect(timer.schedule(callback, 1)).toBeNull()
+    expect(callback).toHaveBeenCalledTimes(1)
+    expect(timer.isArmed).toBe(false)
+    expect(logs).toContainEqual(
+      expect.objectContaining({
+        action: "test.timer.clear.error",
+        errorCode: "FLUME_TIMER_FAILED",
+        error: failure,
+      }),
+    )
+  })
   it("does not overwrite a newer schedule made by the clear-failure observer", () => {
     const callbacks: Array<() => void> = []
     const outer = vi.fn()

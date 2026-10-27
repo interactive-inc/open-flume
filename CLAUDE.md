@@ -157,3 +157,5 @@ callbackBuffer は既定 1000。満杯時は新着 callback を破棄して受�
 Time の状態保存は実行中一件と最新の待機値一件に制限する。load / save は stateTimeoutMs (既定三十秒) で期限を設ける。保存が期限切れになったら追加保存を停止し、古い書込との順序逆転を避ける。tick は継続する。stateStatus で未保存時刻・集約数・失敗・原因を公開し、未解消の保存エラーは停止結果にも含める。
 
 Time の writer は idle / saving / halted、lifecycle は open / closing / closed の不変状態で表す。状態ごとの必要データを union 型で定義し、状態フラグを追加しない。withDeadline は対象に依存しない FlumeOperationError を返し、保存側は FlumeStateError に原因を保持する。通信の公開境界で包み直す場合も errorCode と context を保持する。
+
+起動期限は Flume.open の所有物とし、openTimeoutMs で指定する。Confluence の交換期限もこれを使い、別のタイマーや診断経路を持たない。ホスト signal の購読は open から close まで一度だけ保持する。取消し失敗も Flume の診断履歴に残し、runtime の失敗と明示的な中断を区別する。
