@@ -2,6 +2,10 @@
 
 ## 未リリース
 
+- イベント・ログ・診断の通常の object / array を発行時にコピーして凍結し、producer や別の observer の変更が配送内容へ混入しないようにする。公開型も readonly とし、取得失敗は原因付き診断と rejectedEvents / rejectedItems に残す。Error / cause などの opaque 値は参照を保持する。
+- Confluence.replace の成功値を null から previous: FlumeClosed を持つ結果に変更し、旧接続の停止失敗も返す。remove / closeAll は終了結果と中断した起動の結果を返す。Source.start / Flume.open で起動と後片付けが両方失敗した場合は、両方の原因を保持する。
+- Discord の resume URL は wss・接続先ドメイン・資格情報やポートの有無を検証し、不正なら既定 Gateway へ戻る。stream 設定の getter 失敗を診断して既定値へ戻す。README の利用契約と移行手順を現行実装へ整理する。
+
 - Slack Source は受信に使う appToken だけで構築できる。未使用だった botToken の必須指定を撤廃し、互換用の指定が残っていても読み取らず保持しない。
 
 - Flume、Confluence、全標準 Source の設定を生成時に固定する。既存 options の書換えによる通知先・認証情報・cron・catch-up・再接続方針の変更は反映しない。設定を変える場合は新しい Source / Flume を作成して replace する。ホスト signal も open 時ではなく生成時に選択する。
