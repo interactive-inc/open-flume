@@ -1,5 +1,5 @@
 import type { FlumeErrorContext } from "@/errors/error-context"
-import { FlumeConnectionError } from "@/errors/connection-error"
+import { FlumeOperationError } from "@/errors/operation-error"
 import type { FlumeRuntimeDeps } from "@/types"
 import type { FlumeLogger } from "@/logger"
 import { attempt } from "@/utils/attempt"
@@ -13,7 +13,7 @@ type Props<T> = {
   deps: Pick<FlumeRuntimeDeps, "setTimeout" | "clearTimeout">
 }
 
-/** fetch と body 読取を同じ期限で囲む。中断非対応の IO も待ち続けず、遅延結果は採用しない。 */
+/** 操作全体を一つの期限で囲む。中断非対応の IO も待ち続けず、遅延結果は採用しない。 */
 export async function withDeadline<T>(props: Props<T>): Promise<T | Error> {
   const controller = new AbortController()
   const interrupted = Promise.withResolvers<Error>()
@@ -23,13 +23,21 @@ export async function withDeadline<T>(props: Props<T>): Promise<T | Error> {
   }
   const onAbort = () =>
     abort(
-      new FlumeConnectionError("operation aborted", {
+      new FlumeOperationError("operation aborted", {
         errorCode: "FLUME_ABORTED",
         context: props.context(),
       }),
     )
   const listener = attempt(() => props.signal?.addEventListener("abort", onAbort, { once: true }))
-  if (listener instanceof Error) return listener
+  if (listener instanceof Error) {
+    attempt(() => props.signal?.removeEventListener("abort", onAbort))
+    controller.abort()
+    return new FlumeOperationError("abort listener registration failed", {
+      errorCode: "FLUME_RUNTIME_FAILED",
+      cause: listener,
+      context: props.context(),
+    })
+  }
   if (props.signal?.aborted) onAbort()
 
   let active = true
@@ -37,7 +45,7 @@ export async function withDeadline<T>(props: Props<T>): Promise<T | Error> {
     props.deps.setTimeout(() => {
       if (active)
         abort(
-          new FlumeConnectionError(`operation timed out after ${props.timeoutMs}ms`, {
+          new FlumeOperationError(`operation timed out after ${props.timeoutMs}ms`, {
             errorCode: "FLUME_TIMEOUT",
             context: props.context(),
           }),
@@ -46,7 +54,7 @@ export async function withDeadline<T>(props: Props<T>): Promise<T | Error> {
   )
   const result =
     timer instanceof Error
-      ? new FlumeConnectionError(`timer scheduling failed: ${timer.message}`, {
+      ? new FlumeOperationError(`timer scheduling failed: ${timer.message}`, {
           errorCode: "FLUME_TIMER_FAILED",
           cause: timer,
           context: props.context(),

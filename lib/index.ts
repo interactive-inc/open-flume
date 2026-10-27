@@ -1,6 +1,8 @@
 export type * from "@/types"
 export { createFlumeDefaultDeps } from "@/deps"
 export { FlumeConnectionError } from "@/errors/connection-error"
+export { FlumeOperationError } from "@/errors/operation-error"
+export { FlumeStateError } from "@/errors/state-error"
 export { FlumeHttpError } from "@/errors/http-error"
 export { FlumeParseError } from "@/errors/parse-error"
 export { FlumeStartError } from "@/errors/start-error"

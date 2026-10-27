@@ -1,5 +1,7 @@
 import { FlumeHttpError } from "@/errors/http-error"
 import { FlumeConnectionError } from "@/errors/connection-error"
+import { FlumeOperationError } from "@/errors/operation-error"
+import { FlumeStateError } from "@/errors/state-error"
 import { resolveFlumeErrorCode } from "@/errors/resolve-error-code"
 import type {
   FlumeLog,
@@ -67,7 +69,10 @@ export class FlumeLogger {
           ? resolveFlumeErrorCode(input.action, input.error)
           : undefined),
       detail:
-        (input.error instanceof FlumeConnectionError || input.error instanceof FlumeHttpError) &&
+        (input.error instanceof FlumeConnectionError ||
+          input.error instanceof FlumeHttpError ||
+          input.error instanceof FlumeOperationError ||
+          input.error instanceof FlumeStateError) &&
         input.error.context
           ? { ...input.error.context, ...input.detail }
           : input.detail,

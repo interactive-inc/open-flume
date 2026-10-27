@@ -1,6 +1,7 @@
 import type { FlumeLogHandler, FlumeRuntimeDeps, FlumeSlackEnvelope } from "@/types"
 import { FlumeLogger } from "@/logger"
 import { FlumeConnectionError } from "@/errors/connection-error"
+import { FlumeOperationError } from "@/errors/operation-error"
 import { FlumeHttpError } from "@/errors/http-error"
 import { FlumeParseError } from "@/errors/parse-error"
 import { obtainSlackUrl } from "@/slack/obtain-slack-url"
@@ -136,7 +137,12 @@ export class FlumeSlackSocketMode {
       this.log.error({ action: "url.error", message: url.message, error: url })
       return url instanceof FlumeConnectionError
         ? url
-        : new FlumeConnectionError(url.message, { cause: url })
+        : new FlumeConnectionError(url.message, {
+            cause: url,
+            ...(url instanceof FlumeOperationError
+              ? { errorCode: url.errorCode, context: url.context }
+              : {}),
+          })
     }
 
     if (this.isStoppedFlag) {

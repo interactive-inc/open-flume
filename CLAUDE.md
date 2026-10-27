@@ -38,7 +38,7 @@ vp lint
 
 ### エラー
 
-throw しない。`T | Error` を返し `instanceof` で判別する。カスタムエラーは `lib/errors/` に集約: `FlumeStartError`, `FlumeConnectionError`, `FlumeHttpError`, `FlumeParseError`
+throw しない。`T | Error` を返し `instanceof` で判別する。カスタムエラーは `lib/errors/` に集約: `FlumeStartError`, `FlumeConnectionError`, `FlumeHttpError`, `FlumeParseError`, `FlumeOperationError`, `FlumeStateError`
 
 公開境界 (constructor / start / stop / onEvent 呼び出し / stream() / signal abort / log handler) からは例外を一切漏らさない。汎用 HOF `attempt(fn)` で try/catch をラップし `T | Error` に正規化する。同期/非同期はオーバーロードで自動判定。`safeInvokeCallback({ fn, onError })` はユーザーコールバック (`onEvent` / `onError`) を例外隔離して呼ぶ薄いラッパー (`attempt` + `onError` 通知)。`FlumeDelivery` がコールバックを直列化し、失敗を `onEvent.error` / `onError.error` として pull と peer callback に一度だけ配送する。
 
@@ -155,3 +155,5 @@ callbackBuffer は既定 1000。満杯時は新着 callback を破棄して受�
 `bun run test:stress` は実 HTTP / WebSocket と実 timer で二百回の接続、各五百件の配送を検査する。注入 runtime の取消し失敗・遅延発火・callback 再入は単体試験で検査する。
 
 Time の状態保存は実行中一件と最新の待機値一件に制限する。load / save は stateTimeoutMs (既定三十秒) で期限を設ける。保存が期限切れになったら追加保存を停止し、古い書込との順序逆転を避ける。tick は継続する。stateStatus で未保存時刻・集約数・失敗・原因を公開し、未解消の保存エラーは停止結果にも含める。
+
+Time の writer は idle / saving / halted、lifecycle は open / closing / closed の不変状態で表す。状態ごとの必要データを union 型で定義し、状態フラグを追加しない。withDeadline は対象に依存しない FlumeOperationError を返し、保存側は FlumeStateError に原因を保持する。通信の公開境界で包み直す場合も errorCode と context を保持する。

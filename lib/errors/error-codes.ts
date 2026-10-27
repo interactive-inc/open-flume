@@ -12,7 +12,8 @@ export const FLUME_ERROR_CODES = Object.freeze({
   FLUME_AUTH_FAILED: "接続先に認証・権限を拒否されました。資格情報と要求権限を確認してください。",
   FLUME_RATE_LIMITED:
     "接続先に待機を要求されました。retryAfterMs またはログの待機時間を確認してください。",
-  FLUME_TIMEOUT: "設定された通信期限を超えました。接続段階と接続先の応答を確認してください。",
+  FLUME_TIMEOUT:
+    "操作の期限を超えました。context の操作・段階と、通信先や保存先の応答を確認してください。",
   FLUME_PARSE_FAILED: "接続先の応答を解釈できませんでした。action と検証エラーを確認してください。",
   FLUME_PROTOCOL_INVALID:
     "接続先の応答がプロトコルに違反しています。action と検証結果を確認してください。",

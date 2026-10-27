@@ -1,3 +1,4 @@
+import type { FlumeStateError } from "@/errors/state-error"
 import type { FlumeErrorCode } from "@/errors/error-codes"
 import type { z } from "zod/v4"
 import type { FlumeLogger } from "@/logger"
@@ -296,13 +297,14 @@ export type FlumeTimeSourceState = {
 
 /** checkpoint の保存状態。pendingWrites は未完了 IO と最新の待機値の合計 (最大二件)。 */
 export type FlumeTimeStateStatus = Readonly<{
+  lifecycle: "open" | "closing" | "closed"
   phase: "idle" | "saving" | "halted"
   pendingWrites: number
   coalescedWrites: number
   failedWrites: number
   lastRequestedAt: number | null
   lastSavedAt: number | null
-  error: Error | null
+  error: FlumeStateError | null
 }>
 
 /**

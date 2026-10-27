@@ -274,7 +274,9 @@ new FlumeTimeSource({
 
 通常の保存失敗は記録して次の保存を続ける。保存が期限切れになると `stateStatus().phase` が `halted` となり、tick は継続するが追加保存は停止する。取消し非対応の古い書き込みが後から完了して新しい checkpoint を上書きするのを防ぐため、同じ Source では自動再開しない。復旧時は保存先に残る処理の終了を確認すること。
 
-`source.stateStatus()` で `lastRequestedAt`・`lastSavedAt`・`pendingWrites` (最大二件)・`coalescedWrites`・`failedWrites`・`error` を確認できる。`pendingWrites` は終了後も未完了のホスト IO や未保存の待機値を含む。通常の保存失敗が解消されないまま停止した場合も `error` と二つの時刻から未保存状態を判別できる。停止は有限件数の保存を各期限まで待ち、最後の未解消エラーを `source.stop()` と `FlumeClosed.errors()` に返す。persister 内から Flume の終了を await しない。
+`source.stateStatus()` の `lifecycle` は `open` → `closing` → `closed`、保存処理の `phase` は `idle` → `saving` → `idle` / `halted` を表す。終了処理中も受理済みの保存を待ち、`halted` から追加保存は再開しない。
+
+`source.stateStatus()` で `lastRequestedAt`・`lastSavedAt`・`pendingWrites` (最大二件)・`coalescedWrites`・`failedWrites`・`error` を確認できる。`pendingWrites` は終了後も未完了のホスト IO や未保存の待機値を含む。通常の保存失敗が解消されないまま停止した場合も `error` と二つの時刻から未保存状態を判別できる。停止は有限件数の保存を各期限まで待ち、最後の未解消エラーを `FlumeStateError` として `source.stop()` と `FlumeClosed.errors()` に返す。ホストが返した元の例外は `cause` に保持する。persister 内から Flume の終了を await しない。
 
 `load` の失敗・期限切れ・不正な保存値は診断を残して catchup を省略する。停止時は load の signal を中断し、遅延結果を無視する。`catchupPolicy` (`off` / `lastOnly` / `missed`) で次回起動時の再配送を選ぶ。同じ保存キーを複数の Source で共有する場合は、ホスト側でも書き込み順を直列化するか、版の比較を原子的に行う。
 
@@ -479,6 +481,8 @@ Flume does not throw on protocol/network failures. Every entry point returns `T 
 - `FlumeConnectionError` — WebSocket closed before ready
 - `FlumeHttpError` — HTTP call returned an error payload (e.g. Slack `ok: false`)
 - `FlumeParseError` — Unparseable WebSocket frame
+- `FlumeOperationError` — 操作の期限切れ・中断・timer など実行基盤の失敗。通信や保存の種類に依存しない。
+- `FlumeStateError` — 永続状態の読取・検証・保存の失敗。保存の期限切れもこの型で返し、`errorCode` は `FLUME_TIMEOUT`、`cause` は期限切れを表す `FlumeOperationError` となる。
 
 Exceptions thrown or rejected from `onEvent` / `onError` are isolated and emitted as `onEvent.error` / `onError.error` diagnostics; they are never rethrown into the protocol loop.
 

@@ -742,7 +742,12 @@ describe("socket mode resource regressions", () => {
     })
     const connecting = mode.connect()
     timeouts[0]?.fn()
-    expect(await connecting).toMatchObject({ errorCode: "FLUME_TIMEOUT" })
+    expect(await connecting).toMatchObject({
+      name: "FlumeConnectionError",
+      errorCode: "FLUME_TIMEOUT",
+      context: { operation: "slack.apps.connections.open", phase: "HTTP response" },
+      cause: { name: "FlumeOperationError", errorCode: "FLUME_TIMEOUT" },
+    })
     expect(getSocket()).toBeNull()
     mode.disconnect()
   })
