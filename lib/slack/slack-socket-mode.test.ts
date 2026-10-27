@@ -3,6 +3,7 @@ import { waitFor } from "@/test-utils/wait-for"
 import { FlumeSlackSocketMode } from "@/slack/slack-socket-mode"
 import { FlumeConnectionError } from "@/errors/connection-error"
 import { FlumeHttpError } from "@/errors/http-error"
+import type { FlumeLog } from "@/types"
 
 type Listener = (ev: unknown) => void
 
@@ -47,10 +48,10 @@ class MockWebSocket {
     }
   }
 
-  simulateError(): void {
+  simulateError(error?: Error): void {
     const fns = this.listeners.get("error") ?? []
     for (const fn of fns) {
-      fn({})
+      fn({ error, message: error?.message })
     }
   }
 }
@@ -105,6 +106,37 @@ const createDeps = (overrides?: {
 }
 
 describe("FlumeSlackSocketMode", () => {
+  it.each([false, true])(
+    "distinguishes planned shutdown from an unexpected close (planned=%s)",
+    async (planned) => {
+      const { deps, getSocket } = createDeps()
+      const logs: FlumeLog[] = []
+      const mode = new FlumeSlackSocketMode({
+        appToken: "test-token",
+        deps,
+        onMessage: vi.fn(),
+        onConnected: vi.fn(),
+        onDisconnected: vi.fn(),
+        onLog: (log) => logs.push(log),
+      })
+      const opening = mode.connect()
+      await waitFor(() => expect(getSocket()).not.toBeNull())
+      getSocket()!.simulateMessage('{"type":"hello"}')
+      await opening
+      if (planned) mode.disconnect()
+      else getSocket()!.simulateClose(1006, "test close")
+      const errors = logs.filter((log) => log.action === "ws.closed")
+      expect(errors).toHaveLength(planned ? 0 : 1)
+      if (!planned)
+        expect(errors[0]).toMatchObject({
+          level: "error",
+          errorCode: "FLUME_CONNECTION_FAILED",
+          detail: { code: 1006, phase: "connected" },
+          error: { cause: { code: 1006, reason: "test close" } },
+        })
+      mode.disconnect()
+    },
+  )
   it("connect() obtains URL and opens WebSocket", async () => {
     const mockFetch = createMockFetch()
     const { deps, getSocket } = createDeps({ fetch: mockFetch })
@@ -436,7 +468,7 @@ describe("FlumeSlackSocketMode", () => {
       expect(getSocket()).not.toBeNull()
     })
 
-    const handshake = timeouts.find((entry) => entry.ms === 100)
+    const handshake = timeouts.find((entry) => entry.ms === 100 && !entry.cleared)
     expect(handshake).toBeDefined()
 
     handshake!.fn()
@@ -648,5 +680,88 @@ describe("FlumeSlackSocketMode", () => {
 
     expect(await mode.connect()).toBeInstanceOf(FlumeConnectionError)
     expect(FailingListenerSocket.latest?.closeCount).toBe(1)
+  })
+})
+
+describe("socket mode resource regressions", () => {
+  it("retains the runtime cause and phase of a WebSocket error", async () => {
+    const { deps, getSocket } = createDeps()
+    const mode = new FlumeSlackSocketMode({
+      appToken: "test-token",
+      deps,
+      onConnected: vi.fn(),
+      onDisconnected: vi.fn(),
+      onMessage: vi.fn(),
+    })
+    const connecting = mode.connect()
+    await waitFor(() => expect(getSocket()).not.toBeNull())
+    const cause = new Error("connection reset")
+    getSocket()!.simulateError(cause)
+    expect(await connecting).toMatchObject({
+      cause,
+      message: "WebSocket connection error: connection reset",
+      errorCode: "FLUME_CONNECTION_FAILED",
+      context: { operation: "slack.socket-mode", phase: "handshake" },
+    })
+    mode.disconnect()
+  })
+
+  it("ignores frames from a closed socket", async () => {
+    const { deps, getSocket } = createDeps()
+    const connected = vi.fn()
+    const messages = vi.fn()
+    const mode = new FlumeSlackSocketMode({
+      appToken: "test-token",
+      deps,
+      onConnected: connected,
+      onDisconnected: vi.fn(),
+      onMessage: messages,
+    })
+    const connecting = mode.connect()
+    await waitFor(() => expect(getSocket()).not.toBeNull())
+    const socket = getSocket()!
+    socket.simulateMessage('{"type":"hello"}')
+    await connecting
+    socket.simulateClose(1006, "")
+    socket.simulateMessage('{"type":"hello"}')
+    socket.simulateMessage('{"type":"events_api","envelope_id":"late","payload":{}}')
+    expect(connected).toHaveBeenCalledTimes(1)
+    expect(messages).not.toHaveBeenCalled()
+    expect(socket.sent).toEqual([])
+    mode.disconnect()
+  })
+
+  it("bounds URL acquisition and records the timeout code", async () => {
+    const { deps, timeouts, getSocket } = createDeps({ fetch: () => new Promise(() => {}) })
+    const mode = new FlumeSlackSocketMode({
+      appToken: "test-token",
+      deps,
+      onConnected: vi.fn(),
+      onDisconnected: vi.fn(),
+      onMessage: vi.fn(),
+    })
+    const connecting = mode.connect()
+    timeouts[0]?.fn()
+    expect(await connecting).toMatchObject({ errorCode: "FLUME_TIMEOUT" })
+    expect(getSocket()).toBeNull()
+    mode.disconnect()
+  })
+
+  it("disconnect releases hung URL acquisition without opening a late socket", async () => {
+    const response = Promise.withResolvers<Response>()
+    const { deps, getSocket } = createDeps({ fetch: () => response.promise })
+    const mode = new FlumeSlackSocketMode({
+      appToken: "test-token",
+      deps,
+      onConnected: vi.fn(),
+      onDisconnected: vi.fn(),
+      onMessage: vi.fn(),
+    })
+    const connecting = mode.connect()
+    mode.disconnect()
+    expect(await connecting).toMatchObject({ errorCode: "FLUME_ABORTED" })
+    response.resolve(new Response(JSON.stringify({ ok: true, url: "wss://example.com" })))
+    await Promise.resolve()
+    expect(getSocket()).toBeNull()
   })
 })

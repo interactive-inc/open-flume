@@ -69,16 +69,20 @@
     "build": "vp pack",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:stress": "FLUME_STRESS_CYCLES=200 FLUME_STRESS_EVENTS=500 vitest run lib/integration/socket-lifecycle.test.ts",
     "lint": "vp lint",
     "fmt": "vp fmt"
   },
   "dependencies": {
-    "zod": "^4.4.3"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
+    "@types/node": "^22",
+    "@types/ws": "^8.18.1",
     "typescript": "^5.9.3",
-    "vite-plus": "^0.1.24",
-    "vitest": "^4.1.10"
+    "vite-plus": "^1.4.0",
+    "vitest": "^5.0.5",
+    "ws": "^8.22.0"
   },
   "devEngines": {
     "packageManager": {

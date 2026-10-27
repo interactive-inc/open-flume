@@ -268,7 +268,7 @@ describe("FlumeSlackSource", () => {
       expect(statuses).not.toContain("reconnecting")
       expect(logs.some((log) => log.action === "reconnect.terminal")).toBe(true)
       expect(logs.some((log) => log.action === "reconnect.scheduled")).toBe(false)
-      expect(bundle.timeouts).toHaveLength(0)
+      expect(bundle.timeouts.filter((timer) => !timer.cleared)).toHaveLength(0)
     },
   )
 

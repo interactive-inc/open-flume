@@ -4,6 +4,7 @@ import { attempt } from "@/utils/attempt"
 import { safeErrorMessage } from "@/utils/safe-error-message"
 import { safeInvokeCallback } from "@/utils/safe-invoke-callback"
 import { safeRandom } from "@/utils/safe-random"
+import { FlumeConnectionError } from "@/errors/connection-error"
 
 type Props = {
   onSend: () => void
@@ -30,10 +31,21 @@ export class FlumeDiscordHeartbeat {
 
   private generation = 0
 
+  private active = false
+
   constructor(private readonly props: Props) {}
 
   start(intervalMs: number): Error | null {
     this.stop()
+    if (!Number.isInteger(intervalMs) || intervalMs < 1 || intervalMs > 2_147_483_647) {
+      return new FlumeConnectionError(
+        "heartbeat interval must be an integer from 1 to 2147483647ms",
+        {
+          errorCode: "FLUME_PROTOCOL_INVALID",
+        },
+      )
+    }
+    this.active = true
     this.ackReceived = true
     const scheduledGeneration = ++this.generation
 
@@ -71,6 +83,7 @@ export class FlumeDiscordHeartbeat {
         error: initialResult,
       })
       this.initialTimer = null
+      this.active = false
       return initialResult
     } else {
       this.initialTimer = initialResult
@@ -80,6 +93,7 @@ export class FlumeDiscordHeartbeat {
   }
 
   stop(): void {
+    this.active = false
     this.generation++
 
     if (this.initialTimer !== null) {
@@ -114,7 +128,17 @@ export class FlumeDiscordHeartbeat {
   }
 
   request(): void {
-    this.safeFire()
+    if (!this.active) return
+    // 追加要求への返答で、定期 heartbeat の ACK 待ち期限を早めたり延ばしたりしない。
+    safeInvokeCallback({
+      fn: this.props.onSend,
+      onError: (error) =>
+        this.props.log.error({
+          action: "heartbeat.fire.error",
+          message: safeErrorMessage({ error }),
+          error,
+        }),
+    })
   }
 
   isRunning(): boolean {

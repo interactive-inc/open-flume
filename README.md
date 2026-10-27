@@ -234,7 +234,11 @@ class MyWebhookSource extends FlumeSource {
 }
 ```
 
-`this.emit({...})` queues events through the base's serial queue and routes them to `ctx.onEvent` with `attempt()` isolation. `this.setStatus(...)` deduplicates idempotent transitions and logs the change. IO started after `connect()` returns, such as timer callbacks, must use `attempt()` or `safeInvokeCallback()` as shown above; both are exported from the root entry so custom sources do not need raw try/catch.
+`this.emit({...})` は同期の受け手へその場で転送し、非同期 callback は Source ごとに順序を保って処理する。Flume の有限配送バッファの手前に無制限なキューを作らない。Source を直接 `start(ctx)` する場合は `ctx.eventBuffer` (既定 1000、実行中を含む) が上限となり、満杯時は新着を破棄して受信を継続する。`source.deliveryStatus()` は `pendingEvents`・`droppedEvents`・`callbackFailures` を不変スナップショットで返す。
+
+`source.stop()` は接続の停止まで待ち、通知 callback の完了は待たない。callback 内から停止を await できる。受理済み通知とその失敗診断まで待つ場合は、callback の外で `await source.stop(); await source.drain()` とする。単体起動でも signal は停止まで購読され、起動失敗時は自動で後始末する。
+
+`this.setStatus(...)` は同じ状態と理由の連続通知を省略する。`connect()` の後に動く timer などの IO は `attempt()` または `safeInvokeCallback()` で囲む。どちらも root entry から import できる。
 
 ## Time source
 
@@ -266,7 +270,13 @@ new FlumeTimeSource({
 
 `tick.firedAt` is the scheduled wall-clock time (epoch ms), not the exact `setTimeout` firing instant. A throwing `message()` is isolated and falls back to the defaults. Parse the cron up front with `parseCron(expr)` (returns `FlumeCron | FlumeParseError`) or compute the next fire with `flumeCronNext(cron, afterMs)`.
 
-With `statePersister`, state writes are serialized in tick order and source shutdown waits for queued writes to settle. A failed write is logged and later writes still run. Keep the persister's IO bounded and avoid waiting for Flume lifecycle completion inside it. Stopping during `load()` releases startup immediately and ignores a late result; cancellation of the host's underlying read remains the persister's responsibility. Use `catchupPolicy` (`off`, `lastOnly`, or `missed`) to control replay on the next start. When multiple sources share a persistence key, the host must also serialize or atomically order their writes.
+`statePersister` は checkpoint を直列保存する。保存が遅い間は実行中の一件と最新の待機値一件だけを保持し、中間の保存要求は最新値へ集約する。tick の配送とは独立している。`stateTimeoutMs` は各 `load` / `save` の期限 (既定 30 秒)。persister の任意引数 `{ signal }` を IO に渡し、取消しに対応すること。
+
+通常の保存失敗は記録して次の保存を続ける。保存が期限切れになると `stateStatus().phase` が `halted` となり、tick は継続するが追加保存は停止する。取消し非対応の古い書き込みが後から完了して新しい checkpoint を上書きするのを防ぐため、同じ Source では自動再開しない。復旧時は保存先に残る処理の終了を確認すること。
+
+`source.stateStatus()` で `lastRequestedAt`・`lastSavedAt`・`pendingWrites` (最大二件)・`coalescedWrites`・`failedWrites`・`error` を確認できる。`pendingWrites` は終了後も未完了のホスト IO や未保存の待機値を含む。通常の保存失敗が解消されないまま停止した場合も `error` と二つの時刻から未保存状態を判別できる。停止は有限件数の保存を各期限まで待ち、最後の未解消エラーを `source.stop()` と `FlumeClosed.errors()` に返す。persister 内から Flume の終了を await しない。
+
+`load` の失敗・期限切れ・不正な保存値は診断を残して catchup を省略する。停止時は load の signal を中断し、遅延結果を無視する。`catchupPolicy` (`off` / `lastOnly` / `missed`) で次回起動時の再配送を選ぶ。同じ保存キーを複数の Source で共有する場合は、ホスト側でも書き込み順を直列化するか、版の比較を原子的に行う。
 
 ## Pull stream
 
@@ -456,7 +466,7 @@ new Flume({
 
 ## Safety
 
-- Ordering — each source has its own `FlumeSerialQueue` and per-source events are published FIFO. The public `onEvent` and `onError` callbacks share one global queue, so callback invocations never race across sources. `close()` stops the sources; a subsequent `drain()` waits for callbacks and their failure diagnostics. Pull subscribers receive items when they are published and have independent bounded buffers. The push callback queue is unbounded; use pull-only consumption for a bounded slow consumer.
+- Ordering — each source has its own `FlumeSerialQueue` and per-source events are published FIFO. The public `onEvent` and `onError` callbacks share one global queue, so callback invocations never race across sources. `close()` stops the sources; a subsequent `drain()` waits for callbacks and their failure diagnostics. Pull subscribers receive items when they are published and have independent bounded buffers. push の通常配送には `callbackBuffer` (既定 1000) の上限があり、満杯時は新着を破棄する。診断用の配送は別枠で受け付け、`callback.overflow` を通知する。
 - Duplicate suppression — Slack envelopes are deduped by `envelope_id` (`FlumeSlackSeenCache`) to absorb ack retries. GitHub notifications are deduped by `id + updated_at` (`FlumeGitHubSeenCache`). Discord uses session resume so the Gateway does not re-emit dispatches.
 - Partial-failure rollback — if any source fails during `Flume.open()`, sources acquired by that open are stopped, including partially connected failures. A source that refused reuse remains with its existing owner. A `FlumeStartError` is returned with per-source detail.
 - Idempotent close — `FlumeRunning.close()` is safe to call concurrently; the first call wins and subsequent callers receive the same `FlumeClosed` snapshot. The same guard exists at source level: a double-`close()` (e.g. via signal abort racing a manual close) does not re-invoke `disconnect()`.
@@ -473,6 +483,77 @@ Flume does not throw on protocol/network failures. Every entry point returns `T 
 Exceptions thrown or rejected from `onEvent` / `onError` are isolated and emitted as `onEvent.error` / `onError.error` diagnostics; they are never rethrown into the protocol loop.
 
 With type-valid constructor input, the library guarantees that protocol IO and user callback failures do not escape `open()`, `close()`, the `onEvent` invocation path, the `stream()` iterator, the abort-signal path, or the `onError` callback. These boundaries route work through internal `safe*` wrappers and the generic `attempt()` helper.
+
+### 診断コードと調査情報
+
+`FLUME_ERROR_CODES` は公開コードと確認事項の一覧。コードの意味は変更・再利用しない。標準 warn / error ログと公開エラーは `errorCode` を持つ。成功した debug / info ログには失敗コードを自動付与しない。`action` は発生操作、`source` は接続元、`detail` はその時点の状況を示す。
+
+```ts
+import { FLUME_ERROR_CODES } from "@interactive-inc/flume"
+
+const flume = new Flume({
+  sources,
+  callbackBuffer: 1000,
+  onError: (log) => {
+    console.error(
+      {
+        errorCode: log.errorCode,
+        guidance: log.errorCode ? FLUME_ERROR_CODES[log.errorCode] : undefined,
+        source: log.source,
+        action: log.action,
+        detail: log.detail,
+      },
+      log.error,
+    )
+  },
+})
+```
+
+- `FLUME_TIMEOUT` と `FLUME_ABORTED` は別の状態。GitHub の期限超過では operation・phase・page を記録する。応答を受け取れた場合は httpStatus と、サーバーが提供する requestId も保持する。`requestTimeoutMs` (既定 30 秒) は fetch、本文読取、全ページの取得を含む。
+- `FlumeHttpError.status` とサービス固有の `code`、`FlumeConnectionError.code` (WebSocket 切断コード) は `errorCode` と独立して保持する。元の例外は `cause` に保持し、複数 Source の起動失敗は `AggregateError.errors` まで辿れる。
+- `closed.errors()` には source・errorCode・元の error が残る。停止失敗をログの検索だけに依存させない。
+- 予期しない WebSocket 切断は接続後も `ws.closed` として onError に通知する。切断コード・reason・接続段階・元の CloseEvent を保持する。明示的な close や接続更新の指示とは区別する。
+- `FLUME_BUFFER_OVERFLOW` は通知を破棄した診断。受信を継続し、`flume.deliveryStatus()` / `running.deliveryStatus()` で callback の待機・失敗・破棄数と pull バッファの累積破棄数を確認できる。pull の値は起動時バッファと各購読バッファでの破棄の合計であり、ユニークなイベント数ではない。
+- `close()` は Source の停止、`drain()` は受理した callback とその診断の配送完了を待つ。callback 内から `drain()` を待つと自身を待つため、callback の外で使う。完了しないユーザー callback は `drain()` も完了させないが、Source の停止は妨げない。
+- 相手側が理由を返さない切断では真因を断定しない。観測した切断コード、失敗した段階、直前の状態遷移から調査する。本文や token をログへ追加して原因推定しない。
+
+GitHub のページ送りは同一 API の通知エンドポイントだけを許可し、HTTP redirect は拒否する。全ページの JSON と schema が正常なときだけ既読・ETag・cursor を確定する。Slack の URL 取得にも handshakeTimeoutMs (既定 30 秒) を適用し、その後の WebSocket handshake には別に同じ期限を適用する。
+
+`FlumeConfluence.remove()` は接続途中のグループも中断し、停止まで待つ。同じグループの並行 replace は拒否する。Source の connect は中断時に解放されるが、カスタム Source は IO に `ctx.signal` を渡し、await 後に `this.isStopped` を確認して停止済みのリソースを作り直さないこと。
+
+### 過負荷時の観測
+
+`callbackBuffer` は実行中を含む callback の通常配送枠で、イベントと全レベルのログが共有する。満杯時は新着の配送を破棄し、受信と再接続を継続する。Slack の ACK はライブラリの受信に対する応答であり、利用側 callback の処理完了や永続化を保証しない。
+
+- `droppedEventCallbacks`: バッファ上限で破棄したイベントの onEvent 配送数。
+- `droppedLogCallbacks`: バッファ上限で破棄したログの onEvent / onError 配送数。同じログでも配送先が二つなら二件として数える。
+- `droppedCallbacks`: 上記二つの合計。
+- `droppedDiagnosticCallbacks`: ログ配送のうち診断専用枠でも受理できなかった数。専用枠も最大二件に制限する。
+- `callbackFailures`: 受理した callback の例外や callback 取得失敗の累積数。バッファ超過とは別に数える。
+
+`flume.diagnostics()` / `running.diagnostics()` は最新百件の warn / error を、callback や pull の混雑に依存せず返す。`total` は累積診断数、`evicted` は履歴上限で破棄した数。配列と各ログ・detail の直下は不変のスナップショットで、元の error / cause の参照を保持する。起動失敗後や close 後も取得できる。全履歴を保存する場合は、利用側のログ保存先へ継続的に転送する。
+
+```ts
+const state = running.deliveryStatus()
+console.log(state.droppedEventCallbacks, state.droppedLogCallbacks)
+const history = running.diagnostics()
+console.log(history.total, history.evicted, history.entries)
+
+// Confluence では稼働中のグループから観測専用ハンドルを取得する。
+const view = confluence.observe("group")
+await confluence.remove("group")
+console.log(view?.deliveryStatus(), view?.diagnostics())
+```
+
+Confluence の取得済み観測ハンドルは、その時点の接続世代を保持する。replace 後の新しい接続を観測する場合は再取得する。callback の停止待ちと同様、全記録の永久保存や相手サービス内部の真因特定をライブラリ単独で保証するものではない。
+
+### 障害と負荷の検証
+
+`bun run test` は単体試験に加え、ローカルの実 HTTP / WebSocket サーバーで再接続、Slack ACK、本文停止、handshake 停止、abort、タイマー解放を検査する。外部サービスや実トークンは使用しない。
+
+テストランナーとサーバーは Node.js で動かす。Bun の検証は別プロセスでライブラリを実行し、Bun 標準の fetch / WebSocket を Node.js の試験サーバーに接続する。ライブラリの受信側と試験サーバーの runtime 互換性を独立して検証するため、試験全体を `bun --bun` で起動しない。
+
+`bun run test:stress` は Discord と Slack をそれぞれ二百回接続し、各接続で五百件を受信する。十分な callbackBuffer を与えて順序・欠落・停止後の予約を検査する。小さなバッファでの破棄と回復は別の試験で件数まで検査する。実サービスでの長期運用や、runtime 内部の全リソースの証明に置き換わる試験ではない。
 
 ## Supported sources
 

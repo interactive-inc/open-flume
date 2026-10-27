@@ -1,9 +1,4 @@
-import type {
-  FlumeGatewayMessage,
-  FlumeLogHandler,
-  FlumeRuntimeDeps,
-  FlumeTimerHandle,
-} from "@/types"
+import type { FlumeGatewayMessage, FlumeLogHandler, FlumeRuntimeDeps } from "@/types"
 import { FlumeLogger } from "@/logger"
 import { FlumeConnectionError } from "@/errors/connection-error"
 import { FlumeParseError } from "@/errors/parse-error"
@@ -14,6 +9,8 @@ import { attempt } from "@/utils/attempt"
 import { isRecord } from "@/utils/is-record"
 import { safeErrorMessage } from "@/utils/safe-error-message"
 import { safeRandom } from "@/utils/safe-random"
+import { FlumeTimeout } from "@/utils/timeout"
+import { webSocketError } from "@/utils/web-socket-error"
 import { safeStringify } from "@/utils/safe-stringify"
 
 type Deps = Pick<
@@ -111,11 +108,11 @@ export class FlumeDiscordGateway {
 
   private pendingResolved = false
 
-  private invalidSessionTimer: FlumeTimerHandle | null = null
+  private readonly invalidSessionTimer: FlumeTimeout
 
-  private handshakeTimer: FlumeTimerHandle | null = null
+  private readonly handshakeTimer: FlumeTimeout
 
-  private forcedCloseFallbackTimer: FlumeTimerHandle | null = null
+  private readonly forcedCloseFallbackTimer: FlumeTimeout
 
   private teardownDone = false
 
@@ -125,6 +122,17 @@ export class FlumeDiscordGateway {
       source: "discord.gateway",
       handler: props.onLog,
       deps: props.deps,
+    })
+    this.invalidSessionTimer = new FlumeTimeout({
+      ...props,
+      log: this.log,
+      action: "session.invalid.timer",
+    })
+    this.handshakeTimer = new FlumeTimeout({ ...props, log: this.log, action: "handshake.timer" })
+    this.forcedCloseFallbackTimer = new FlumeTimeout({
+      ...props,
+      log: this.log,
+      action: "ws.close.fallback",
     })
   }
 
@@ -137,6 +145,8 @@ export class FlumeDiscordGateway {
   }
 
   connect(url?: string): Promise<FlumeConnectionError | null> {
+    if (this.pendingResolve || this.isStoppedFlag)
+      return Promise.resolve(new FlumeConnectionError("gateway is single-use"))
     const WS = this.props.deps.WebSocket
     if (!WS) {
       const error = new FlumeConnectionError("WebSocket runtime not available")
@@ -177,7 +187,7 @@ export class FlumeDiscordGateway {
       const listenerResult = attempt(() => {
         socket.addEventListener("message", (ev) => this.safeOnMessage(ev, socket))
         socket.addEventListener("close", (ev) => this.safeOnClose(ev))
-        socket.addEventListener("error", () => this.safeOnError())
+        socket.addEventListener("error", (ev) => this.safeOnError(ev))
       })
       if (listenerResult instanceof Error) {
         const error = new FlumeConnectionError(
@@ -251,11 +261,9 @@ export class FlumeDiscordGateway {
     this.clearHandshakeTimer()
 
     const timeoutMs = this.resolveHandshakeTimeoutMs()
-    const timerResult = attempt(() =>
-      this.props.deps.setTimeout(() => {
-        this.handshakeTimer = null
-        this.onHandshakeTimeout(timeoutMs)
-      }, timeoutMs),
+    const timerResult = this.handshakeTimer.schedule(
+      () => this.onHandshakeTimeout(timeoutMs),
+      timeoutMs,
     )
     if (timerResult instanceof Error) {
       const error = new FlumeConnectionError(
@@ -267,27 +275,14 @@ export class FlumeDiscordGateway {
         message: safeErrorMessage({ error }),
         error,
       })
-      this.handshakeTimer = null
       this.completeConnect(error)
       this.forceClose({ code: 4000, reason: "handshake timer failure" })
       return
     }
-    this.handshakeTimer = timerResult
   }
 
   private clearHandshakeTimer(): void {
-    if (this.handshakeTimer === null) return
-
-    const handle = this.handshakeTimer
-    const result = attempt(() => this.props.deps.clearTimeout(handle))
-    if (result instanceof Error) {
-      this.log.error({
-        action: "handshake.timer.clear.error",
-        message: safeErrorMessage({ error: result }),
-        error: result,
-      })
-    }
-    this.handshakeTimer = null
+    this.handshakeTimer.cancel()
   }
 
   /**
@@ -300,6 +295,7 @@ export class FlumeDiscordGateway {
 
     const error = new FlumeConnectionError(
       `handshake timeout after ${timeoutMs}ms (no READY/RESUMED)`,
+      { errorCode: "FLUME_TIMEOUT" },
     )
     this.log.error({ action: "handshake.timeout", message: safeErrorMessage({ error }), error })
     this.completeConnect(error)
@@ -313,20 +309,23 @@ export class FlumeDiscordGateway {
    * 4000 を使う (4009 は session 無効化コードと衝突する)
    */
   private forceClose(input: { ws?: WebSocket; code: number; reason: string }): void {
+    if (this.isStoppedFlag || this.teardownDone) return
+    const socket = input.ws ?? this.ws
+    if (socket === null) return
+    this.ws = null
     this.heartbeat?.stop()
-    this.closeSocket({ ws: input.ws ?? this.ws, code: input.code, reason: input.reason })
+    this.clearInvalidSessionTimer()
+    this.closeSocket({ ws: socket, code: input.code, reason: input.reason })
     this.armForcedCloseFallback()
   }
 
   private armForcedCloseFallback(): void {
     if (this.teardownDone) return
-    if (this.forcedCloseFallbackTimer !== null) return
+    if (this.forcedCloseFallbackTimer.isArmed) return
 
-    const timerResult = attempt(() =>
-      this.props.deps.setTimeout(() => {
-        this.forcedCloseFallbackTimer = null
-        this.synthesizeTeardown()
-      }, FORCED_CLOSE_FALLBACK_MS),
+    const timerResult = this.forcedCloseFallbackTimer.schedule(
+      () => this.synthesizeTeardown(),
+      FORCED_CLOSE_FALLBACK_MS,
     )
     if (timerResult instanceof Error) {
       this.log.error({
@@ -334,26 +333,13 @@ export class FlumeDiscordGateway {
         message: safeErrorMessage({ error: timerResult }),
         error: timerResult,
       })
-      this.forcedCloseFallbackTimer = null
       this.synthesizeTeardown()
       return
     }
-    this.forcedCloseFallbackTimer = timerResult
   }
 
   private clearForcedCloseFallbackTimer(): void {
-    if (this.forcedCloseFallbackTimer === null) return
-
-    const handle = this.forcedCloseFallbackTimer
-    const result = attempt(() => this.props.deps.clearTimeout(handle))
-    if (result instanceof Error) {
-      this.log.error({
-        action: "ws.close.fallback.clear.error",
-        message: safeErrorMessage({ error: result }),
-        error: result,
-      })
-    }
-    this.forcedCloseFallbackTimer = null
+    this.forcedCloseFallbackTimer.cancel()
   }
 
   /**
@@ -413,8 +399,8 @@ export class FlumeDiscordGateway {
     }
   }
 
-  private safeOnError(): void {
-    const r = attempt(() => this.onError())
+  private safeOnError(ev: Event): void {
+    const r = attempt(() => this.onError(ev))
     if (r instanceof Error) {
       this.log.error({
         action: "ws.error.threw",
@@ -425,7 +411,7 @@ export class FlumeDiscordGateway {
   }
 
   private onMessage(raw: string, socket: WebSocket): void {
-    if (this.isStoppedFlag) return
+    if (this.isStoppedFlag || this.teardownDone || socket !== this.ws) return
 
     const parsed = parseFlumeDiscordGatewayMessage(raw)
 
@@ -467,10 +453,16 @@ export class FlumeDiscordGateway {
     const d = isRecord(msg.d) ? msg.d : null
     const rawInterval = d === null ? null : d.heartbeat_interval
 
-    if (typeof rawInterval !== "number" || !Number.isFinite(rawInterval) || rawInterval <= 0) {
+    if (
+      typeof rawInterval !== "number" ||
+      !Number.isInteger(rawInterval) ||
+      rawInterval < 1 ||
+      rawInterval > 2_147_483_647
+    ) {
       // interval 0 のまま setInterval すると heartbeat flood になるためプロトコルエラー扱い
       const error = new FlumeConnectionError(
-        "malformed HELLO: heartbeat_interval is not a finite number > 0",
+        "malformed HELLO: heartbeat_interval must be an integer from 1 to 2147483647ms",
+        { errorCode: "FLUME_PROTOCOL_INVALID" },
       )
       this.log.error({
         action: "gateway.hello.invalid",
@@ -511,7 +503,7 @@ export class FlumeDiscordGateway {
     if (heartbeatError instanceof Error) {
       const error = new FlumeConnectionError(
         `heartbeat timer scheduling failed: ${safeErrorMessage({ error: heartbeatError })}`,
-        { cause: heartbeatError },
+        { cause: heartbeatError, errorCode: "FLUME_TIMER_FAILED" },
       )
       this.completeConnect(error)
       this.forceClose({ code: 4000, reason: "heartbeat timer failure" })
@@ -555,22 +547,16 @@ export class FlumeDiscordGateway {
     }
 
     this.clearInvalidSessionTimer()
-    const timerResult = attempt(() =>
-      this.props.deps.setTimeout(() => {
-        this.invalidSessionTimer = null
-        this.forceClose({ ws: socket, code: 4000, reason: "invalid session" })
-      }, delay),
-    )
+    const timerResult = this.invalidSessionTimer.schedule(() => {
+      this.forceClose({ ws: socket, code: 4000, reason: "invalid session" })
+    }, delay)
     if (timerResult instanceof Error) {
       this.log.error({
         action: "session.invalid.timer.error",
         message: safeErrorMessage({ error: timerResult }),
         error: timerResult,
       })
-      this.invalidSessionTimer = null
       this.forceClose({ ws: socket, code: 4000, reason: "invalid session timer failure" })
-    } else {
-      this.invalidSessionTimer = timerResult
     }
   }
 
@@ -624,6 +610,30 @@ export class FlumeDiscordGateway {
     this.teardownDone = true
 
     const terminal = TERMINAL_CLOSE_CODES.has(ev.code)
+    const error = new FlumeConnectionError(
+      `WebSocket closed ${this.hasConnected ? "after connection" : "before ready"} (code=${ev.code}, reason=${ev.reason || "none"})`,
+      {
+        code: ev.code,
+        cause: ev,
+        errorCode:
+          ev.code === 4004 || ev.code === 4014
+            ? "FLUME_AUTH_FAILED"
+            : terminal
+              ? "FLUME_PROTOCOL_INVALID"
+              : "FLUME_CONNECTION_FAILED",
+        context: {
+          operation: "discord.gateway",
+          phase: this.hasConnected ? "connected" : "handshake",
+        },
+      },
+    )
+    if (this.ws !== null && !this.isStoppedFlag)
+      this.log.error({
+        action: "ws.closed",
+        message: error.message,
+        error,
+        detail: { code: ev.code, reason: ev.reason, terminal },
+      })
     this.log.info({
       action: "ws.close",
       message: `code=${ev.code} reason=${ev.reason || "none"}${terminal ? " (terminal)" : ""}`,
@@ -653,32 +663,26 @@ export class FlumeDiscordGateway {
     }
 
     if (!this.pendingResolved) {
-      const error = new FlumeConnectionError(`WebSocket closed before ready (code=${ev.code})`, {
-        code: ev.code,
-      })
       this.completeConnect(error)
     }
   }
 
-  private onError(): void {
-    const error = new FlumeConnectionError("WebSocket connection error")
+  private onError(ev: Event): void {
+    if (this.isStoppedFlag || this.teardownDone) return
+    const error = webSocketError({
+      event: ev,
+      context: {
+        operation: "discord.gateway",
+        phase: this.hasConnected ? "connected" : "handshake",
+      },
+    })
     this.log.error({ action: "ws.error", message: safeErrorMessage({ error }), error })
     this.completeConnect(error)
+    this.forceClose({ code: 4000, reason: "connection error" })
   }
 
   private clearInvalidSessionTimer(): void {
-    if (this.invalidSessionTimer === null) return
-
-    const handle = this.invalidSessionTimer
-    const result = attempt(() => this.props.deps.clearTimeout(handle))
-    if (result instanceof Error) {
-      this.log.error({
-        action: "session.invalid.timer.clear.error",
-        message: safeErrorMessage({ error: result }),
-        error: result,
-      })
-    }
-    this.invalidSessionTimer = null
+    this.invalidSessionTimer.cancel()
   }
 
   private closeSocket(input: { ws: WebSocket | null; code?: number; reason?: string }): void {

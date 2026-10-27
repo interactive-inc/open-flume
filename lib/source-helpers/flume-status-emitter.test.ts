@@ -72,3 +72,23 @@ describe("FlumeStatusEmitter", () => {
     expect(() => emitter.set("connected")).not.toThrow()
   })
 })
+
+it("commits status before observing it and does not overwrite a reentrant transition", () => {
+  const seen: string[] = []
+  const holder: { emitter?: FlumeStatusEmitter } = {}
+  const log = new FlumeLogger({
+    source: "test",
+    deps: { now: () => 0 },
+    handler: (entry) => {
+      if (entry.action === "status" && entry.detail?.to === "connected") {
+        expect(holder.emitter?.value).toBe("connected")
+        holder.emitter?.set("disconnected", "observer stopped the source")
+      }
+    },
+  })
+  const emitter = new FlumeStatusEmitter({ log, onStatus: (status) => seen.push(status) })
+  holder.emitter = emitter
+  emitter.set("connected")
+  expect(emitter.value).toBe("disconnected")
+  expect(seen).toEqual(["disconnected"])
+})

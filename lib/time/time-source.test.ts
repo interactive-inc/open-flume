@@ -16,18 +16,36 @@ import type {
 const timerHandle = globalThis.setTimeout(() => {}, 0)
 globalThis.clearTimeout(timerHandle)
 
+function createTimers(now: () => number) {
+  const timers = new Map<ReturnType<typeof setTimeout>, { fn: () => void; due: number }>()
+  return {
+    setTimeout: vi.fn((fn: () => void, ms: number) => {
+      const handle = globalThis.setTimeout(() => {}, 0)
+      globalThis.clearTimeout(handle)
+      timers.set(handle, { fn, due: now() + ms })
+      return handle
+    }),
+    clearTimeout: vi.fn((handle: ReturnType<typeof setTimeout> | number) => {
+      timers.delete(handle as ReturnType<typeof setTimeout>)
+    }),
+    fire: () => {
+      const first = [...timers.entries()].sort((a, b) => a[1].due - b[1].due)[0]
+      if (!first) return
+      timers.delete(first[0])
+      first[1].fn()
+    },
+  }
+}
+
 function createMockDeps(startMs: number) {
   let nowMs = startMs
-  let lastCallback: (() => void) | null = null
+  const timers = createTimers(() => nowMs)
 
   const deps: FlumeRuntimeDeps = {
     fetch: vi.fn(),
     now: () => nowMs,
-    setTimeout: vi.fn((fn: () => void, _ms: number) => {
-      lastCallback = fn
-      return timerHandle
-    }),
-    clearTimeout: vi.fn(),
+    setTimeout: timers.setTimeout,
+    clearTimeout: timers.clearTimeout,
     setInterval: vi.fn(() => timerHandle),
     clearInterval: vi.fn(),
     random: () => 0.5,
@@ -39,7 +57,7 @@ function createMockDeps(startMs: number) {
     setNow: (ms: number) => {
       nowMs = ms
     },
-    fire: () => lastCallback?.(),
+    fire: timers.fire,
   }
 }
 
@@ -68,6 +86,29 @@ function tickFiredAt(event: FlumeEvent): unknown {
 }
 
 describe("FlumeTimeSource", () => {
+  it("preserves a timer failure when a running scheduler halts", async () => {
+    const test = createMockDeps(0)
+    const logs: FlumeLog[] = []
+    const source = new FlumeTimeSource({ cron: "* * * * *" })
+    expect(
+      await source.start(createCtx({ deps: test.deps, onLog: (log) => logs.push(log) })),
+    ).toBeNull()
+    const failure = new Error("timer unavailable")
+    test.deps.setTimeout = () => {
+      throw failure
+    }
+    test.setNow(60_000)
+    test.fire()
+    expect(source.status()).toBe("disconnected")
+    for (const action of ["scheduler.halted", "time.scheduler.halted"]) {
+      expect(logs.find((log) => log.action === action)).toMatchObject({
+        errorCode: "FLUME_TIMER_FAILED",
+        error: failure,
+      })
+    }
+    await source.stop()
+  })
+
   it("cancels a pending state load and never starts a scheduler after abort", async () => {
     const test = createMockDeps(0)
     const loaded = Promise.withResolvers<FlumeTimeSourceState | null>()
@@ -103,7 +144,8 @@ describe("FlumeTimeSource", () => {
     await opening
     await flushPromises()
     expect(source.status()).toBe("disconnected")
-    expect(test.deps.setTimeout).not.toHaveBeenCalled()
+    expect(test.deps.setTimeout).toHaveBeenCalledTimes(1)
+    expect(test.deps.clearTimeout).toHaveBeenCalled()
     test.setNow(60_000)
     test.fire()
     expect(save).not.toHaveBeenCalled()
@@ -120,6 +162,7 @@ describe("FlumeTimeSource", () => {
     const source = new FlumeTimeSource({
       cron: "* * * * *",
       statePersister: { load: async () => null, save },
+      stateTimeoutMs: 300_000,
     })
     await source.start(createCtx({ deps: test.deps }))
     test.setNow(60_000)
@@ -154,6 +197,7 @@ describe("FlumeTimeSource", () => {
     const source = new FlumeTimeSource({
       cron: "* * * * *",
       statePersister: { load: async () => null, save },
+      stateTimeoutMs: 300_000,
     })
     await source.start(createCtx({ deps: test.deps, onLog: (log) => logs.push(log) }))
     test.setNow(60_000)
@@ -161,7 +205,10 @@ describe("FlumeTimeSource", () => {
     test.setNow(120_000)
     test.fire()
     await source.stop()
-    expect(save).toHaveBeenLastCalledWith({ lastFiredAt: 120_000 })
+    expect(save).toHaveBeenLastCalledWith(
+      { lastFiredAt: 120_000 },
+      { signal: expect.any(AbortSignal) },
+    )
     expect(logs.filter((log) => log.action === "time.state.save.error")).toHaveLength(1)
   })
 
@@ -267,6 +314,10 @@ describe("FlumeTimeSource", () => {
     )
 
     expect(result).toBeInstanceOf(FlumeStartError)
+    expect(result).toMatchObject({
+      errorCode: "FLUME_CRON_INVALID",
+      cause: { name: "FlumeParseError" },
+    })
     expect(statuses).toEqual(["connecting", "disconnected"])
   })
 
@@ -405,7 +456,7 @@ describe("FlumeTimeSource", () => {
     // 起動処理の途中 (scheduler start と catchup の間) で時計が分境界 600_000 を跨ぐ状況:
     // 最初の safeNow (= startedAt) だけ 570_000 を返し、以降は 630_000 を返す
     let nowCallCount = 0
-    let lastCallback: (() => void) | null = null
+    const timers = createTimers(() => 630_000)
 
     const deps: FlumeRuntimeDeps = {
       fetch: vi.fn(),
@@ -413,17 +464,14 @@ describe("FlumeTimeSource", () => {
         nowCallCount += 1
         return nowCallCount === 1 ? 570_000 : 630_000
       },
-      setTimeout: vi.fn((fn: () => void, _ms: number) => {
-        lastCallback = fn
-        return timerHandle
-      }),
-      clearTimeout: vi.fn(),
+      setTimeout: timers.setTimeout,
+      clearTimeout: timers.clearTimeout,
       setInterval: vi.fn(() => timerHandle),
       clearInterval: vi.fn(),
       random: () => 0.5,
       WebSocket: globalThis.WebSocket,
     }
-    const fire = () => lastCallback?.()
+    const fire = timers.fire
 
     const events: FlumeEvent[] = []
     const persister = {

@@ -249,23 +249,28 @@ describe("Flume", () => {
     )
   })
 
-  it("threads the host signal into source ctx so sources can listen for abort natively", async () => {
+  it("forwards host cancellation into the owned source signal", async () => {
     const source = new MockSource({ name: "discord" })
     const controller = new AbortController()
     const flume = new Flume({ sources: [source], onEvent: vi.fn(), signal: controller.signal })
 
     const result = await flume.open()
     expect(result).not.toBeInstanceOf(Error)
-    expect(source.capturedSignal).toBe(controller.signal)
+    expect(source.capturedSignal?.aborted).toBe(false)
+    controller.abort()
+    if (result instanceof FlumeRunning) await result.close()
+    expect(source.capturedSignal?.aborted).toBe(true)
   })
 
-  it("passes undefined as ctx.signal when the host did not supply one", async () => {
+  it("gives sources an owned signal even without a host signal", async () => {
     const source = new MockSource({ name: "discord" })
     const flume = new Flume({ sources: [source], onEvent: vi.fn() })
 
     const result = await flume.open()
     expect(result).not.toBeInstanceOf(Error)
-    expect(source.capturedSignal).toBeUndefined()
+    expect(source.capturedSignal?.aborted).toBe(false)
+    if (result instanceof FlumeRunning) await result.close()
+    expect(source.capturedSignal?.aborted).toBe(true)
   })
 
   it("refuses start if signal already aborted", async () => {
@@ -423,6 +428,7 @@ describe("FlumeRunning", () => {
 
     expect(errors).toHaveLength(1)
     expect(errors[0]?.source).toBe("slack")
+    expect(errors[0]?.errorCode).toBe("FLUME_STOP_FAILED")
     expect(errors[0]?.error.message).toBe("boom")
   })
 

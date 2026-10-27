@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest"
 import { FlumeGitHubPoller } from "@/github/github-poller"
+import { FlumeHttpError } from "@/errors/http-error"
 import type { FlumeLog, FlumeRuntimeDeps } from "@/types"
 
 function makeNotification(id: string, updatedAt: string) {
@@ -67,6 +68,63 @@ function flushPromises() {
 }
 
 describe("FlumeGitHubPoller", () => {
+  it.each([200, 401, 403, 503])(
+    "retains HTTP %s and request identity when a response fails",
+    async (status) => {
+      const test = createTestDeps()
+      test.mockFetch.mockResolvedValueOnce(
+        new Response("invalid JSON", {
+          status,
+          headers: { "X-GitHub-Request-Id": "test-request" },
+        }),
+      )
+      const poller = new FlumeGitHubPoller({
+        token: "test-token",
+        interval: 60,
+        deps: test.deps,
+        onConnected: vi.fn(),
+        onDisconnected: vi.fn(),
+        onNotifications: vi.fn(),
+      })
+      const result = await poller.start()
+      expect(result).toMatchObject({
+        status,
+        context: { httpStatus: status, requestId: "test-request", page: 1 },
+        errorCode:
+          status === 200
+            ? "FLUME_PARSE_FAILED"
+            : status === 503
+              ? "FLUME_HTTP_FAILED"
+              : "FLUME_AUTH_FAILED",
+      })
+      poller.stop()
+    },
+  )
+
+  it("preserves the original body failure while classifying a 403", async () => {
+    const test = createTestDeps()
+    const cause = new Error("body interrupted")
+    test.mockFetch.mockResolvedValueOnce(
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.error(cause)
+          },
+        }),
+        { status: 403 },
+      ),
+    )
+    const poller = new FlumeGitHubPoller({
+      token: "test-token",
+      interval: 60,
+      deps: test.deps,
+      onConnected: vi.fn(),
+      onDisconnected: vi.fn(),
+      onNotifications: vi.fn(),
+    })
+    expect(await poller.start()).toMatchObject({ status: 403, cause: { cause } })
+    poller.stop()
+  })
   it("start() does initial poll and calls onConnected", async () => {
     const test = createTestDeps()
     const onConnected = vi.fn()
@@ -235,7 +293,7 @@ describe("FlumeGitHubPoller", () => {
     cb!()
     await flushPromises()
 
-    expect(onDisconnected).toHaveBeenCalledWith("network error")
+    expect(onDisconnected).toHaveBeenCalledWith("network failure")
   })
 
   it("stop() clears interval and sets stopped", async () => {
@@ -472,8 +530,9 @@ describe("FlumeGitHubPoller", () => {
   })
 
   it("does not start the interval when rate-limit timer scheduling fails", async () => {
-    const mockSetTimeout = vi.fn(() => {
-      throw new Error("timer unavailable")
+    const mockSetTimeout = vi.fn((_fn: () => void, ms: number) => {
+      if (ms === 60_000) throw new Error("timer unavailable")
+      return timerHandle
     })
     const test = createTestDeps({ setTimeout: mockSetTimeout })
     const onDisconnected = vi.fn()
@@ -746,5 +805,176 @@ describe("FlumeGitHubPoller", () => {
 
     // ヘッダ無しは現在の実効値を維持する (再スケジュールなし)
     expect(test.mockSetInterval).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe("notification transaction regressions", () => {
+  it("keeps HTTP metadata and the original failure when adding request context", async () => {
+    const test = createTestDeps()
+    const failure = new FlumeHttpError({
+      message: "request rejected",
+      status: 503,
+      code: "service_unavailable",
+      retryAfterMs: 1000,
+    })
+    test.mockFetch.mockRejectedValueOnce(failure)
+    const poller = new FlumeGitHubPoller({
+      token: "test-token",
+      interval: 60,
+      deps: test.deps,
+      onConnected: vi.fn(),
+      onDisconnected: vi.fn(),
+      onNotifications: vi.fn(),
+    })
+    expect(await poller.start()).toMatchObject({
+      status: 503,
+      code: "service_unavailable",
+      retryAfterMs: 1000,
+      cause: failure,
+      errorCode: "FLUME_HTTP_FAILED",
+      context: { operation: "github.notifications", phase: "request", page: 1 },
+    })
+    poller.stop()
+  })
+
+  it.each([
+    "https://example.com/notifications?page=2",
+    "https://api.github.com/other?page=2",
+    "http://api.github.com/notifications?page=2",
+    "https://user:secret@api.github.com/notifications?page=2",
+  ])("rejects an untrusted next URL without forwarding the token: %s", async (next) => {
+    const test = createTestDeps()
+    test.mockFetch.mockResolvedValueOnce(
+      makeJsonResponse([], 200, { Link: `<${next}>; rel="next"` }),
+    )
+    const poller = new FlumeGitHubPoller({
+      token: "test-token",
+      interval: 60,
+      deps: test.deps,
+      onConnected: vi.fn(),
+      onDisconnected: vi.fn(),
+      onNotifications: vi.fn(),
+    })
+    expect(await poller.start()).toBeInstanceOf(Error)
+    expect(test.mockFetch).toHaveBeenCalledTimes(1)
+    expect(test.mockFetch.mock.calls[0]?.[1]?.redirect).toBe("error")
+    poller.stop()
+  })
+
+  it.each(["{broken", "{}", '[{"id":"incomplete"}]'])(
+    "rejects malformed bootstrap bodies: %s",
+    async (body) => {
+      const test = createTestDeps()
+      test.mockFetch.mockResolvedValueOnce(new Response(body))
+      const connected = vi.fn()
+      const poller = new FlumeGitHubPoller({
+        token: "test-token",
+        interval: 60,
+        deps: test.deps,
+        onConnected: connected,
+        onDisconnected: vi.fn(),
+        onNotifications: vi.fn(),
+      })
+      expect(await poller.start()).toBeInstanceOf(Error)
+      expect(connected).not.toHaveBeenCalled()
+      poller.stop()
+    },
+  )
+
+  it("does not commit a partial page or validator after schema failure", async () => {
+    const test = createTestDeps()
+    const delivered = vi.fn()
+    test.mockFetch.mockResolvedValueOnce(makeJsonResponse([], 200, { ETag: '"previous"' }))
+    test.mockFetch.mockResolvedValueOnce(
+      makeJsonResponse([makeNotification("new", "2026-01-01T00:00:00Z")], 200, {
+        ETag: '"partial"',
+        Link: '<https://api.github.com/notifications?page=2>; rel="next"',
+      }),
+    )
+    test.mockFetch.mockResolvedValueOnce(makeJsonResponse([{ id: "invalid" }]))
+    test.mockFetch.mockResolvedValueOnce(
+      makeJsonResponse([makeNotification("new", "2026-01-01T00:00:00Z")]),
+    )
+    const poller = new FlumeGitHubPoller({
+      token: "test-token",
+      interval: 60,
+      deps: test.deps,
+      onConnected: vi.fn(),
+      onDisconnected: vi.fn(),
+      onNotifications: delivered,
+    })
+    await poller.start()
+    test.getIntervalCallback()?.()
+    await flushPromises()
+    expect(delivered).not.toHaveBeenCalled()
+    test.getIntervalCallback()?.()
+    await flushPromises()
+    expect(test.mockFetch.mock.calls[3]?.[1]?.headers).toMatchObject({
+      "If-None-Match": '"previous"',
+    })
+    expect(delivered.mock.calls[0]?.[0]).toHaveLength(1)
+    poller.stop()
+  })
+
+  it.each(["fetch", "body"])("bounds a hung %s and aborts the request", async (phase) => {
+    const timers: Array<() => void> = []
+    const test = createTestDeps({
+      setTimeout: (fn) => {
+        timers.push(fn)
+        return timers.length
+      },
+    })
+    if (phase === "fetch") test.mockFetch.mockImplementation(() => new Promise(() => {}))
+    else test.mockFetch.mockResolvedValue(new Response(new ReadableStream()))
+    const poller = new FlumeGitHubPoller({
+      token: "test-token",
+      interval: 60,
+      deps: test.deps,
+      onConnected: vi.fn(),
+      onDisconnected: vi.fn(),
+      onNotifications: vi.fn(),
+    })
+    const starting = poller.start()
+    await flushPromises()
+    timers[0]?.()
+    const result = await starting
+    expect(result).toMatchObject({
+      errorCode: "FLUME_TIMEOUT",
+      context: {
+        operation: "github.notifications",
+        page: 1,
+        phase: phase === "fetch" ? "request" : "response body",
+      },
+    })
+    expect(test.mockFetch.mock.calls[0]?.[1]?.signal?.aborted).toBe(true)
+    poller.stop()
+  })
+
+  it("counts malformed bodies as failures and reports recovery", async () => {
+    const test = createTestDeps()
+    test.mockFetch.mockResolvedValueOnce(makeJsonResponse([]))
+    for (let index = 0; index < 3; index++)
+      test.mockFetch.mockResolvedValueOnce(new Response("bad JSON"))
+    test.mockFetch.mockResolvedValueOnce(new Response(null, { status: 304 }))
+    const connected = vi.fn()
+    const disconnected = vi.fn()
+    const poller = new FlumeGitHubPoller({
+      token: "test-token",
+      interval: 60,
+      deps: test.deps,
+      onConnected: connected,
+      onDisconnected: disconnected,
+      onNotifications: vi.fn(),
+    })
+    await poller.start()
+    for (let index = 0; index < 3; index++) {
+      test.getIntervalCallback()?.()
+      await flushPromises()
+    }
+    expect(disconnected).toHaveBeenCalledTimes(1)
+    test.getIntervalCallback()?.()
+    await flushPromises()
+    expect(connected).toHaveBeenCalledTimes(2)
+    poller.stop()
   })
 })

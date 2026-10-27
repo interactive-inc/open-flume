@@ -11,18 +11,24 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [22, 24, 26]
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: 1.3.14
       - run: bun install --frozen-lockfile
       - name: Typecheck
         run: bunx tsc --noEmit
-      - name: Unit tests
+      - name: Unit and local wire tests
         run: bunx vitest run
       - name: Build dist
         run: bun run build
       - name: Validate published types
         run: |
-          bunx tsc --noEmit --strict --skipLibCheck dist/index.d.ts dist/discord.d.ts dist/slack.d.ts dist/github.d.ts
+          bunx tsc --noEmit --strict --skipLibCheck dist/index.d.ts dist/discord.d.ts dist/slack.d.ts dist/github.d.ts dist/time.d.ts

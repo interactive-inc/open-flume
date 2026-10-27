@@ -2,6 +2,7 @@ import type {
   FlumeConfluenceItem,
   FlumeConfluenceItemHandler,
   FlumeErrorHandler,
+  FlumeObservation,
   FlumeReconnectOptions,
   FlumeRuntimeDeps,
   FlumeStreamHandler,
@@ -24,46 +25,30 @@ type Props = {
   onEvent?: FlumeConfluenceItemHandler
   /** error レベル log だけ (全 Flume 共通) */
   onError?: FlumeErrorHandler
+  callbackBuffer?: number
   deps?: FlumeRuntimeDeps
   reconnect?: boolean | FlumeReconnectOptions
 }
 
-type PendingOpen = {
+type Opening = {
   controller: AbortController
   done: Promise<void>
   finish: () => void
 }
 
+type Group = {
+  running: FlumeRunning | null
+  opening: Opening | null
+  closing: Promise<void> | null
+}
+
 /**
- * 複数の `Flume` を束ねて動的に増減させる上位レイヤー。各 Flume は immutable のまま、
- * `add()` で新しいグループを起動し `remove()` で個別に停止する。全グループの firehose は
- * `onEvent` 1 本に合流し、各 item には発信元グループ id が `groupId` としてスタンプされる。
- * Flume 本体の FSM / rollback / reconnect はそのまま再利用される。
- *
- * `replace(id, sources)` は同じ id のグループを差し替える。新グループを先に起動し、
- * 起動成功時にのみ旧グループを停止するので連続稼働を維持できる (token rotation 用途)。
- * 起動失敗時は旧グループはそのまま走り続ける。
- * 注意: 失敗した replace / add に渡した source インスタンスは consumed になるため、
- * リトライには新しいインスタンスを構築する必要がある。
- *
- * `closeAll()` は終端操作。以後の `add()` / `replace()` は拒否され、closeAll と並行して
- * 起動中だったグループも abort して完了を待つ (シャットダウン後に誰にも止められない
- * グループが残らない)。
- *
- * throw しない流儀に従い `add()` / `replace()` は `Error | null` を返す
+ * グループごとに起動・稼働・停止を所有する。replace は新しい接続が成功した時だけ交換する。
+ * remove は起動中の接続も中断して停止を待つ。closeAll は終端操作。
  */
 export class FlumeConfluence {
-  private readonly running = new Map<string, FlumeRunning>()
-
-  /** open() を await 中でまだ Map に commit されていないグループの id (add 重複と remove 追跡用) */
-  private readonly pendingIds = new Set<string>()
-
-  private readonly removedWhilePending = new Set<string>()
-
-  private readonly pendingOpens = new Set<PendingOpen>()
-
-  private isClosedFlag = false
-
+  private readonly groups = new Map<string, Group>()
+  private closePromise: Promise<void> | null = null
   private readonly deps: FlumeRuntimeDeps
 
   constructor(private readonly props: Props = {}) {
@@ -71,135 +56,112 @@ export class FlumeConfluence {
   }
 
   get isClosed(): boolean {
-    return this.isClosedFlag
+    return this.closePromise !== null
   }
 
-  /** sources を 1 グループとして起動。id 重複や起動失敗は `Error` で返す (throw しない) */
   async add(id: string, sources: ReadonlyArray<FlumeSource>): Promise<Error | null> {
-    if (this.isClosedFlag) {
-      return new FlumeStartError(`FlumeConfluence: already closed: ${id}`)
-    }
+    if (this.isClosed) return new FlumeStartError(`FlumeConfluence: already closed: ${id}`)
+    if (this.groups.has(id)) return new FlumeStartError(`FlumeConfluence: id already added: ${id}`)
 
-    if (this.running.has(id) || this.pendingIds.has(id)) {
-      return new FlumeStartError(`FlumeConfluence: id already added: ${id}`)
-    }
-
-    this.pendingIds.add(id)
-    const pending = this.createPendingOpen()
-    this.pendingOpens.add(pending)
-
-    try {
-      const running = await this.openGroup(id, sources, pending.controller, undefined)
-      if (running instanceof Error) return running
-
-      // open() を await している間に closeAll / remove が走った可能性がある (TOCTOU)。
-      // 後勝ちで Map を上書きすると前の FlumeRunning が宙に浮いて close されないので、
-      // 開き直した方をその場で閉じて弾く
-      if (this.isClosedFlag) {
-        await running.close()
-        return new FlumeStartError(`FlumeConfluence: closed during add: ${id}`)
-      }
-
-      if (this.removedWhilePending.has(id)) {
-        await running.close()
-        return new FlumeStartError(`FlumeConfluence: removed during add: ${id}`)
-      }
-
-      if (this.running.has(id)) {
-        await running.close()
-        return new FlumeStartError(`FlumeConfluence: id already added: ${id}`)
-      }
-
-      this.running.set(id, running)
-      return null
-    } finally {
-      this.pendingIds.delete(id)
-      this.removedWhilePending.delete(id)
-      this.pendingOpens.delete(pending)
-      pending.finish()
-    }
+    const group: Group = { running: null, opening: null, closing: null }
+    this.groups.set(id, group)
+    const result = await this.startGroup(id, group, sources)
+    if (result instanceof Error && !group.closing) this.groups.delete(id)
+    return result
   }
 
-  /**
-   * 既存グループを新しい sources で差し替える。新グループを先に起動し、成功時のみ旧を停止する。
-   * 起動失敗 / replaceTimeoutMs (既定 10s) 経過時は新グループを破棄し旧を走らせたまま返す。
-   * 旧グループが存在しない場合は `Error` を返す (replace は add と違ってグループの存在を前提とする)
-   */
+  /** 起動失敗時は旧接続を維持する。同じグループの並行 replace は拒否する。 */
   async replace(
     id: string,
     sources: ReadonlyArray<FlumeSource>,
     options?: { readonly replaceTimeoutMs?: number },
   ): Promise<Error | null> {
-    if (this.isClosedFlag) {
-      return new FlumeStartError(`FlumeConfluence: already closed: ${id}`)
-    }
-
-    const previous = this.running.get(id)
-    if (!previous) {
+    if (this.isClosed) return new FlumeStartError(`FlumeConfluence: already closed: ${id}`)
+    const group = this.groups.get(id)
+    if (!group?.running || group.closing)
       return new FlumeStartError(`FlumeConfluence: id not running: ${id}`)
-    }
+    if (group.opening)
+      return new FlumeStartError(`FlumeConfluence: replacement already pending: ${id}`)
 
-    const pending = this.createPendingOpen()
-    this.pendingOpens.add(pending)
-
-    try {
-      const timeoutMs = options?.replaceTimeoutMs ?? DEFAULT_REPLACE_TIMEOUT_MS
-      const next = await this.openGroup(id, sources, pending.controller, timeoutMs)
-      if (next instanceof Error) return next
-
-      if (this.isClosedFlag) {
-        await next.close()
-        return new FlumeStartError(`FlumeConfluence: closed during replace: ${id}`)
-      }
-
-      if (this.running.get(id) !== previous) {
-        await next.close()
-        return new FlumeStartError(`FlumeConfluence: ${id} concurrently mutated during replace`)
-      }
-
-      this.running.set(id, next)
-      await previous.close()
-      return null
-    } finally {
-      this.pendingOpens.delete(pending)
-      pending.finish()
-    }
+    const requested = options?.replaceTimeoutMs
+    const timeoutMs =
+      typeof requested === "number" && Number.isFinite(requested) && requested > 0
+        ? Math.min(requested, 2_147_483_647)
+        : DEFAULT_REPLACE_TIMEOUT_MS
+    return this.startGroup(id, group, sources, timeoutMs)
   }
 
-  /**
-   * 指定グループだけ close。他グループは無停止。未知の id は no-op。
-   * 起動中 (add が open を await 中) の id は commit 時点で破棄されるよう予約する
-   */
-  async remove(id: string): Promise<void> {
-    if (this.pendingIds.has(id)) {
-      this.removedWhilePending.add(id)
-    }
+  remove(id: string): Promise<void> {
+    const group = this.groups.get(id)
+    if (!group) return Promise.resolve()
+    if (group.closing) return group.closing
 
-    const running = this.running.get(id)
-    if (!running) return
-
-    this.running.delete(id)
-    await running.close()
+    // user callback が remove を再入しても同じ完了を待てるよう、副作用より先に登録する。
+    group.closing = Promise.resolve().then(async () => {
+      const opening = group.opening
+      if (opening) attempt(() => opening.controller.abort())
+      await Promise.all([opening?.done, group.running?.close()])
+      this.groups.delete(id)
+    })
+    return group.closing
   }
 
-  /** 終端操作。全グループを close し、以後の add / replace を拒否する */
-  async closeAll(): Promise<void> {
-    this.isClosedFlag = true
-
-    const pending = [...this.pendingOpens]
-    for (const operation of pending) attempt(() => operation.controller.abort())
-    await Promise.allSettled(pending.map((operation) => operation.done))
-
-    const ids = [...this.running.keys()]
-    await Promise.all(ids.map((id) => this.remove(id)))
+  closeAll(): Promise<void> {
+    if (!this.closePromise) {
+      this.closePromise = Promise.resolve().then(async () => {
+        await Promise.all([...this.groups.keys()].map((id) => this.remove(id)))
+      })
+    }
+    return this.closePromise
   }
 
   has(id: string): boolean {
-    return this.running.has(id)
+    const group = this.groups.get(id)
+    return group?.running !== null && group !== undefined && group.closing === null
   }
 
   ids(): ReadonlyArray<string> {
-    return [...this.running.keys()]
+    return [...this.groups.keys()].filter((id) => this.has(id))
+  }
+
+  /** 現在の接続世代を観測する。取得済みハンドルは replace / remove 後も利用できる。 */
+  observe(id: string): FlumeObservation | undefined {
+    const running = this.groups.get(id)?.running
+    if (!running) return undefined
+    return Object.freeze({
+      deliveryStatus: () => running.deliveryStatus(),
+      diagnostics: () => running.diagnostics(),
+    })
+  }
+
+  private async startGroup(
+    id: string,
+    group: Group,
+    sources: ReadonlyArray<FlumeSource>,
+    timeoutMs?: number,
+  ): Promise<Error | null> {
+    const completion = Promise.withResolvers<void>()
+    const opening: Opening = {
+      controller: new AbortController(),
+      done: completion.promise,
+      finish: completion.resolve,
+    }
+    group.opening = opening
+    const result = await attempt(async () => {
+      const next = await this.openGroup(id, sources, opening.controller, timeoutMs)
+      if (next instanceof Error) return next
+      if (this.isClosed || group.closing) {
+        await next.close()
+        return new FlumeStartError(`FlumeConfluence: removed during open: ${id}`)
+      }
+      const previous = group.running
+      group.running = next
+      await previous?.close()
+      return null
+    })
+    group.opening = null
+    opening.finish()
+    return result
   }
 
   /**
@@ -214,19 +176,23 @@ export class FlumeConfluence {
     controller: AbortController,
     timeoutMs: number | undefined,
   ): Promise<FlumeRunning | Error> {
-    const timeoutState = { isArmed: timeoutMs !== undefined }
+    const timeoutState = { isArmed: timeoutMs !== undefined, expired: false }
     const timeoutResult =
       timeoutMs === undefined
         ? null
         : attempt(() =>
             this.deps.setTimeout(() => {
-              if (timeoutState.isArmed) controller.abort()
+              if (timeoutState.isArmed && !controller.signal.aborted) {
+                timeoutState.expired = true
+                controller.abort()
+              }
             }, timeoutMs),
           )
     if (timeoutResult instanceof Error) {
       attempt(() => controller.abort())
       return new FlumeStartError(`FlumeConfluence: failed to schedule timeout for "${id}"`, {
         cause: timeoutResult,
+        errorCode: "FLUME_TIMER_FAILED",
       })
     }
 
@@ -234,6 +200,7 @@ export class FlumeConfluence {
       sources,
       onEvent: this.wrapOnEvent(id),
       onError: this.wrapOnError(id),
+      callbackBuffer: this.props.callbackBuffer,
       deps: this.props.deps,
       reconnect: this.props.reconnect,
       signal: controller.signal,
@@ -246,25 +213,16 @@ export class FlumeConfluence {
     }
 
     if (result instanceof Error) {
-      if (controller.signal.aborted && timeoutMs !== undefined) {
+      if (timeoutState.expired) {
         return new FlumeStartError(
           `FlumeConfluence: open of "${id}" timed out after ${timeoutMs}ms`,
-          { cause: result },
+          { cause: result, errorCode: "FLUME_TIMEOUT" },
         )
       }
       return result
     }
 
     return result
-  }
-
-  private createPendingOpen(): PendingOpen {
-    const completion = Promise.withResolvers<void>()
-    return {
-      controller: new AbortController(),
-      done: completion.promise,
-      finish: completion.resolve,
-    }
   }
 
   private wrapOnEvent(id: string): FlumeStreamHandler | undefined {

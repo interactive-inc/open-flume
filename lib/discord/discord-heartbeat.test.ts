@@ -60,6 +60,37 @@ describe("FlumeDiscordHeartbeat", () => {
     expect(ctx.mockSetInterval).not.toHaveBeenCalled()
   })
 
+  it.each([0.5, 2_147_483_648, Infinity, NaN, 0, -1])(
+    "rejects unsafe heartbeat interval %s",
+    (interval) => {
+      const ctx = createHeartbeat()
+      expect(ctx.heartbeat.start(interval)).toBeInstanceOf(Error)
+      expect(ctx.mockSetTimeout).not.toHaveBeenCalled()
+      expect(ctx.mockSetInterval).not.toHaveBeenCalled()
+    },
+  )
+
+  it("answers a server heartbeat request even while the periodic ACK is pending", () => {
+    const ctx = createHeartbeat(0)
+    ctx.heartbeat.start(5000)
+    ctx.fireInitial()
+    ctx.heartbeat.request()
+    expect(ctx.onSend).toHaveBeenCalledTimes(2)
+    expect(ctx.onZombie).not.toHaveBeenCalled()
+    ctx.heartbeat.ack()
+    ctx.tick()
+    expect(ctx.onSend).toHaveBeenCalledTimes(3)
+    ctx.heartbeat.stop()
+  })
+
+  it("does not send requested heartbeats after stop", () => {
+    const ctx = createHeartbeat(0)
+    ctx.heartbeat.start(5000)
+    ctx.heartbeat.stop()
+    ctx.heartbeat.request()
+    expect(ctx.onSend).not.toHaveBeenCalled()
+  })
+
   it("returns an error when the initial heartbeat timer cannot be scheduled", () => {
     const ctx = createHeartbeat()
     ctx.mockSetTimeout.mockImplementationOnce(() => {
@@ -113,14 +144,16 @@ describe("FlumeDiscordHeartbeat", () => {
     expect(ctx.onSend).toHaveBeenCalledTimes(2)
   })
 
-  it("marks a server-requested heartbeat as awaiting an ACK", () => {
+  it("does not shorten the periodic ACK deadline when answering a server request", () => {
     const ctx = createHeartbeat(0)
 
     ctx.heartbeat.start(5000)
     ctx.heartbeat.request()
     ctx.fireInitial()
 
-    expect(ctx.onSend).toHaveBeenCalledOnce()
+    expect(ctx.onSend).toHaveBeenCalledTimes(2)
+    expect(ctx.onZombie).not.toHaveBeenCalled()
+    ctx.tick()
     expect(ctx.onZombie).toHaveBeenCalledOnce()
   })
 

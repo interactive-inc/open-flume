@@ -1,10 +1,10 @@
 import type { FlumeCron } from "@/time/parse-cron"
-import type { FlumeLogHandler, FlumeRuntimeDeps, FlumeTimerHandle } from "@/types"
+import type { FlumeLogHandler, FlumeRuntimeDeps } from "@/types"
 import { FlumeLogger } from "@/logger"
+import { FlumeTimeout } from "@/utils/timeout"
 import { FlumeParseError } from "@/errors/parse-error"
 import { flumeCronNext } from "@/time/cron-next"
 import { isDstDuplicateFire } from "@/time/is-dst-duplicate-fire"
-import { attempt } from "@/utils/attempt"
 import { safeErrorMessage } from "@/utils/safe-error-message"
 import { safeInvokeCallback } from "@/utils/safe-invoke-callback"
 import { safeNow } from "@/utils/safe-now"
@@ -22,7 +22,7 @@ type Props = {
   cron: FlumeCron
   onTick: (firedAt: number) => void
   /** cron / timer エラーで恒久停止したとき (dead-but-green 防止)。stop() 起因では呼ばれない */
-  onHalt?: () => void
+  onHalt?: (error: Error) => void
   onLog?: FlumeLogHandler
   deps: Deps
 }
@@ -38,7 +38,7 @@ export class FlumeTimeScheduler {
 
   private isStoppedFlag = false
 
-  private timer: FlumeTimerHandle | null = null
+  private readonly timer: FlumeTimeout
 
   private target = 0
 
@@ -50,6 +50,7 @@ export class FlumeTimeScheduler {
       handler: props.onLog,
       deps: props.deps,
     })
+    this.timer = new FlumeTimeout({ deps: props.deps, log: this.log, action: "scheduler.timer" })
   }
 
   get isStopped(): boolean {
@@ -91,23 +92,20 @@ export class FlumeTimeScheduler {
     const delay = Math.max(0, this.target - safeNow({ deps: this.props.deps }))
     const capped = Math.min(delay, MAX_TIMEOUT_MS)
 
-    const result = attempt(() => this.props.deps.setTimeout(() => this.onWake(), capped))
+    const result = this.timer.schedule(() => this.onWake(), capped)
     if (result instanceof Error) {
       this.log.error({
         action: "scheduler.arm.error",
         message: safeErrorMessage({ error: result }),
         error: result,
       })
-      this.timer = null
       this.isStoppedFlag = true
       return result
     }
-    this.timer = result
     return null
   }
 
   private onWake(): void {
-    this.timer = null
     if (this.isStoppedFlag) return
 
     const remaining = this.target - safeNow({ deps: this.props.deps })
@@ -178,13 +176,18 @@ export class FlumeTimeScheduler {
   private halt(error: Error): void {
     this.isStoppedFlag = true
     this.clearTimer()
-    this.log.error({ action: "scheduler.halted", message: error.message, error })
+    this.log.error({
+      action: "scheduler.halted",
+      message: error.message,
+      error,
+      errorCode: error instanceof FlumeParseError ? "FLUME_CRON_INVALID" : "FLUME_TIMER_FAILED",
+    })
 
     const onHalt = this.props.onHalt
     if (!onHalt) return
 
     safeInvokeCallback({
-      fn: () => onHalt(),
+      fn: () => onHalt(error),
       onError: (haltError) => {
         this.log.error({
           action: "scheduler.halt.error",
@@ -217,17 +220,6 @@ export class FlumeTimeScheduler {
   }
 
   private clearTimer(): void {
-    if (this.timer === null) return
-
-    const handle = this.timer
-    const result = attempt(() => this.props.deps.clearTimeout(handle))
-    if (result instanceof Error) {
-      this.log.error({
-        action: "scheduler.timer.clear.error",
-        message: safeErrorMessage({ error: result }),
-        error: result,
-      })
-    }
-    this.timer = null
+    this.timer.cancel()
   }
 }

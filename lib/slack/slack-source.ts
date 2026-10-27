@@ -6,6 +6,7 @@ import { scheduleFlumeReconnect } from "@/schedule-reconnect"
 import { flumeExtractSlackMeta } from "@/slack/extract-slack-meta"
 import { FlumeSlackSeenCache } from "@/slack/slack-seen-cache"
 import { FlumeSlackSocketMode } from "@/slack/slack-socket-mode"
+import { slackErrorCode } from "@/slack/slack-error-code"
 import { FlumeSource } from "@/flume-source"
 import { attempt } from "@/utils/attempt"
 import { safeErrorMessage } from "@/utils/safe-error-message"
@@ -14,20 +15,6 @@ import { safeNow } from "@/utils/safe-now"
 
 const SEEN_CACHE_MAX = 1024
 const SEEN_CACHE_TTL_MS = 5 * 60 * 1000
-
-/**
- * `apps.connections.open` が返す恒久エラー。トークンが無効な状態で再接続しても
- * 回復しないため、reconnect を打ち切って呼び出し側へエラーを返す
- */
-const TERMINAL_SLACK_ERROR_CODES = new Set([
-  "invalid_auth",
-  "account_inactive",
-  "token_revoked",
-  "not_authed",
-  "not_allowed_token_type",
-  "token_expired",
-  "missing_scope",
-])
 
 export class FlumeSlackSource extends FlumeSource {
   readonly name = "slack" as const
@@ -108,6 +95,8 @@ export class FlumeSlackSource extends FlumeSource {
   }
 
   private async connectInternal(ctx: FlumeSourceStartContext): Promise<Error | null> {
+    if (this.isStopped) return new FlumeStartError("Source stopped before reconnect")
+    this.socket?.disconnect()
     this.setStatus("connecting")
 
     // close()/disconnect() は this.socket を null 化するため、await 以降と callback 内の
@@ -118,8 +107,11 @@ export class FlumeSlackSource extends FlumeSource {
       handshakeTimeoutMs: this.options.handshakeTimeoutMs,
       onLog: ctx.log.handler,
       deps: ctx.deps,
-      onMessage: (envelope) => this.handleMessage(ctx, envelope),
+      onMessage: (envelope) => {
+        if (socket === this.socket) this.handleMessage(ctx, envelope)
+      },
       onConnected: () => {
+        if (socket !== this.socket) return
         if (this.reconnector && this.reconnector.attempt > 0) {
           ctx.log.info({
             action: "reconnect.reset",
@@ -130,6 +122,7 @@ export class FlumeSlackSource extends FlumeSource {
         this.setStatus("connected")
       },
       onDisconnected: () => {
+        if (socket !== this.socket) return
         if (socket.isStopped) {
           this.setStatus("disconnected")
           return
@@ -168,8 +161,7 @@ export class FlumeSlackSource extends FlumeSource {
 
   private isTerminalSlackError(error: Error): boolean {
     if (!(error instanceof FlumeHttpError)) return false
-    if (error.code === null) return false
-    return TERMINAL_SLACK_ERROR_CODES.has(error.code)
+    return slackErrorCode(error.status, error.code) === "FLUME_AUTH_FAILED"
   }
 
   private minRetryDelayMs(error: Error): number | undefined {

@@ -1,3 +1,4 @@
+import type { FlumeErrorCode } from "@/errors/error-codes"
 import type { z } from "zod/v4"
 import type { FlumeLogger } from "@/logger"
 import type { FlumeGatewayMessageSchema } from "@/discord/discord-gateway-message-schema"
@@ -95,6 +96,35 @@ export type FlumeConfluenceItemHandler = (item: FlumeConfluenceItem) => unknown 
 
 export type FlumeStreamOverflow = "drop-oldest" | "drop-newest"
 
+/** 累積破棄数は log を購読していなくても確認できる。stream 側は購読バッファごとの合計。 */
+export type FlumeDeliveryStatus = Readonly<{
+  callbackBuffer: number
+  pendingCallbacks: number
+  droppedCallbacks: number
+  /** onEvent に渡せなかったイベント数 */
+  droppedEventCallbacks: number
+  /** onEvent / onError に渡せなかったログ配送数 */
+  droppedLogCallbacks: number
+  /** droppedCallbacks のうち、診断専用枠でも受理できなかった数 */
+  droppedDiagnosticCallbacks: number
+  callbackFailures: number
+  droppedStreamItems: number
+}>
+
+/** callback や pull の混雑と独立した警告・エラー履歴。古い履歴の破棄数も公開する。 */
+export type FlumeDiagnosticSnapshot = Readonly<{
+  capacity: number
+  total: number
+  evicted: number
+  entries: ReadonlyArray<Readonly<FlumeLog>>
+}>
+
+/** 接続の変更権限を渡さず、配送と診断だけを観測するハンドル。 */
+export type FlumeObservation = Readonly<{
+  deliveryStatus(): FlumeDeliveryStatus
+  diagnostics(): FlumeDiagnosticSnapshot
+}>
+
 export type FlumeStreamOptions = {
   /** バッファ上限 (既定 1000)。consumer が遅れて溢れたら onOverflow に従う */
   buffer?: number
@@ -125,6 +155,7 @@ export type FlumeLog = {
   action: string
   message: string
   error?: Error
+  errorCode?: FlumeErrorCode
   detail?: Record<string, unknown>
   timestamp: number
 }
@@ -138,6 +169,7 @@ export type FlumeLogInput = {
   action: string
   message: string
   error?: Error
+  errorCode?: FlumeErrorCode
   detail?: Record<string, unknown>
 }
 
@@ -161,20 +193,26 @@ export type FlumeSourceLocalStatusHandler = (status: FlumeStatus, detail?: strin
 
 export type FlumeSourceStartContext = {
   onEvent: FlumeEventHandler
+  /** Source 単体へ非同期 callback を渡す場合の上限。既定 1000。Flume への同期転送は滞留しない。 */
+  eventBuffer?: number
   log: FlumeLogger
   deps: FlumeRuntimeDeps
   /** Source 内部の status 遷移ブリッジ。Flume 公開 API に status callback は無く、遷移は log に出る */
   onStatus?: FlumeSourceLocalStatusHandler
   reconnect: FlumeReconnectConfig | null
   /**
-   * Flume に渡された signal をそのまま転送する。
-   * connect 中の abort は `FlumeSource` 基底クラスが購読して `stop()` を発火する
-   * (進行中の接続を中断して `Flume.open()` を解放する)。connect 完了後の abort は
-   * FlumeRunning が runClose を駆動する。source 実装が自前で `fetch(url, { signal })`
-   * などへ伝播させたい場合にも使える。Flume.options.signal が未設定なら省略される。
+   * Flume が所有する接続用 signal。host の abort・起動失敗・close で中断する。
+   * custom source も IO へ渡し、await 後は isStopped を確認して新しいリソースを作らない。
    */
   signal?: AbortSignal
 }
+
+export type FlumeSourceDeliveryStatus = Readonly<{
+  eventBuffer: number
+  pendingEvents: number
+  droppedEvents: number
+  callbackFailures: number
+}>
 
 // Source 構築 options — domain config のみ。
 // cross-cutting (onEvent firehose / onError / signal / deps / reconnect) は Flume 側で受け取る
@@ -218,6 +256,8 @@ export type FlumeSlackSourceOptions = {
 
 export type FlumeGitHubSourceOptions = {
   token: string
+  /** 全ページの fetch と body 読取を含む期限。既定 30 秒 */
+  requestTimeoutMs?: number
   pollInterval?: number
 }
 
@@ -239,20 +279,31 @@ export type FlumeTimeMessage = {
 
 /**
  * 起動 / 終了をまたいだ状態を 1 つ載せる純粋な DI ポート。flume 内部で fs / db / network を
- * 触らないように、I/O の場所と方式は host が決める。load の失敗は null 復帰扱い、save の
- * 失敗は best-effort (source 側で log するが throw しない)。Time source は save を直列実行し、
- * stop 時に queued save の完了を待つ。persister 内から Flume の終了を await しない。
- * stop は load の待機を解除するが、host 側で開始した read IO 自体は中断しない。
+ * 触らないように、I/O の場所と方式は host が決める。signal に従って IO を中断する。
+ * load 失敗時は catchup を省略する。save は直列化し、待機中は最新値に集約する。
+ * stop は各保存の期限まで待ち、最後の未解消エラーを返す。persister 内から終了を await しない。
+ * 期限切れ後は完了順の逆転を防ぐため追加保存を停止する (tick は継続)。
  */
 export type FlumeStatePersister<S> = {
-  load(): Promise<S | null>
-  save(state: S): Promise<void>
+  load(options?: { signal: AbortSignal }): Promise<S | null>
+  save(state: S, options?: { signal: AbortSignal }): Promise<void>
 }
 
 /** `FlumeTimeSource` の statePersister が保存する形 */
 export type FlumeTimeSourceState = {
   readonly lastFiredAt: number
 }
+
+/** checkpoint の保存状態。pendingWrites は未完了 IO と最新の待機値の合計 (最大二件)。 */
+export type FlumeTimeStateStatus = Readonly<{
+  phase: "idle" | "saving" | "halted"
+  pendingWrites: number
+  coalescedWrites: number
+  failedWrites: number
+  lastRequestedAt: number | null
+  lastSavedAt: number | null
+  error: Error | null
+}>
 
 /**
  * `FlumeTimeSource` の起動時 catch-up 方針。statePersister が読めた lastFiredAt から
@@ -275,6 +326,8 @@ export type FlumeTimeSourceOptions = {
    * (lastFiredAt が分からないので)。flume は fs / db を触らないので host が実装を渡す
    */
   statePersister?: FlumeStatePersister<FlumeTimeSourceState>
+  /** 各 load / save の期限。既定 30 秒、最大 2,147,483,647 ms。不正値は既定値へ戻す。 */
+  stateTimeoutMs?: number
   /** statePersister が読めた lastFiredAt を元に過去 tick を再発火する方針 (既定 "off") */
   catchupPolicy?: FlumeCatchupPolicy
 }

@@ -45,6 +45,23 @@ const event = (type: string): FlumeEvent => ({
 })
 
 describe("FlumeConfluence", () => {
+  it("retains an observation handle across removal while callbacks are blocked", async () => {
+    const gate = Promise.withResolvers<void>()
+    const source = new MockSource()
+    const confluence = new FlumeConfluence({ callbackBuffer: 1, onEvent: () => gate.promise })
+    expect(await confluence.add("load", [source])).toBeNull()
+    const view = confluence.observe("load")!
+    for (let index = 0; index < 10; index++) source.pushEvent!(event("test"))
+    await confluence.remove("load")
+    expect(confluence.observe("load")).toBeUndefined()
+    expect(view.deliveryStatus().droppedEventCallbacks).toBe(10)
+    expect(view.diagnostics().entries).toContainEqual(
+      expect.objectContaining({ errorCode: "FLUME_BUFFER_OVERFLOW" }),
+    )
+    expect(Object.isFrozen(view)).toBe(true)
+    gate.resolve()
+    await waitFor(() => expect(view.deliveryStatus().pendingCallbacks).toBe(0))
+  })
   it("merges firehoses from every added group into one onEvent", async () => {
     const items: FlumeStreamItem[] = []
     const confluence = new FlumeConfluence({ onEvent: (item) => items.push(item) })
@@ -238,11 +255,13 @@ describe("FlumeConfluence", () => {
     await confluence.closeAll()
 
     expect(source.stopCount).toBe(1)
-    expect(errors).toContainEqual(
-      expect.objectContaining({
-        action: "onEvent.error",
-        detail: expect.objectContaining({ groupId: "async", itemType: "reject" }),
-      }),
+    await waitFor(() =>
+      expect(errors).toContainEqual(
+        expect.objectContaining({
+          action: "onEvent.error",
+          detail: expect.objectContaining({ groupId: "async", itemType: "reject" }),
+        }),
+      ),
     )
   })
 
@@ -292,9 +311,46 @@ describe("FlumeConfluence", () => {
 
     const result = await confluence.replace("replace", [next])
 
-    expect(result).toBeInstanceOf(Error)
+    expect(result).toMatchObject({
+      errorCode: "FLUME_TIMER_FAILED",
+      cause: new Error("timer failed"),
+    })
     expect(previous.stopCount).toBe(0)
     expect(confluence.has("replace")).toBe(true)
+    await confluence.closeAll()
+  })
+
+  it.each(["remove", "timeout"])("distinguishes replacement cancellation by %s", async (reason) => {
+    const entered = Promise.withResolvers<void>()
+    const timer = { callback: (): void => {} }
+    class PendingSource extends MockSource {
+      protected override async connect(): Promise<Error | null> {
+        entered.resolve()
+        return new Promise(() => {})
+      }
+    }
+    const confluence = new FlumeConfluence({
+      deps: {
+        ...createFlumeDefaultDeps(),
+        setTimeout: (callback) => {
+          timer.callback = callback
+          return 1
+        },
+        clearTimeout: () => {},
+      },
+    })
+    const previous = new MockSource()
+    const next = new PendingSource()
+    await confluence.add("replace", [previous])
+    const replacing = confluence.replace("replace", [next])
+    await entered.promise
+    if (reason === "remove") await confluence.remove("replace")
+    else timer.callback()
+    expect(await replacing).toMatchObject({
+      errorCode: reason === "remove" ? "FLUME_ABORTED" : "FLUME_TIMEOUT",
+    })
+    expect(next.stopCount).toBe(1)
+    expect(previous.stopCount).toBe(reason === "remove" ? 1 : 0)
     await confluence.closeAll()
   })
 

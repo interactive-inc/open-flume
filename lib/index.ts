@@ -19,3 +19,6 @@ export { safeNow } from "@/utils/safe-now"
 export { safeRandom } from "@/utils/safe-random"
 export { safeReadText } from "@/utils/safe-read-text"
 export { safeStringify } from "@/utils/safe-stringify"
+
+export { FLUME_ERROR_CODES, type FlumeErrorCode } from "@/errors/error-codes"
+export type { FlumeErrorContext } from "@/errors/error-context"

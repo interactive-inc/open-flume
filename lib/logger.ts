@@ -1,3 +1,6 @@
+import { FlumeHttpError } from "@/errors/http-error"
+import { FlumeConnectionError } from "@/errors/connection-error"
+import { resolveFlumeErrorCode } from "@/errors/resolve-error-code"
 import type {
   FlumeLog,
   FlumeLogHandler,
@@ -58,7 +61,16 @@ export class FlumeLogger {
       message: input.message,
       timestamp: safeNow({ deps: this.props.deps }),
       error: input.error,
-      detail: input.detail,
+      errorCode:
+        input.errorCode ??
+        (level === "error" || level === "warn" || input.error
+          ? resolveFlumeErrorCode(input.action, input.error)
+          : undefined),
+      detail:
+        (input.error instanceof FlumeConnectionError || input.error instanceof FlumeHttpError) &&
+        input.error.context
+          ? { ...input.error.context, ...input.detail }
+          : input.detail,
     }
 
     safeInvokeCallback({ fn: () => handler(log), onError: () => {} })
