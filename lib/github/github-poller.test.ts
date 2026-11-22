@@ -597,6 +597,9 @@ describe("FlumeGitHubPoller", () => {
     test.mockFetch.mockResolvedValueOnce(
       makeJsonResponse([makeNotification("3", "2024-01-03T00:00:00Z")]),
     )
+    test.mockFetch.mockResolvedValueOnce(
+      makeJsonResponse([makeNotification("2", "2024-01-02T00:00:00Z")]),
+    )
 
     const poller = new FlumeGitHubPoller({
       token: "ghp_test",
@@ -655,7 +658,7 @@ describe("FlumeGitHubPoller", () => {
 
     await poller.start()
 
-    expect(test.mockFetch).toHaveBeenCalledTimes(11)
+    expect(test.mockFetch).toHaveBeenCalledTimes(21)
 
     const truncatedWarns = logs.filter((log) => log.action === "poll.pages.truncated")
     expect(truncatedWarns).toHaveLength(0)
@@ -977,4 +980,38 @@ describe("notification transaction regressions", () => {
     expect(connected).toHaveBeenCalledTimes(2)
     poller.stop()
   })
+})
+
+it("retries the previous cursor when an unread notification moves onto a visited page", async () => {
+  const test = createTestDeps()
+  const a = makeNotification("a", "2024-01-01T00:00:00Z")
+  const b = makeNotification("b", "2024-01-01T00:00:01Z")
+  for (const response of [
+    makeJsonResponse([]),
+    makeJsonResponse([a], 200, {
+      Link: '<https://api.github.com/notifications?page=2>; rel="next"',
+    }),
+    makeJsonResponse([]),
+    makeJsonResponse([b]),
+    makeJsonResponse([b]),
+  ])
+    test.mockFetch.mockResolvedValueOnce(response)
+  const onNotifications = vi.fn()
+  const poller = new FlumeGitHubPoller({
+    token: "test",
+    interval: 60,
+    deps: test.deps,
+    onConnected: vi.fn(),
+    onDisconnected: vi.fn(),
+    onNotifications,
+  })
+  await poller.start()
+  test.getIntervalCallback()!()
+  await flushPromises()
+  expect(onNotifications).not.toHaveBeenCalled()
+  test.getIntervalCallback()!()
+  await flushPromises()
+  expect(test.mockFetch.mock.calls[4]![0]).toBe(test.mockFetch.mock.calls[1]![0])
+  expect(onNotifications).toHaveBeenCalledWith([b])
+  poller.stop()
 })

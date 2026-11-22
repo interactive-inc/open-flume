@@ -444,3 +444,46 @@ describe("FlumeConfluence", () => {
     await confluence.closeAll()
   })
 })
+
+it.each(["connected", "disconnected"] as const)(
+  "keeps the old source until retry resolves as %s",
+  async (outcome) => {
+    class Retrying extends MockSource {
+      protected override async connect() {
+        this.setStatus("reconnecting")
+        return null
+      }
+      settle() {
+        this.setStatus(outcome)
+      }
+    }
+    const group = new FlumeConfluence()
+    const old = new MockSource()
+    await group.add("group", [old])
+    const next = new Retrying()
+    const replacing = group.replace("group", [next])
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    expect(old.stopCount).toBe(0)
+    next.settle()
+    const result = await replacing
+    expect(result instanceof Error).toBe(outcome === "disconnected")
+    expect(old.stopCount).toBe(outcome === "connected" ? 1 : 0)
+    await group.closeAll()
+  },
+)
+
+it("does not roll back a source rejected by another package copy", async () => {
+  class ExternalSource extends MockSource {
+    override async start(...args: Parameters<MockSource["start"]>) {
+      if (this.startCount)
+        return Object.assign(new Error("already running"), { errorCode: "FLUME_SOURCE_REUSED" })
+      return super.start(...args)
+    }
+  }
+  const group = new FlumeConfluence()
+  const source = new ExternalSource()
+  await group.add("group", [source])
+  expect(await group.replace("group", [source])).toBeInstanceOf(Error)
+  expect(source.stopCount).toBe(0)
+  await group.closeAll()
+})

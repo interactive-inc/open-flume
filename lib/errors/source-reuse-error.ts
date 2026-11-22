@@ -6,3 +6,10 @@ export class FlumeSourceReuseError extends FlumeStartError {
     super(message, { errorCode: "FLUME_SOURCE_REUSED" })
   }
 }
+
+export function isSourceReuseError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    Reflect.getOwnPropertyDescriptor(error, "errorCode")?.value === "FLUME_SOURCE_REUSED"
+  )
+}

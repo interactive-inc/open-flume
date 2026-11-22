@@ -14,7 +14,7 @@ import type { FlumeSource } from "@/flume-source"
 import { createFlumeDefaultDeps } from "@/deps"
 import { FlumeStartError } from "@/errors/start-error"
 import { FlumeClosed } from "@/flume-closed"
-import { Flume } from "@/flume"
+import { Flume, openReplacement } from "@/flume"
 import { FlumeRunning } from "@/flume-running"
 import { snapshotValue } from "@/utils/snapshot-value"
 import { attempt } from "@/utils/attempt"
@@ -192,7 +192,7 @@ export class FlumeConfluence {
     }
     group.opening = opening
     const result = await attempt(async () => {
-      const next = await new Flume({
+      const candidate = new Flume({
         sources,
         onEvent: this.wrapOnEvent(id, props.onEvent),
         onError: this.wrapOnError(id, props.onError),
@@ -201,7 +201,8 @@ export class FlumeConfluence {
         reconnect: props.reconnect,
         signal: opening.controller.signal,
         openTimeoutMs: timeoutMs,
-      }).open()
+      })
+      const next = await (timeoutMs === undefined ? candidate.open() : candidate[openReplacement]())
       if (next instanceof Error) return next
       if (this.isClosed || group.closing) {
         const closed = await next.close()

@@ -8,11 +8,12 @@ import type {
   FlumeRuntimeDeps,
   FlumeSourceStartContext,
   FlumeStreamHandler,
+  FlumeStatus,
 } from "@/types"
 import type { FlumeSource } from "@/flume-source"
 import { createFlumeDefaultDeps } from "@/deps"
 import { FlumeStartError } from "@/errors/start-error"
-import { FlumeSourceReuseError } from "@/errors/source-reuse-error"
+import { isSourceReuseError } from "@/errors/source-reuse-error"
 import { FlumeDelivery } from "@/flume-delivery"
 import { FlumeLogger } from "@/logger"
 import { FlumeRunning } from "@/flume-running"
@@ -21,6 +22,8 @@ import { attempt } from "@/utils/attempt"
 import { FlumeTimeout } from "@/utils/timeout"
 import { safeErrorMessage } from "@/utils/safe-error-message"
 import { safeNormalizeError } from "@/utils/safe-normalize-error"
+
+export const openReplacement = Symbol("Flume.openReplacement")
 
 export type FlumeOptions = Readonly<{
   /** 統合する Source 群 (必須) */
@@ -112,7 +115,15 @@ export class Flume {
     return this.delivery.status()
   }
 
-  async open(): Promise<FlumeRunning | FlumeStartError> {
+  open(): Promise<FlumeRunning | FlumeStartError> {
+    return this.runOpen(false)
+  }
+
+  [openReplacement](): Promise<FlumeRunning | FlumeStartError> {
+    return this.runOpen(true)
+  }
+
+  private async runOpen(waitForConnected: boolean): Promise<FlumeRunning | FlumeStartError> {
     if (this.options instanceof Error) {
       this.log.error({
         action: "flume.open.refused",
@@ -198,14 +209,46 @@ export class Flume {
       this.finishFailedOpen()
       return openError
     }
+    const statuses = new Map<FlumeSource, FlumeStatus>()
+    let wake: (() => void) | undefined
     const settled = await Promise.allSettled(
       this.sources.map(async (source) => {
-        const result = await attempt(() => this.safeStart(source, reconnect, controller.signal))
+        const result = await attempt(() =>
+          this.safeStart(
+            source,
+            reconnect,
+            controller.signal,
+            waitForConnected
+              ? (status) => {
+                  statuses.set(source, status)
+                  wake?.()
+                }
+              : undefined,
+          ),
+        )
         if (result instanceof Error) controller.abort()
         return result
       }),
     )
 
+    if (waitForConnected && !controller.signal.aborted) {
+      const signal = controller.signal
+      const ready = Promise.withResolvers<void>()
+      wake = () => {
+        // Sources that do not publish connection states declare readiness by returning from start.
+        if (signal.aborted || [...statuses.values()].every((status) => status === "connected"))
+          ready.resolve()
+        else if ([...statuses.values()].includes("disconnected")) {
+          openError = new FlumeStartError("Replacement source disconnected before becoming ready")
+          controller.abort()
+        }
+      }
+      signal.addEventListener("abort", wake, { once: true })
+      wake()
+      await ready.promise
+      signal.removeEventListener("abort", wake)
+      wake = undefined
+    }
     timer.cancel()
 
     const failures: Failure[] = []
@@ -217,7 +260,7 @@ export class Flume {
       const name = this.sourceName(source)
 
       const outcome = result.status === "rejected" ? result.reason : result.value
-      if (!(outcome instanceof FlumeSourceReuseError)) ownedSources.add(source)
+      if (!isSourceReuseError(outcome)) ownedSources.add(source)
 
       if (result.status === "rejected") {
         failures.push({ name, error: safeNormalizeError({ value: result.reason }) })
@@ -363,11 +406,13 @@ export class Flume {
     source: FlumeSource,
     reconnect: FlumeReconnectConfig | null,
     signal: AbortSignal,
+    onStatus?: (status: FlumeStatus) => void,
   ): Promise<Error | null> {
     const name = this.sourceName(source)
     const ctx: FlumeSourceStartContext = {
       onEvent: (event) => this.delivery.publish({ kind: "event", event }),
       log: this.log.child(name),
+      onStatus,
       deps: this.deps,
       reconnect,
       signal,
