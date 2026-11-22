@@ -80,6 +80,7 @@ export class FlumeGitHubNotificationReader {
     if (checkpoint.since) params.set("since", checkpoint.since)
     let url: string | null = `${ENDPOINT}?${params}`
     let first: Response | null = null
+    const boundaries: { url: string; fingerprint: string }[] = []
     const visited = new Set<string>()
     const notifications: FlumeGitHubNotification[] = []
 
@@ -126,7 +127,31 @@ export class FlumeGitHubNotificationReader {
       for (const notification of page) notifications.push(notification)
       const next = this.nextPage(response.headers.get("Link"))
       if (next instanceof Error) return next
+      if (next) boundaries.push({ url, fingerprint: pageFingerprint(page) })
       url = next
+    }
+    // A read notification can shift an unread thread onto a page already visited.
+    for (const boundary of boundaries) {
+      if (signal.aborted) return new Error("operation aborted")
+      const response = await this.fetchPage(boundary.url, null, signal)
+      if (response instanceof Error) return response
+      progress.httpStatus = response.status
+      progress.requestId = response.headers.get("X-GitHub-Request-Id") ?? undefined
+      const limited = await this.isRateLimited(response)
+      if (limited instanceof Error) return limited
+      if (limited)
+        return {
+          kind: "rate-limit",
+          delayMs: this.retryDelay(response),
+          context: { operation: "github.notifications", ...progress },
+          pollInterval: first?.headers.get("X-Poll-Interval") ?? null,
+        }
+      if (!response.ok)
+        return new FlumeHttpError({ message: `HTTP ${response.status}`, status: response.status })
+      const page = await this.readBody(response)
+      if (page instanceof Error) return page
+      if (boundary.fingerprint !== pageFingerprint(page))
+        return new FlumeParseError("notification pagination changed during polling")
     }
     if (first === null) return new FlumeParseError("missing first notification page")
     return {
@@ -245,4 +270,8 @@ export class FlumeGitHubNotificationReader {
       since: Number.isFinite(latest) ? new Date(latest - 1000).toISOString() : previous.since,
     }
   }
+}
+
+function pageFingerprint(page: FlumeGitHubNotification[]): string {
+  return JSON.stringify(page.map(({ id, updated_at }) => [id, updated_at]))
 }
