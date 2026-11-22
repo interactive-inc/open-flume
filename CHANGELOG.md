@@ -1,6 +1,8 @@
 # Changelog
 
-## 未リリース
+## 0.12.0
+
+- 接続交換では候補の接続確立まで旧接続を維持し、別のパッケージコピーが所有する Source を停止しない。GitHub 通知一覧がページ取得中に変わった場合は、以前の取得位置から再試行する。
 
 - イベント・ログ・診断の通常の object / array を発行時にコピーして凍結し、producer や別の observer の変更が配送内容へ混入しないようにする。公開型も readonly とし、取得失敗は原因付き診断と rejectedEvents / rejectedItems に残す。Error / cause などの opaque 値は参照を保持する。
 - Confluence.replace の成功値を null から previous: FlumeClosed を持つ結果に変更し、旧接続の停止失敗も返す。remove / closeAll は終了結果と中断した起動の結果を返す。Source.start / Flume.open で起動と後片付けが両方失敗した場合は、両方の原因を保持する。
